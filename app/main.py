@@ -18,6 +18,9 @@ AgentDesk 服务入口
     POST /rag/index       重建索引
     POST /rag/search      只检索不生成（排查检索质量用）
     POST /rag/ask         RAG 问答，带引用溯源
+    GET  /agent/tools     Agent 能调用的工具清单（含风险等级）
+    GET  /agent/graph     导出状态图的 mermaid 定义
+    POST /agent/ask       ★ Agent 自主诊断：它自己决定调哪些工具、几轮
 
 服务起来后打开 http://127.0.0.1:8000/docs 有自动生成的交互式文档。
 """
@@ -560,3 +563,108 @@ def rag_ask(req: SearchRequest):
         "mode": result["mode"],
         "citations": result["citations"],
     }
+
+
+# ============================================================
+# Agent：ReAct 循环（自己决定调哪个工具）
+# ============================================================
+# 这一组接口是项目的分水岭：前三天的接口都是"你说一句，它答一句"，
+# 从这里开始，服务会**自己决定要做几件事、按什么顺序做**。
+class AgentRequest(BaseModel):
+    question: str = Field(..., min_length=1, max_length=2000,
+                          description="要诊断的问题")
+    engine: str = Field("langgraph", pattern="^(handwritten|langgraph)$",
+                        description="编排引擎：handwritten 手写循环 / langgraph 状态图")
+    max_steps: int = Field(6, ge=1, le=12,
+                           description="最多几轮工具调用。这既是成本上限，也是防死循环的护栏")
+    include_trace: bool = Field(True, description="是否返回完整执行轨迹")
+
+
+@app.get("/agent/tools")
+def agent_tools():
+    """列出 Agent 能调用的工具，以及每个工具的风险等级。
+
+    【为什么要把这个暴露成接口】
+    1. 调试时能一眼看到"模型到底有哪些牌可打"
+    2. 演示时可以直接给面试官看 —— 工具清单就是能力的边界
+    3. 风险等级在这里是公开的：调用方能看到哪些操作需要人工确认
+    """
+    from app.tools import tool_catalog
+    from app.tools.ops import BACKEND
+    return {"backend": BACKEND, "count": len(tool_catalog()),
+            "tools": tool_catalog()}
+
+
+@app.get("/agent/graph")
+def agent_graph(max_steps: int = Query(6, ge=1, le=12)):
+    """导出状态图的 mermaid 定义。
+
+    LangGraph 白送的能力：图的结构不用手画，直接导出。
+    把这段文本贴进任何支持 mermaid 的地方（GitHub README、飞书文档、
+    VS Code 预览）就会渲染成流程图。
+
+    面试时这张图比任何口头描述都直观：**一眼能看出哪里是循环**。
+    """
+    from app.agents.graph import mermaid
+    text = mermaid(max_steps)
+    return {"max_steps": max_steps, "format": "mermaid", "graph": text}
+
+
+@app.post("/agent/ask")
+def agent_ask(req: AgentRequest):
+    """让 Agent 自己诊断一个问题。
+
+    【为什么是 def 而不是 async def】
+    这个接口内部是同步的（模型调用 + 工具执行都是阻塞的），
+    一次要跑好几秒。写成 def，FastAPI 会把它丢进线程池执行；
+    写成 async def 反而会卡住事件循环 —— 一个请求就把所有人都堵住。
+
+    这是新手最容易搞反的一处：**不是所有接口都该写成 async。**
+    只有内部真的用了异步 IO（比如 httpx.AsyncClient）时，
+    async def 才有意义。
+    """
+    started_ts = datetime.now().isoformat(timespec="seconds")
+
+    if req.engine == "handwritten":
+        from app.agents.react import run as engine_run
+    else:
+        from app.agents.graph import run as engine_run
+
+    try:
+        result = engine_run(req.question, max_steps=req.max_steps)
+    except ModelError as e:
+        # 模型层故障 → 502（上游问题，可重试）
+        raise HTTPException(status_code=502, detail=str(e))
+
+    # 审计留痕：Agent 自己做了决定这件事，必须可追溯。
+    # 记的是"它查了什么"，而不是"它答了什么" —— 后者可以从日志里再取，
+    # 前者才是排查"它为什么这么判断"的关键。
+    write_audit("agent.ask", {
+        "question": req.question,
+        "engine": req.engine,
+        "rounds": result["rounds"],
+        "tool_calls": result["tool_calls"],
+        "tools": result["distinct_tools"],
+        "stop_reason": result["stop_reason"],
+        "tokens": result["usage"].get("total_tokens", 0),
+    })
+
+    payload = {
+        "started_at": started_ts,
+        "engine": result["engine"],
+        "question": result["question"],
+        "answer": result["answer"],
+        # 这三个数字是 Agent 特有的可观测指标 ——
+        # 普通问答接口没有"轮次"和"工具调用"这两个概念
+        "metrics": {
+            "rounds": result["rounds"],
+            "tool_calls": result["tool_calls"],
+            "distinct_tools": len(result["distinct_tools"]),
+            "tokens": result["usage"].get("total_tokens", 0),
+            "elapsed_ms": result["elapsed_ms"],
+            "stop_reason": result["stop_reason"],
+        },
+    }
+    if req.include_trace:
+        payload["trace"] = result["steps"]
+    return payload

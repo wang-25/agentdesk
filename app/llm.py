@@ -9,8 +9,9 @@
 加成本统计的时候，就要改十几个地方 —— 改漏一个就是一个线上 bug。
 统一入口之后，这些能力只要在这里加一次，全项目都受益。
 
-本文件提供四个函数：
-    chat                  一次性返回
+本文件提供五个函数：
+    chat                  一次性返回，只给文本
+    chat_step             一步请求，返回完整 message（含 tool_calls）—— Agent 循环用
     chat_stream           流式返回（同步生成器）
     chat_stream_async     流式返回（异步生成器，高并发时用）
     chat_json             要模型返回 JSON 的便捷方法
@@ -154,7 +155,66 @@ def chat(messages, temperature=0.7, timeout=60) -> str:
 
 
 # ============================================================
-# 三、流式返回 —— 同步版
+# 三、工具调用 —— 带 tools 参数的一步
+# ============================================================
+def chat_step(messages, tools=None, temperature=0, timeout=90) -> dict:
+    """发一次请求，返回**完整的 assistant message** 与用量。
+
+    【和 chat() 的区别】
+    chat() 只把文本内容抠出来给你 —— 适合"问一句答一句"。
+    chat_step() 把整个 message 对象原样返回。为什么？
+
+    因为开了工具调用之后，message 里除了 content 还会多一个
+    tool_calls 字段。只取 content 等于把"模型想调工具"这个意图丢掉了 ——
+    而 Agent 循环的全部意义就在这个意图上。
+
+    【为什么必须原样返回、原样追加】
+    ReAct 循环要把这个 message 追加进对话历史，而且下一轮的 tool 消息
+    必须靠 tool_call_id 和它对应起来。
+    如果你自己拼一个 {"role": "assistant", "content": ...} 塞回去，
+    id 和 tool_calls 就丢了，模型下一轮会以为那条工具结果是别人给的，
+    轻则重复调用，重则直接报错。
+
+    【temperature 默认 0】
+    工具调用需要的是"稳定决策"，不是"文采"。同样的故障描述每次都该调同一批工具，
+    否则评测根本没法复现。
+
+    返回值：
+        {"message": {...}, "finish_reason": str, "usage": {...}, "model": str}
+    """
+    _, cfg, api_key = _pick()
+    payload = {"model": cfg["model"], "messages": messages,
+               "temperature": temperature}
+    if tools:
+        payload["tools"] = tools
+        # tool_choice="auto" 表示"调不调、调哪个，模型自己定"。
+        # 另外两个取值："none"（强制不调）、"required"（强制必须调一个），
+        # 评测时经常用 required 来测"它到底会不会选工具"。
+        payload["tool_choice"] = "auto"
+
+    try:
+        resp = httpx.post(cfg["url"], headers=_headers(api_key), json=payload,
+                          timeout=timeout)
+    except httpx.ConnectError as e:
+        raise ModelError(f"连不上模型服务：{e}") from e
+    except httpx.TimeoutException as e:
+        raise ModelError(f"请求超时（{timeout}s）") from e
+
+    if resp.status_code != 200:
+        raise ModelError(f"请求失败 HTTP {resp.status_code}: {resp.text[:300]}")
+
+    data = resp.json()
+    choice = data["choices"][0]
+    return {
+        "message": choice["message"],
+        "finish_reason": choice.get("finish_reason"),
+        "usage": data.get("usage") or {},
+        "model": data.get("model") or cfg["model"],
+    }
+
+
+# ============================================================
+# 四、流式返回 —— 同步版
 # ============================================================
 def chat_stream(messages, temperature=0.7, timeout=120) -> Iterator[str]:
     """逐块返回模型输出，每 yield 一小段文本。
@@ -194,7 +254,7 @@ def chat_stream(messages, temperature=0.7, timeout=120) -> Iterator[str]:
 
 
 # ============================================================
-# 四、流式返回 —— 异步版
+# 五、流式返回 —— 异步版
 # ============================================================
 async def chat_stream_async(messages, temperature=0.7,
                             timeout=120) -> AsyncIterator[str]:
@@ -238,7 +298,7 @@ async def chat_stream_async(messages, temperature=0.7,
 
 
 # ============================================================
-# 五、容错解析模型返回的 JSON
+# 六、容错解析模型返回的 JSON
 # ============================================================
 def parse_json_reply(text: str) -> dict:
     """把模型返回的文本解析成字典，容忍几种常见的不规范格式。

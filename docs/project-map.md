@@ -19,7 +19,7 @@
 |---|---|---|
 | **大模型** | `app/llm.py` 统一调用 DeepSeek | 没有"理解人话"的能力 |
 | **私有知识** | `app/rag/` 检索你自己的排障文档 | 只能答通用问题，答不了"你们这台机器" |
-| **能执行** | Day 5+ 的工具层（还没做） | 只能"说"，不能"查"，结论无法验证 |
+| **能执行** | `app/tools/` 6 个运维工具（Day 4 完成） | 只能"说"，不能"查"，结论无法验证 |
 
 而"服务"这两个字的意思是：**它不是一个聊天框，是一个可以被别的系统调用的地址。**
 
@@ -35,33 +35,55 @@
                                         │ HTTP
                         ┌───────────────▼─────────────────┐
                         │        app/main.py              │  ← 大门
-                        │  10 个接口 + 参数校验 + 审计留痕  │
-                        └───┬─────────────────────┬───────┘
-                            │                     │
-              ┌─────────────▼──────┐   ┌──────────▼──────────────┐
-              │    app/llm.py      │   │      app/rag/           │
-              │  模型调用唯一入口    │   │  检索你的私有文档        │
-              │  chat / stream /   │   │  loader → embedder →    │
-              │  chat_json         │   │  store → pipeline       │
-              └─────────┬──────────┘   └──────────┬──────────────┘
-                        │                         │
-                        └──────────┬──────────────┘
-                                   │
-                    ┌──────────────▼──────────────┐
-                    │        DeepSeek API         │  ← 外部
-                    └─────────────────────────────┘
+                        │  13 个接口 + 参数校验 + 审计留痕  │
+                        └───┬──────────┬──────────┬───────┘
+                            │          │          │
+        ┌───────────────────▼──┐  ┌────▼─────┐  ┌─▼──────────────┐
+        │   app/agents/        │  │ app/rag/ │  │  app/llm.py    │
+        │  Agent 编排层（大脑） │  │ 检索增强  │  │ 模型调用唯一入口│
+        │  react / graph 双版本 │  │ loader → │  │ chat / stream  │
+        │  ┌────────────────┐  │  │ embedder │  │ chat_step ★    │
+        │  │ ReAct 循环      │  │  │ store →  │  │ chat_json      │
+        │  │ 想→做→看→想…    │  │  │ pipeline │  └───────┬────────┘
+        │  └───────┬────────┘  │  └────┬─────┘          │
+        └──────────┼───────────┘       │                │
+                   │ 调用工具           │ 检索            │
+        ┌──────────▼───────────┐       │                │
+        │    app/tools/        │       │                │
+        │  Agent 的手（6 个）   │       │                │
+        │  check_disk /        │       │                │
+        │  check_load /        │       │                │
+        │  check_service /     │       │                │
+        │  list_containers /   │       │                │
+        │  tail_log /          │       │                │
+        │  search_knowledge ───┼───────┘                │
+        └──────────┬───────────┘                        │
+                   │ 查真实系统（mock / local）           │
+                   │                                    │
+                   └────────────┬───────────────────────┘
+                                │
+                 ┌──────────────▼──────────────┐
+                 │        DeepSeek API         │  ← 外部
+                 └─────────────────────────────┘
 
           数据侧：data/knowledge/*.md （语料）
                   data/index/*.npz    （向量索引，可重建）
                   logs/audit.jsonl    （审计日志）
-          验证侧：eval/qa_set.json    （32 个测试问题）
+          验证侧：eval/qa_set.json    （32 个检索问题）
+                  eval/reports/       （跑出来的报告，可重建）
 
-          ⬜ 还没做：app/agents/  app/tools/  app/mcp_server/
-                    app/sandbox/  app/observability/  deploy/
+          ⬜ 还没做：app/mcp_server/（Day 5）  app/sandbox/（Day 7）
+                    app/observability/（Day 8）  deploy/（Day 10）
 ```
 
 **读这张图的方法**：从上往下是"请求怎么进来的"，从下往上是"数据从哪来的"。
-中间那两个方框（`llm.py` 和 `rag/`）是目前全部的能力来源。
+
+**注意 `search_knowledge` 那条虚线连接** —— 它很特殊：**把 RAG 变成了 Agent 的一只手**。
+传统 RAG 是"不管问什么先检索一遍、结果全塞进 Prompt"；这里改成模型自己判断
+"这题要不要查资料、用什么词查"。这是 Agent 化 RAG 和传统 RAG 的分水岭。
+
+**分层依赖是单向的**：`main` → `agents` → `tools`。所以换模型只动 `llm.py`、
+换工具实现只动 `tools/`、换编排引擎只动 `agents/` —— 上层不用改。
 
 ---
 
@@ -108,7 +130,7 @@
 
 这个文件的职责是：**接请求 → 校验参数 → 调能力 → 返回结果 → 留痕**。它自己不做任何"智能"的事。
 
-10 个接口分四组：
+13 个接口分五组：
 
 | 分组 | 接口 | 说明 |
 |---|---|---|
@@ -122,10 +144,17 @@
 | | `POST /rag/index` | 重建索引 |
 | | `POST /rag/search` | 只检索不生成（排查检索质量时用） |
 | | `POST /rag/ask` | RAG 问答，**带引用溯源** |
+| **Agent** | `GET /agent/tools` | Agent 能调用的工具清单（含风险等级） |
+| | `GET /agent/graph` | 导出状态图的 mermaid 定义 |
+| | `POST /agent/ask` | ★ **Agent 自主诊断**：它自己决定调哪些工具、跑几轮 |
+
+> **`/chat` 和 `/agent/ask` 的区别，就是「聊天机器人」和「Agent」的区别。**
+> 前者一问一答；后者会自己决定要查什么、查几轮、什么时候停手，
+> 响应里多出 `rounds` / `tool_calls` / `distinct_tools` 这三个普通问答没有的指标。
 
 文件里还有几个关键零件：
 
-- `ChatRequest` / `ChatResponse` / `SearchRequest` —— pydantic 模型，**定义接口收什么、返什么**。FastAPI 靠它们自动校验参数、自动生成文档
+- `ChatRequest` / `ChatResponse` / `SearchRequest` / `AgentRequest` —— pydantic 模型，**定义接口收什么、返什么**。FastAPI 靠它们自动校验参数、自动生成文档
 - `validate_intent(data)` —— 校验模型返回的 JSON 合不合格（字段齐不齐、risk 取值合不合法）。**不合格就反馈给模型重试**
 - `normalize_alerts(payload)` —— 把不同格式的告警（Alertmanager 标准格式、扁平格式）统一成一种结构
 - `alert_to_question(alert)` —— 把告警翻译成人话，交给模型去理解
@@ -133,6 +162,78 @@
 
 > **一个刻意的设计**：`/webhook/alert` 遇到 `risk=high` 时**不执行任何操作**，返回 `decision: need_human`。
 > 这不是能力不足，是**责任边界** —— 生产环境不能靠"相信模型不会删错东西"。
+>
+> **另一个**：`/agent/ask` 写成 `def` 而不是 `async def`。它内部是同步阻塞的（模型调用 +
+> 工具执行要跑好几秒），写成 `def` FastAPI 会丢进线程池；写成 `async def`
+> 反而会卡住事件循环 —— **一个请求就把所有人都堵住**。
+
+### `app/tools/` —— 工具层（Day 4 的产出）
+
+```
+Agent 的「手」：能去查真实的磁盘、日志、服务状态、容器
+```
+
+| 文件 | 干什么的 |
+|---|---|
+| `ops.py` | 6 个工具 + 参数白名单 + 风险分级 + 双后端 + 注册表 |
+
+六个工具，**全部只读**：
+
+| 工具 | 查什么 | 在哪个场景下是关键证据 |
+|---|---|---|
+| `check_disk` | 各分区使用率，**顺带给出告警级别** | 磁盘满（最高频故障） |
+| `check_load` | 负载 / CPU 核数 / 内存，**顺带算每核负载** | 判断"是不是被压垮了" |
+| `check_service` | systemd 服务是否在跑 | 服务挂了 |
+| `list_containers` | 容器状态，**标出反复重启的** | CrashLoop 类问题 |
+| `tail_log` | 日志尾部，**自动标注命中的已知错误模式** | 定位具体原因 |
+| `search_knowledge` | 检索 Day 3 的知识库 | ★ 见下方说明 |
+
+**三个设计点，都是面试可以展开的**：
+
+**1. 阈值判断放在工具里，不放在 Prompt 里。** `check_disk` 直接返回 `level: critical/warning/ok`，
+`check_load` 直接算好"每个核上跑了多少任务"。为什么？**阈值是运维标准（行业知识），
+不是模型的常识** —— 放在代码里才能改、才能测、才能被 review。
+而且模型经常算错"4 核上负载 8.0 高不高"这种事，让它去算就是给它挖坑。
+
+**2. `search_knowledge` 这个工具是把 RAG 做成 Agent 的一只手。**
+它和"把检索结果一股脑塞进 Prompt"是两种路子：
+
+| | 传统 RAG 问答 | Agent 化 RAG |
+|---|---|---|
+| 检索时机 | 不管什么问题都先检索一遍 | 模型自己判断"这题要不要查资料" |
+| 检索词 | 用原问题 | 模型自己组织关键词 |
+| token | 检索结果全塞进 Prompt | 只在需要时取，取几条也能自己定 |
+
+**3. `local` 后端的关键是 `shell=False` + 列表传参。**
+如果写成 `shell=True`，白名单就形同虚设 —— 因为 shell 会解释分号、管道、反引号。
+传"列表"等于告诉内核"这是参数列表，不是一段命令"，**shell 根本没机会参与**。
+这是防命令注入的根本手段，不是靠黑名单过滤。
+
+### `app/agents/` —— 编排层（Day 4 的产出）
+
+```
+common.py     两个引擎共用的 Prompt、消息处理、工具执行
+react.py      手写 ReAct 循环（零依赖，原理在这里）
+graph.py      LangGraph 状态图版本
+compare.py    两个引擎的对比评测 → 输出报告
+```
+
+**为什么同一个循环写两遍**：为了回答「LangGraph 底层在做什么」。
+手写版是 `for` + `break`；图里 `add_edge("tools","agent")` 那条回头边就是循环。
+**先手写、后框架，顺序不能反** —— 反了只会用框架，答不出原理。
+
+| 手写版 | LangGraph 版 |
+|---|---|
+| `for step_no in range(1, max_steps+1)` | `add_edge("tools", "agent")` |
+| `if not tool_calls: break` | `add_conditional_edges` 返回 `END` |
+| 局部变量 `messages/steps/usage` | `AgentState` + reducer，可落盘 |
+| 自己画图 | `draw_mermaid()` 白送 |
+
+> **共用 `common.py` 不是偷懒，是对比实验的基本要求**：如果两个版本的工具执行逻辑不一样，
+> 跑出来的差异你就分不清是"框架的差异"还是"你自己代码的差异"。**变量只留一个。**
+
+实测对比数据、框架的取舍、踩过的两个坑（消息格式转换 / usage 嵌套字段），
+见 [`react-langgraph.md`](react-langgraph.md)。
 
 ### `app/rag/` —— 检索增强（Day 3 的产出）
 
@@ -247,6 +348,45 @@ Day 1 的 5 个 Python 练习（变量类型 / 容器 / 函数 / 文件 JSON / �
 **这条链路是「通用 AI 助手做不到」的技术落点**：通用助手要你打开界面打字；这个接口是给告警系统调的 ——
 **你不在场，它自己起来干活。**
 
+### 主线 D：Agent 自主诊断（`POST /agent/ask`）★ 最新的一条
+
+**它和前面三条有本质区别：前面三条的流程是写死的，这一条的流程是模型自己决定的。**
+
+```
+用户提问「web-01 上的网站很慢，有时报 502」
+  → ① 组装 messages（system prompt + 问题）
+  → 循环开始（最多 max_steps 轮）：
+      ② 调模型，带上 6 个工具的 schema      chat_step(messages, tools=...)
+      ③ 模型返回 tool_calls？── 没有 ──→ 它要回答了，跳出循环
+      ④ 有 → 逐个执行工具                    execute_tool()
+              参数校验 → 执行 → 结果转成文本
+      ⑤ 把 tool 消息追加回对话历史            role:"tool" + tool_call_id
+      ⑥ 回到 ②，让模型看结果继续决策
+  → ⑦ 撞上限则去掉 tools 强制收口
+  → ⑧ 返回 answer + trace + metrics，写审计
+```
+
+**实测一次（Q1）走了 3 轮、10 次工具调用**：
+
+| 轮 | 模型决定了什么 |
+|---|---|
+| 1 | 先看主机整体：`check_disk` `check_load` `check_service` `list_containers` |
+| 2 | 磁盘满了，查日志 + 查经验：`tail_log` `search_knowledge` |
+| 3 | 信息够了，出结论（不再调工具） |
+
+**这三步没有一步是预先写死的。** 这就是 ReAct。
+
+**四道护栏**（生产环境的必要条件）：
+
+| 层 | 护栏 |
+|---|---|
+| 工具层 | 参数白名单正则 + `shell=False` 列表传参 —— 绝不拼 shell |
+| 循环层 | `max_steps` 硬上限 + 重复调用检测（同工具同参数查第二次就提示它） |
+| 收口 | 撞上限时**去掉 tools** 再问一次，让它只能输出文字 |
+| 框架层 | `recursion_limit` 第二道保险 |
+
+> 完整的循环实现、两个引擎的对比数据、踩过的坑，见 [`react-langgraph.md`](react-langgraph.md)。
+
 ---
 
 ## 第 4 章｜还没做的是什么
@@ -255,12 +395,21 @@ Day 1 的 5 个 Python 练习（变量类型 / 容器 / 函数 / 文件 JSON / �
 
 | 目录 | 计划做什么 | 对应 JD 要求 |
 |---|---|---|
-| `app/tools/` | 5 个运维工具函数（查磁盘、读日志、看容器…） | 工具调用 / Function Calling |
-| `app/agents/` | 4 个专业 Agent（意图路由 / 知识检索 / 工具执行 / 结果校验） | 多 Agent 协同、Supervisor |
-| `app/mcp_server/` | 把工具暴露成 MCP Server | MCP、工具生态 |
-| `app/sandbox/` | Docker 沙箱执行 + 命令白名单 | 沙箱执行、权限控制 |
-| `app/observability/` | Langfuse 接入，全链路 Trace | AgentOps、可观测性 |
-| `deploy/` | docker-compose + Nginx + HTTPS | 部署与稳定性 |
+| `app/mcp_server/` | 把 6 个工具暴露成 MCP Server（Day 5） | MCP、工具生态 |
+| `app/sandbox/` | Docker 沙箱执行 + Human-in-the-Loop（Day 7） | 沙箱执行、权限控制 |
+| `app/observability/` | Langfuse 接入，全链路 Trace（Day 8） | AgentOps、可观测性 |
+| `deploy/` | docker-compose + Nginx + HTTPS（Day 10） | 部署与稳定性 |
+
+**已经做完的**：
+
+| 目录 | 状态 | 对应 JD 要求 |
+|---|---|---|
+| `app/rag/` | ✅ Day 3 | RAG、向量检索、混合检索 |
+| `app/tools/` | ✅ Day 4 | 工具调用 / Function Calling |
+| `app/agents/` | ✅ Day 4（单 Agent 版） | Agent 框架、ReAct、编排 |
+
+> 多 Agent 协同（Supervisor + 4 个专业 Agent）在 Day 6 —— 那是在现在这个
+> 单 Agent 循环外面再套一层调度，`app/agents/` 里会多出 `supervisor.py`。
 
 **这张表就是你的"下一步路线图"。** 面试时如果被问"这个项目还有哪些没做"，
 照着说一遍，比说"还在完善"强得多 —— 它证明你知道一个完整的 Agent 系统该有哪些部件。
@@ -275,11 +424,12 @@ Day 1 的 5 个 Python 练习（变量类型 / 容器 / 函数 / 文件 JSON / �
 
 **给面试用**：
 - 面试官问"介绍一下你的项目" → 先讲第 0 章那句一句话总结，再讲第 1 章那张图
-- 问"你的架构是什么样的" → 讲四个方框：`main.py`（大门）、`llm.py`（模型）、`rag/`（知识）、工具层（还没做）
-- 问"你项目里有什么难点" → 挑第 2 章里那几个"设计决定"讲（为什么切分、为什么重叠、为什么混合检索、为什么 RRF）
+- 问"你的架构是什么样的" → 讲四个方框：`main.py`（大门）、`agents/`（大脑）、`tools/`（手）、`rag/`（知识）
+- 问"你项目里有什么难点" → 挑第 2 章里那几个"设计决定"讲（为什么切分、为什么混合检索、
+  为什么 RRF、为什么工具里做阈值判断、为什么两个引擎都写）
 - 问"还没做什么" → 讲第 4 章那张表
 
 **一句话记住整个项目**：
 
-> **一个 HTTP 服务：门口十个接口，里面靠"模型调用 + 私有知识检索"两条腿走路，
+> **一个 HTTP 服务：门口十三个接口，里面靠"模型调用 + 私有知识检索 + 工具执行"三条腿走路，
 > 高危操作停下来等人确认，每一步都留痕。**

@@ -30,3 +30,10 @@ numpy>=1.26
 # Chinese word segmentation, used by BM25 keyword retrieval.
 # Pure Python, no model download required.
 jieba>=0.42
+
+# ---------- Day 4 (Agent orchestration) ----------
+# Agent orchestration as a state graph. Optional in the sense that
+# app/agents/react.py implements the same loop by hand with zero
+# dependencies -- but installed so the two can be compared side by side.
+# Pulls in langchain-core, langgraph-checkpoint, langsmith, etc.
+langgraph>=0.2

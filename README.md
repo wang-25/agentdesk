@@ -163,6 +163,9 @@ python -m venv .venv
 | POST | `/rag/index` | 重建索引 |
 | POST | `/rag/search` | 只检索不生成（排查检索质量用） |
 | POST | `/rag/ask` | RAG 问答，带引用溯源 |
+| GET | `/agent/tools` | Agent 能调用的工具清单（含风险等级） |
+| GET | `/agent/graph` | 导出状态图的 mermaid 定义 |
+| POST | `/agent/ask` | **Agent 自主诊断**：它自己决定调哪些工具、跑几轮 |
 
 RAG 也可以用命令行：
 
@@ -170,6 +173,22 @@ RAG 也可以用命令行：
 .venv\Scripts\python.exe -m app.rag.pipeline build     # 构建索引
 .venv\Scripts\python.exe -m app.rag.pipeline eval      # 跑召回率评测
 .venv\Scripts\python.exe -m app.rag.pipeline ask "nginx 报 502 怎么排查"
+```
+
+Agent 也可以用命令行（两个引擎任选）：
+
+```bash
+# 手写 ReAct 循环
+.venv\Scripts\python.exe -m app.agents.react "web-01 上的网站很慢，帮我查下"
+
+# LangGraph 状态图版本
+.venv\Scripts\python.exe -m app.agents.graph "cache-01 的 Redis 容器一直重启"
+
+# 看状态图长什么样（mermaid）
+.venv\Scripts\python.exe -m app.agents.graph --graph
+
+# 两个引擎横向对比（会真实调用模型，约 ¥0.1）
+.venv\Scripts\python.exe -m app.agents.compare
 ```
 
 调用示例（在 Git Bash 下，中文请用文件传参，命令行直传会被编码搞坏）：
@@ -210,14 +229,37 @@ curl -sN -X POST http://127.0.0.1:8000/chat/stream -H "Content-Type: application
 
 ---
 
+## Agent 能力（实测）
+
+**6 个工具，都只读**：`check_disk` `check_load` `check_service` `list_containers`
+`tail_log` `search_knowledge`（前 5 个查现场，最后 1 个查知识库）。
+
+工具层做了两件事，都是安全边界：
+- **参数白名单校验**：`"web-01; rm -rf /"` 这类输入直接被拒，绝不拼 shell
+- **双后端**：默认 `mock`（仿真数据，任何机器都能跑）
+  ／ 可切 `local`（真执行只读命令，Linux 上可用）
+
+**两个引擎实现同一个 ReAct 循环**，用来回答「框架到底替你做了什么」：
+
+| | 手写版 `app/agents/react.py` | LangGraph 版 `app/agents/graph.py` |
+|---|---|---|
+| 循环 | `for` + `break` | `add_conditional_edges` |
+| 状态 | 局部变量 | `AgentState` + reducer，可落盘 |
+| 可视化 | 自己画 | `draw_mermaid()` 白送 |
+| 依赖 | 零 | +7 个包 |
+
+两个版本共用 `common.py` 里的同一份 Prompt 与工具执行逻辑 —— **唯一的变量是编排方式**。
+
+---
+
 ## 进度
 
 - [x] **Day 0** 环境搭建、密钥管理、第一次模型调用
 - [x] **Day 1** Python 基础（5 个练习）+ 容错解析结构化输出
 - [x] **Day 2** FastAPI 服务 + SSE 流式 + 意图解析 + 告警 webhook + 审计留痕
 - [x] **Day 3** RAG 全链路 + 混合检索 + 召回率评测 + 引用溯源问答
-- [ ] **Day 4** 手写 ReAct + LangGraph 双版本
-- [ ] **Day 5** 5 个运维工具 → MCP Server
+- [x] **Day 4** 工具层（6 个运维工具）+ 手写 ReAct + LangGraph 双版本 + 对比评测
+- [ ] **Day 5** 把工具暴露成 MCP Server
 - [ ] **Day 6** 拆成 Supervisor + 4 个专业 Agent
 - [ ] **Day 7** Docker 沙箱执行 + Human-in-the-Loop
 - [ ] **Day 8** 自托管 Langfuse + 全链路 Trace
@@ -233,8 +275,15 @@ curl -sN -X POST http://127.0.0.1:8000/chat/stream -H "Content-Type: application
 agentdesk/
 ├── app/
 │   ├── __init__.py      包说明与目录规划
-│   ├── llm.py           模型调用统一入口（chat / chat_stream / chat_stream_async / chat_json）
-│   ├── main.py          FastAPI 服务入口（10 个接口）
+│   ├── llm.py           模型调用统一入口（含 chat_step：带工具调用的一步）
+│   ├── main.py          FastAPI 服务入口（13 个接口）
+│   ├── agents/          Agent 编排层
+│   │   ├── common.py    两个引擎共用的 Prompt、消息处理、工具执行
+│   │   ├── react.py     手写 ReAct 循环（零依赖，原理在这里）
+│   │   ├── graph.py     LangGraph 状态图版本
+│   │   └── compare.py   两个引擎的对比评测
+│   ├── tools/           工具层（Agent 的「手」）
+│   │   └── ops.py       6 个运维工具 + 参数白名单 + 风险分级 + 双后端
 │   └── rag/
 │       ├── loader.py    文档加载与语义段落切分
 │       ├── embedder.py  可插拔向量后端（dashscope / local 兜底）
@@ -246,14 +295,16 @@ agentdesk/
 ├── docs/
 │   ├── project-map.md        项目框架说明书（每个文件干什么、怎么串起来）
 │   ├── tech-stack.md         技术栈说明（用了什么 / 替代方案 / 怎么测）
+│   ├── react-langgraph.md    ReAct 原理 + 两个实现的对比与取舍
 │   ├── python-reference.md   Python 速查手册（含笔试四件套 + 报错速查表）
 │   └── knowledge-points.md   知识点清单（面试复习用）
 ├── eval/
-│   └── qa_set.json      召回率评测集（32 个问题）
+│   ├── qa_set.json      召回率评测集（32 个问题）
+│   └── reports/         跑出来的报告（可重建，不进仓库）
 ├── practice/
 │   └── day1/            Day 1 的 5 个练习 + 公共封装
 ├── scripts/
-│   └── smoke_test.py    全链路自检：环境 → 模型 → 检索 → 10 个接口
+│   └── smoke_test.py    全链路自检：环境 → 模型 → 检索 → Agent → 13 个接口
 ├── check_env.py        Day 0 验收脚本
 ├── requirements.txt
 ├── .env                 本地密钥（不进仓库）

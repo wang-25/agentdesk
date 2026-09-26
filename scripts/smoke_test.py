@@ -2,23 +2,26 @@
 """
 全链路自检
 ============================================================
-一条命令跑完四层检查，输出 ✅/❌ 清单 + 汇总表。
+一条命令跑完五层检查，输出 ✅/❌ 清单 + 汇总表。
 
 【为什么需要这个脚本】
 技术栈是分层堆起来的：
 
-    Python 环境  →  模型 API  →  检索(RAG)  →  HTTP 服务
+    Python 环境  →  模型 API  →  检索(RAG)  →  Agent(工具+编排)  →  HTTP 服务
 
 出问题时必须自下而上逐层确认。手敲命令一个个试，容易漏、也容易看错。
-这个脚本把四层一次性跑完，最后告诉你「哪一层是好的、哪一层断了」。
+这个脚本把五层一次性跑完，最后告诉你「哪一层是好的、哪一层断了」。
 
 【运行】在 agentdesk 目录下：
-    .venv\\Scripts\\python.exe scripts\\smoke_test.py
+    .venv\\Scripts\\python.exe scripts\\smoke_test.py           # 快速（推荐，不花钱）
+    .venv\\Scripts\\python.exe scripts\\smoke_test.py --full    # 完整（含真实 Agent 调用）
 
-【注意】第 4 层需要服务已在运行。没运行会自动跳过，并提示启动命令。
-        脚本会真实调用模型 3 次（约 ¥0.001），可忽略。
+【注意】
+    - 第 5 层需要服务已在运行。没运行会自动跳过，并提示启动命令。
+    - 默认会真实调用模型 3 次（约 ¥0.001）；--full 再加一次 Agent 调用（约 ¥0.02）。
+    - 「跳过」和「失败」是两回事：服务没启动只会标 ⏭，退出码仍是 0。
 
-【退出码】0 = 全通；1 = 有失败项
+【退出码】0 = 已检查项全通；1 = 有真失败项
 """
 
 import sys
@@ -68,14 +71,15 @@ def brief(exc: Exception) -> str:
 # 第一层：运行环境
 # ============================================================
 def check_env():
-    print("\n[1/4] 运行环境　—— Python 与依赖包")
+    print("\n[1/5] 运行环境　—— Python 与依赖包")
 
     v = sys.version_info
     record("环境", f"Python {v.major}.{v.minor}.{v.micro}",
            v >= (3, 10), "要求 >= 3.10，低于则语法会报错")
 
     # 逐个 import，缺哪个补哪个，而不是笼统说"依赖有问题"
-    packages = ["httpx", "dotenv", "fastapi", "pydantic", "numpy", "jieba", "uvicorn"]
+    packages = ["httpx", "dotenv", "fastapi", "pydantic", "numpy", "jieba",
+                "uvicorn", "langgraph"]
     missing = []
     for name in packages:
         try:
@@ -106,7 +110,7 @@ def check_env():
 # 第二层：模型连通
 # ============================================================
 def check_model():
-    print("\n[2/4] 模型连通　—— 真实发一次请求")
+    print("\n[2/5] 模型连通　—— 真实发一次请求")
 
     try:
         from app.llm import chat
@@ -135,7 +139,7 @@ def check_model():
 # 第三层：检索与问答（RAG）
 # ============================================================
 def check_rag():
-    print("\n[3/4] 检索与问答　—— RAG 全链路")
+    print("\n[3/5] 检索与问答　—— RAG 全链路")
 
     try:
         from app.rag.pipeline import load_store, answer
@@ -180,10 +184,85 @@ def check_rag():
 
 
 # ============================================================
-# 第四层：HTTP 服务（需要服务已在运行）
+# 第四层：Agent（工具 + 编排）
 # ============================================================
-def check_http():
-    print("\n[4/4] HTTP 服务　—— 10 个接口")
+def check_agent(full: bool = False):
+    print("\n[4/5] Agent 层　—— 工具注册表与编排引擎")
+
+    # ---- 工具注册表 ----
+    try:
+        from app.tools import tool_catalog, tool_schemas
+        from app.tools.ops import BACKEND, execute_tool
+        catalog = tool_catalog()
+        schemas = tool_schemas()
+        record("工具", f"注册表载入 {len(catalog)} 个工具", len(catalog) > 0,
+               f"后端 {BACKEND}　" + " · ".join(t["name"] for t in catalog))
+        record("工具", f"schema 转换 {len(schemas)} 条", len(schemas) == len(catalog),
+               "模型看到的就是这些 schema")
+    except Exception as e:
+        record("工具", "载入工具注册表", False, brief(e))
+        return
+
+    # ---- 真的执行一个工具（mocked 后端，不碰系统） ----
+    try:
+        out = execute_tool("check_disk", {"host": "web-01"})
+        ok = out.get("ok")
+        record("工具", "执行 check_disk(web-01)", bool(ok),
+               f"最高使用率 {out.get('result', {}).get('max_use_percent')}%"
+               f" / level={out.get('result', {}).get('level')}" if ok
+               else out.get("error"))
+    except Exception as e:
+        record("工具", "执行 check_disk", False, brief(e))
+
+    # ---- 参数校验是否真的在拦（这是安全边界，必须验） ----
+    try:
+        bad = execute_tool("check_disk", {"host": "web-01; rm -rf /"})
+        ok = (not bad.get("ok")) and "不合法" in (bad.get("error") or "")
+        record("工具", "拒绝非法参数（防注入）", ok,
+               bad.get("error", "")[:60])
+    except Exception as e:
+        record("工具", "参数校验", False, brief(e))
+
+    # ---- 手写引擎：模块可导入 + 图能编译 ----
+    try:
+        from app.agents.react import run as hw_run            # noqa: F401
+        record("编排", "手写 ReAct 引擎可导入", True, "app/agents/react.py")
+    except Exception as e:
+        record("编排", "手写 ReAct 引擎", False, brief(e))
+
+    try:
+        from app.agents.graph import build_graph, mermaid
+        build_graph(6)
+        mm = mermaid(6)
+        has_loop = "tools --> agent" in mm
+        record("编排", "LangGraph 状态图编译", True,
+               f"mermaid {len(mm)} 字符　循环边 {'存在' if has_loop else '缺失!'}")
+    except Exception as e:
+        record("编排", "LangGraph 状态图", False, brief(e))
+
+    # ---- 可选：真跑一轮（花钱，默认不跑） ----
+    if full:
+        try:
+            from app.agents.graph import run as lg_run
+            t0 = time.time()
+            res = lg_run("web-01 上的磁盘用满了吗", max_steps=3)
+            record("编排", "LangGraph 真跑一轮", bool(res["answer"]),
+                   f"{time.time() - t0:.1f}s · {res['rounds']} 轮 · "
+                   f"{res['tool_calls']} 次工具调用 · "
+                   f"token {res['usage'].get('total_tokens', 0)}")
+        except Exception as e:
+            record("编排", "LangGraph 真跑一轮", False, brief(e))
+    else:
+        record("编排", "真实一轮 Agent 调用（默认跳过）", False,
+               "加 --full 参数才会跑：python scripts/smoke_test.py --full",
+               skipped=True)
+
+
+# ============================================================
+# 第五层：HTTP 服务（需要服务已在运行）
+# ============================================================
+def check_http(full: bool = False):
+    print("\n[5/5] HTTP 服务　—— 13 个接口")
 
     import httpx
 
@@ -310,6 +389,44 @@ def check_http():
     except Exception as e:
         record("接口", "POST /webhook/alert", False, brief(e))
 
+    # GET /agent/tools
+    try:
+        r = httpx.get(f"{BASE_URL}/agent/tools", timeout=20)
+        ok = r.status_code == 200
+        d = r.json() if ok else {}
+        record("接口", "GET  /agent/tools（工具清单）", ok,
+               f"{d.get('count')} 个工具 · 后端 {d.get('backend')}" if ok
+               else f"HTTP {r.status_code}")
+    except Exception as e:
+        record("接口", "GET  /agent/tools", False, brief(e))
+
+    # GET /agent/graph —— 状态图里必须有那条循环边，没有就说明图建错了
+    try:
+        r = httpx.get(f"{BASE_URL}/agent/graph", timeout=20)
+        ok = r.status_code == 200 and "tools --> agent" in r.text
+        record("接口", "GET  /agent/graph（状态图）", ok,
+               "循环边存在" if ok else "未找到 tools --> agent 边")
+    except Exception as e:
+        record("接口", "GET  /agent/graph", False, brief(e))
+
+    # POST /agent/ask —— 真跑一轮 Agent，比较贵，只在 --full 时跑
+    if full:
+        try:
+            t0 = time.time()
+            r = post("/agent/ask", {"question": "web-01 上的磁盘用满了吗",
+                                    "engine": "langgraph", "max_steps": 3})
+            ok = r.status_code == 200 and r.json().get("answer")
+            m = (r.json().get("metrics") or {}) if r.status_code == 200 else {}
+            record("接口", "POST /agent/ask（自主诊断）", bool(ok),
+                   f"{time.time() - t0:.1f}s · {m.get('rounds')} 轮 · "
+                   f"{m.get('tool_calls')} 次工具调用 · "
+                   f"token {m.get('tokens')}" if ok else f"HTTP {r.status_code}")
+        except Exception as e:
+            record("接口", "POST /agent/ask", False, brief(e))
+    else:
+        record("接口", "POST /agent/ask（默认跳过）", False,
+               "加 --full 参数才会跑（一次约 7k token）", skipped=True)
+
 
 # ============================================================
 # 汇总
@@ -319,18 +436,20 @@ def summarize():
     print("  自检汇总")
     print("=" * 62)
 
-    layers = ["环境", "模型", "检索", "问答", "服务", "接口"]
+    layers = ["环境", "模型", "检索", "问答", "工具", "编排", "服务", "接口"]
     for layer in layers:
         rows = [r for r in results if r[0] == layer]
         if not rows:
             continue
         skipped = sum(1 for r in rows if r[4])
         ok = sum(1 for r in rows if r[2] and not r[4])
-        if skipped and ok == 0:
+        checked = len(rows) - skipped
+        if skipped and checked == 0:
             print(f"  {layer:4s} ⏭ 跳过　{len(rows)} 项")
             continue
-        bar = "█" * ok + "░" * (len(rows) - ok - skipped)
-        print(f"  {layer:4s} {bar}  {ok}/{len(rows)}")
+        bar = "█" * ok + "░" * (checked - ok)
+        tail = f"　(另跳过 {skipped} 项)" if skipped else ""
+        print(f"  {layer:4s} {bar}  {ok}/{checked}{tail}")
 
     failed = [r for r in results if not r[2] and not r[4]]
     skipped = [r for r in results if r[4]]
@@ -342,25 +461,39 @@ def summarize():
         print("\n  → 从最下面的失败层往上修，上面那层通常是它的连带后果。")
     elif skipped:
         print("  ✅ 已检查的项目全部通过。")
-        print(f"  ⏭  有 {len(skipped)} 项被跳过（服务没在跑），启动服务后可复跑。")
+        print(f"  ⏭  有 {len(skipped)} 项被跳过（服务没在跑 / 未加 --full），可复跑。")
     else:
-        print("  ✅ 全部通过。四层技术栈都在工作。")
+        print("  ✅ 全部通过。五层技术栈都在工作。")
     print("=" * 62)
     return 1 if failed else 0
 
 
 def main():
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="AgentDesk 全链路自检（五层：环境/模型/检索/Agent/接口）")
+    parser.add_argument("--full", action="store_true",
+                        help="额外跑一次真实 Agent 调用（约 7k token，默认跳过）")
+    args = parser.parse_args()
+
     print("=" * 62)
     print("  AgentDesk 全链路自检")
     print(f"  项目目录：{PROJECT_ROOT}")
+    print(f"  模式：{'完整（含真实 Agent 调用）' if args.full else '快速（跳过花钱项）'}")
     print("=" * 62)
 
-    for step in (check_env, check_model, check_rag, check_http):
+    steps = [lambda: check_env(),
+             lambda: check_model(),
+             lambda: check_rag(),
+             lambda: check_agent(args.full),
+             lambda: check_http(args.full)]
+    for step in steps:
         try:
             step()
         except Exception as e:
             # 单个步骤意外崩了，不该拖垮整份报告
-            record("脚本", step.__name__, False, brief(e))
+            record("脚本", "某一步", False, brief(e))
 
     sys.exit(summarize())
 

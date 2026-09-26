@@ -11,7 +11,12 @@
 
 ## 第 0 章｜一页速览
 
-**整个项目只用了 7 个第三方包。** 这是刻意的——依赖越少，出问题的面越小，面试也越讲得清。
+**整个项目的直接依赖只有 8 个。** 这是刻意的——依赖越少，出问题的面越小，面试也越讲得清。
+
+> 但要注意一个数字：`pip list` 里实际有 **49 个包**。多出来的 41 个是传递依赖 ——
+> 装一个 `langgraph` 就带进来 `langchain-core`、`langgraph-checkpoint`、
+> `langsmith`、`orjson`、`zstandard` 等 7 个直接/间接依赖。
+> **"我只装了 8 个包"和"环境里有 49 个包"是两件事，面试被问到依赖治理时能答出这个区别很加分。**
 
 | 层 | 用了什么 | 版本 | 在哪个文件 | 一句话职责 |
 |---|---|---|---|---|
@@ -23,16 +28,18 @@
 | 数据校验 | `pydantic` | ≥2.9 | `main.py` | 定义接口收什么、返什么，自动校验 |
 | 数值计算 | `numpy` | ≥1.26 | `store.py` `embedder.py` | 向量存成矩阵，相似度=一次矩阵乘法 |
 | 中文分词 | `jieba` | ≥0.42 | `store.py` | 给 BM25 分词（缺了会退化成字符 bigram） |
+| **Agent 编排** | **`langgraph`** | **≥0.2（装的 1.2.12）** | `agents/graph.py` | **状态图编排：检查点、可视化、按节点流式** |
 
 **没用的东西同样值得记住**（面试常被问"你为什么不用 X"）：
 
 | 没用 | 为什么 |
 |---|---|
-| **LangChain / LangGraph** | Day 4 才会引入。**先手写 ReAct 一遍**，搞清编排到底在做什么，再上框架 —— 顺序反了，你只会用框架，答不出原理 |
-| **OpenAI SDK** | 用 `httpx` 手写。SDK 是黑盒，出问题时你不知道它到底发了什么请求。手写一遍，`messages` 数组、`stream`、`temperature` 你都亲眼见过 |
+| **LangChain 全家桶** | 只引了 `langgraph`（Day 4）。**没有引 `langchain`、chains、agents 那套**——本项目手写协议调用，不需要它。LangGraph 是独立的编排层，可以单独用 |
+| **OpenAI SDK** | 用 `httpx` 手写。SDK 是黑盒，出问题时你不知道它到底发了什么请求。手写一遍，`messages` 数组、`tools` 参数、`stream`、`temperature` 你都亲眼见过 |
 | **Milvus / Qdrant / FAISS** | 50 个块的规模用不上。向量库解决的是"千万级向量的近似最近邻"，我这儿一次矩阵乘法几毫秒就完了 |
 | **requests** | 它不支持流式 + 异步。而流式和高并发是项目的核心需求 |
 | **Flask / Django** | 都不是原生异步，做 SSE 流式要绕路；FastAPI 原生 async + pydantic 直接省掉一半参数校验代码 |
+| **PydanticAI / AutoGen / CrewAI** | 同类 Agent 框架。LangGraph 胜在"状态图 + 检查点"这套心智模型最贴近"可中断、可恢复、可观测"的生产需求 |
 
 ---
 
@@ -376,40 +383,113 @@ git check-ignore -v .env      # 应输出「.gitignore:行号:.env」
 
 ---
 
+### 12. LangGraph —— Agent 编排（Day 4 引入）
+
+**怎么实现的**（`app/agents/graph.py`）：把 ReAct 循环画成状态图。
+
+```python
+class AgentState(TypedDict):
+    messages: Annotated[list, add_messages]      # reducer：追加并去重
+    steps:    Annotated[list, operator.add]      # 轨迹拼接
+    usage:    Annotated[dict, _merge_usage]      # ★ token 累加
+    stop_reason: str                             # 不写 Annotated → 覆盖
+
+graph.add_edge("tools", "agent")                 # 这条回头边就是「循环」
+graph.add_conditional_edges("agent", route, {...})  # 这就是那个 if
+```
+
+**`Annotated[..., reducer]` 是它的核心概念**：节点返回的字典怎么合并进状态，由 reducer 决定。
+不写 reducer 就是"后写的覆盖前面的"。
+
+**★ 同一个循环项目里有两份实现**，这是刻意的：
+
+| | 手写版 `react.py` | LangGraph 版 `graph.py` |
+|---|---|---|
+| 循环 | `for` + `break` | `add_edge("tools","agent")` |
+| 条件 | `if not tool_calls:` | `add_conditional_edges` |
+| 状态 | 局部变量 | `AgentState` + reducer，可落盘 |
+| 可视化 | 自己画 | `draw_mermaid()` 白送 |
+| 检查点 | 要自己做 | 内建 |
+| 依赖 | 0 | +7 个包 |
+
+**替代方案的差异**：
+
+| 替代 | 差异 | 什么时候换成它 |
+|---|---|---|
+| **纯手写循环**（本项目也有） | 零依赖、原理透明、报错栈干净。**但没有检查点** —— 做"人工确认"要自己实现状态落盘 | 需求简单、要极致可控时 |
+| **PydanticAI** | 类型安全做得最好，写法更 Pythonic，**但生态和示例比 LangGraph 少** | 团队重类型、喜欢 Pydantic 风格 |
+| **AutoGen**（微软） | 面向"多 Agent 对话"设计，Agent 之间互相聊天。**对"工具编排"的抽象不如状态图清晰** | 任务本质是多角色对话时 |
+| **CrewAI** | 上手最快，"角色 + 任务" 的写法很直观。**但定制性弱** —— 复杂的循环/回退逻辑不好表达 | 快速做 demo |
+| **OpenAI Agents SDK** | 官方出品，轻量，**但和 OpenAI 生态绑定较紧** | 主要用 OpenAI 模型时 |
+| **自建状态机**（不用框架） | 完全可控，但要自己实现检查点、恢复、可视化 —— **这几样才是框架真正的价值** | 有特殊约束不能引框架 |
+
+**为什么选 LangGraph**：它的心智模型（状态图 + reducer + 检查点）最贴近
+Agent 生产化的三个真实需求 —— **可中断（人工确认）、可恢复（崩了续跑）、
+可观测（按节点看进度）**。而这三点恰好是本项目 Day 7-8 要做的。
+
+**代价（面试更想听这个）**：
+
+| 代价 | 具体表现 |
+|---|---|
+| 消息格式要转换 | 原生 API 的 `arguments` 是**字符串**，LangChain 的 `args` 是 **dict**。少写一个字段不报错，只在某次工具调用时莫名失败 |
+| 抽象层让排查变难 | 报错栈里全是框架内部帧 |
+| 依赖变重 | 1 个包 → 实际多装 7 个（`langchain-core`、`langgraph-checkpoint`、`langsmith`、`orjson`、`zstandard` …） |
+| 版本变化快 | 0.x → 1.x 期间 API 改过好几轮 |
+
+**怎么验证**：
+
+```bash
+# 看状态图（不花钱，几秒）
+.venv\Scripts\python.exe -m app.agents.graph --graph
+
+# 跑一轮
+.venv\Scripts\python.exe -m app.agents.graph "cache-01 的 Redis 容器一直重启"
+
+# 和手写版对比（约 ¥0.1）
+.venv\Scripts\python.exe -m app.agents.compare
+```
+
+> 完整的对比数据、两个真实踩过的坑，见 [`react-langgraph.md`](react-langgraph.md)。
+
+---
+
 ## 第 2 章｜总表：什么时候该换
 
 把上面所有"升级触发器"收成一张表。**这张表就是"技术选型"面试题的答案骨架**。
 
 | 技术 | 现在够用的理由 | 什么信号出现时该换 | 换成什么 |
 |---|---|---|---|
-| Python + venv | 依赖只有 7 个 | 装包开始变慢、要锁版本 | `uv` 或 `poetry` |
+| Python + venv | 直接依赖只有 8 个 | 装包开始变慢、要锁版本 | `uv` 或 `poetry` |
 | httpx 手写 | 要看清协议细节 | 要接 5 家以上模型、要统一重试与限流 | `openai` SDK + 网关（LiteLLM） |
 | DeepSeek | 便宜到能随便试错 | 要处理敏感数据 / 要私有化 | 本地 Ollama / vLLM |
 | FastAPI 单进程 | 本机演示够用 | 上线、要抗并发 | gunicorn + uvicorn worker |
 | 内存向量索引 | 50 块，检索几毫秒 | 语料到几十万块 / 要在线增删 | Qdrant 或 pgvector |
 | local 哈希向量 | 零 Key 也能跑通 | **要真实语义效果**（现在就该换） | 百炼 `text-embedding-v3` 或本地 BGE-M3 |
 | BM25 手写 | 公式只有几行，好讲 | 上生产 | `rank_bm25` 库或 Elasticsearch |
+| **LangGraph 内存检查点** | 单进程演示够用 | 要跨进程恢复 / 要多人协作查看历史 | 检查点换 Postgres / Redis 存储 |
+| **手写 ReAct** | 原理透明，讲得清 | 复杂分支、要中断续跑 | 全面切 LangGraph（已在用） |
+| **工具 mock 后端** | 任何机器都能复现 | 要演示真实故障处置 | `local` 后端，再到 Day 7 的 Docker 沙箱 |
 | `.env` + dotenv | 单人开发 | 配置项超过 10 个 | `pydantic-settings` |
 | 无缓存 | 调用量小 | 调用量上来、开始心疼钱 | Redis 缓存 + 上下文缓存 |
 
 ---
 
-## 第 3 章｜Day 4 起会引入的技术栈
+## 第 3 章｜Day 5 起会引入的技术栈
 
 提前知道"下一步要加什么、以及它们的替代品"，面试时你就能讲"技术演进路线"而不只是"我现在有什么"。
 
 | 要做的 | 主流做法 | 手写替代（本项目风格） | 区别 |
 |---|---|---|---|
-| Agent 编排 | **LangGraph**（状态图） | 手写 ReAct 循环（while + 工具调用） | 手写能讲清每一步；LangGraph 有状态管理、检查点、可视化，生产上更稳 |
-| 工具接入 | **MCP**（模型上下文协议） | 自己定义 JSON schema 的工具函数 | MCP 是标准协议，能被 Cursor 等客户端直接调用；自定义只在自家项目内可用 |
-| 可观测 | **Langfuse**（自托管） | 自己写 JSONL 日志 | Langfuse 有 Trace 树、Token 成本面板、Prompt 版本管理；自己写只能查文本 |
-| 评测 | **Ragas**（LLM-as-Judge） | 自己写召回率 + 关键词命中（本项目已有） | Ragas 有忠实度、答案相关性等成熟指标；自写指标简单但可解释 |
-| 沙箱执行 | **Docker** 一次性容器 | 直接 `subprocess` | Docker 有文件系统隔离、资源限制、网络隔离；subprocess **等于把机器交出去** |
+| 工具接入 | **MCP**（模型上下文协议） | 自己定义 JSON schema 的工具函数（**本项目已有**，Day 5 包成 MCP Server） | MCP 是标准协议，能被 Cursor / Claude 等客户端直接调用；自定义只在自家项目内可用 |
+| 多 Agent 协同 | **LangGraph Supervisor** | 自己在图上多挂几个节点 + 路由 | Supervisor 管"派活、汇总、决定走哪条边"；适合把职责拆开分别评测 |
+| 可观测 | **Langfuse**（自托管） | 自己写 JSONL 日志（**本项目已有审计**） | Langfuse 有 Trace 树、Token 成本面板、Prompt 版本管理；自己写只能查文本 |
+| 评测 | **Ragas**（LLM-as-Judge） | 自己写召回率 + 双引擎对比（**本项目已有**） | Ragas 有忠实度、答案相关性等成熟指标；自写指标简单但可解释 |
+| 沙箱执行 | **Docker** 一次性容器 | `subprocess` + 白名单（**本项目 local 后端已是这个，但不够**） | Docker 有文件系统隔离、资源限制、网络隔离；subprocess **等于把机器交出去** |
 | 监控告警 | **Prometheus + Grafana** | 打印日志 | 你已有 Zabbix/Grafana 底子，这块上手最快 |
 | 部署 | **Docker Compose + Nginx** | 直接跑 uvicorn | Nginx 负责 HTTPS、超时、缓冲控制（SSE 那个坑就出在这里） |
 
 > **注意一个顺序问题**：**先手写，再上框架。** 反了的话你只会用框架，面试官问"LangGraph 的状态图底层怎么跑的"你就答不上来。
-> 这也是本项目到现在还**故意不引 LangChain 依赖**的原因。
+> 本项目已经做到了这一点：手写 ReAct 和 LangGraph 版**同时存在**，可以直接对比。
 
 ---
 
@@ -460,20 +540,31 @@ RAG 模块可以直接当 CLI 跑：
 .venv\Scripts\python.exe scripts\smoke_test.py
 ```
 
-一条命令跑完四层：**运行环境 → 模型连通 → 检索与问答 → HTTP 十个接口**，最后给出汇总表和失败项的修复提示。**退出码 0 = 全通**，可以接进自动化。
+### 4.5 一键自检（新增，最省事）
+
+```bash
+.venv\Scripts\python.exe scripts\smoke_test.py          # 快速，不花钱
+.venv\Scripts\python.exe scripts\smoke_test.py --full   # 加一次真实 Agent 调用
+```
+
+一条命令跑完五层：**运行环境 → 模型连通 → 检索与问答 → Agent（工具+编排）→ HTTP 十三个接口**，
+最后给出汇总表和失败项的修复提示。**退出码 0 = 已检查项全通**，可以接进自动化。
+
+`--full` 才会跑真实 Agent 调用（约 7k token）—— **默认跳过花钱项，这样你可以随手跑。**
 
 ---
 
-## 第 5 章｜怎么测试：分四层
+## 第 5 章｜怎么测试：分五层
 
 **核心原则：从下往上测。** 下面的层断了，上面的失败都是连带后果——先修下面那个。
 
 | 层 | 测什么 | 怎么测 | 通过标准 |
 |---|---|---|---|
-| **1 环境** | Python 版本、7 个依赖包、`.env` 密钥 | `scripts\smoke_test.py` 第 1 层 | 4 项全 ✅ |
-| **2 模型** | Key 有效、网络通、能拿到回答 | `smoke_test.py` 第 2 层；或直接跑 `check_env.py` | 拿到回答 + 打印 token 用量 |
-| **3 检索** | 索引能载入、三种模式都能召回、问答带引用 | `smoke_test.py` 第 3 层；或 `pipeline eval` | 召回率表跑出来；引用里能看到来源文件名 |
-| **4 服务** | 10 个接口都能通、参数校验生效、告警分级正确 | `smoke_test.py` 第 4 层；或 `/docs` 页面逐点点 | 9 项接口全 ✅ |
+| **1 环境** | Python 版本、8 个直接依赖、`.env` 密钥 | `smoke_test.py` 第 1 层 | 4 项全 ✅ |
+| **2 模型** | Key 有效、网络通、能拿到回答 | `smoke_test.py` 第 2 层；或 `check_env.py` | 拿到回答 + 打印 token 用量 |
+| **3 检索** | 索引能载入、三种模式都能召回、问答带引用 | `smoke_test.py` 第 3 层；或 `pipeline eval` | 召回率表跑出来；引用里有来源文件名 |
+| **4 Agent** | 工具注册表能载入、能执行、**能拒绝非法参数**、状态图能编译 | `smoke_test.py` 第 4 层 | 6 项全 ✅ |
+| **5 服务** | 13 个接口都能通、参数校验生效、告警分级正确 | `smoke_test.py` 第 5 层；或 `/docs` 逐点点 | 12 项接口全 ✅ |
 
 **几个"故意制造错误"的测试**（比"能跑通"更能证明你理解系统）：
 
@@ -484,6 +575,9 @@ RAG 模块可以直接当 CLI 跑：
 | 高危操作会被拦 | 推 `DiskSpaceCritical` 告警 | `decision: need_human`，**不执行任何操作** |
 | 流式真的是流式 | curl 加 `-N` 看输出 | 字逐块到达，不是一次性出现 |
 | 索引后端不匹配 | 载入用另一个后端建的索引 | **显式报错**，而不是查出乱七八糟的结果 |
+| **防命令注入真的生效** | `execute_tool("check_disk", {"host": "web-01; rm -rf /"})` | 返回「主机名不合法」，**被拒绝** |
+| **Agent 不会无限循环** | `--max-steps 1` 跑一个复杂问题 | `stop_reason: max_steps`，且给出了收口答案 |
+| **Agent 不会硬找问题** | 问一个一切正常的主机（Q3 负例） | 如实回答"没发现问题"，而不是编一个隐患 |
 
 ---
 
@@ -514,6 +608,20 @@ RAG 模块可以直接当 CLI 跑：
 > 实测混合检索的 Top-3 召回率是 100%，比纯向量的 93.8% 和纯 BM25 的 96.9% 都高——
 > **因为它两个都高，说明两路漏掉的是不同的题目**。"
 
-**这三段的共同点**：**每段都有数字或具体的技术约束**，不是"我觉得它更好"。
+**示范四：「你为什么用 LangGraph，而不是自己写？」**
+
+> "我两个都写了 —— 项目里手写 ReAct 和 LangGraph 版同时存在，因为我想搞清楚框架
+> 到底替我做了什么。结论是：手写版就是 `for` 循环加 `break`，主干 30 行；
+> LangGraph 里 `add_edge("tools","agent")` 那条回头边就是循环。
+>
+> 它真正多给我三样：**检查点**（能中断续跑 —— 这是我后面做人工确认功能的技术前提，
+> 手写要实现得自己搞状态落盘）、结构可视化（`draw_mermaid()` 直接出架构图）、
+> 按节点流式输出进度。
+>
+> 代价我也清楚：**消息格式要转换**，原生 API 的 `arguments` 是字符串、
+> LangChain 的 `args` 是 dict，少写一个字段不报错、只在某次工具调用时莫名失败；
+> 还有依赖从 1 个包变成 8 个。"
+
+**这四段的共同点**：**每段都有数字或具体的技术约束**，不是"我觉得它更好"。
 
 > 一句话原则：**说不出代价的技术选型，在面试官耳朵里就是"跟着教程抄的"。**
