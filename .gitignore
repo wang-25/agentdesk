@@ -35,3 +35,6 @@ eval/reports/
 .idea/
 .DS_Store
 Thumbs.db
+
+# 练习脚本生成的产物（可随时重跑生成）
+output/
