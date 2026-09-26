@@ -38,3 +38,7 @@ Thumbs.db
 
 # 练习脚本生成的产物（可随时重跑生成）
 output/
+
+# 测试用的临时 payload
+_t*.json
+_q.json

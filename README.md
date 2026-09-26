@@ -116,22 +116,54 @@ python -m venv .venv
 
 **通过标准**：屏幕出现模型的一句回答，并打印出本次调用的 token 用量与成本估算。
 
+### 4. 启动服务
+
+```bash
+.venv\Scripts\python.exe -m uvicorn app.main:app --reload --port 8000
+```
+
+启动后打开 **http://127.0.0.1:8000/docs** —— FastAPI 自动生成的交互式文档，
+不用写前端就能点着测每一个接口。
+
+### 5. 接口一览
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/health` | 健康检查，供容器探活和监控使用 |
+| POST | `/chat` | 问答，一次性返回完整回答 |
+| POST | `/chat/stream` | 问答，SSE 流式返回（字逐个蹦出） |
+| POST | `/parse` | 意图解析：把一句人话变成结构化 JSON |
+| POST | `/webhook/alert` | 告警驱动的入口（骨架，待实现） |
+
+调用示例（在 Git Bash 下，中文请用文件传参，命令行直传会被编码搞坏）：
+
+```bash
+# 先生成 payload 文件，避免中文在命令行里被破坏
+python -c "import json,pathlib;pathlib.Path('_q.json').write_text(json.dumps({'question':'帮我看看 web-01 上 nginx 的日志'},ensure_ascii=False),encoding='utf-8')"
+
+# 非流式
+curl -s -X POST http://127.0.0.1:8000/chat -H "Content-Type: application/json" --data-binary @_q.json
+
+# 流式（-N 关闭缓冲，才能看到逐块输出）
+curl -sN -X POST http://127.0.0.1:8000/chat/stream -H "Content-Type: application/json" --data-binary @_q.json
+```
+
 ---
 
 ## 进度
 
 - [x] **Day 0** 环境搭建、密钥管理、第一次模型调用
-- [ ] **Day 1-3** Python 子集 + Prompt 工程 + 结构化输出（产出：CLI 问答脚本）
-- [ ] **Day 4** FastAPI + SSE 流式接口
-- [ ] **Day 5-6** RAG 全链路（解析 → 切分 → 向量化 → 检索 → 重排）
-- [ ] **Day 7** 手写 ReAct + LangGraph 双版本
-- [ ] **Day 8** 5 个运维工具 → MCP Server
-- [ ] **Day 9** 拆成 Supervisor + 4 个专业 Agent
-- [ ] **Day 10** Docker 沙箱 + Human-in-the-Loop
-- [ ] **Day 11** 自托管 Langfuse + 全链路 Trace
-- [ ] **Day 12** 40 条评测集 + 评测报告
-- [ ] **Day 13** 部署到公网
-- [ ] **Day 14-15** 仓库整理 + 简历 + 面试演练
+- [x] **Day 1** Python 基础（5 个练习）+ 容错解析结构化输出
+- [x] **Day 2** FastAPI 服务 + SSE 流式 + 意图解析接口
+- [ ] **Day 3** RAG 全链路（解析 → 切分 → 向量化 → 检索 → 重排）
+- [ ] **Day 4** 手写 ReAct + LangGraph 双版本
+- [ ] **Day 5** 5 个运维工具 → MCP Server
+- [ ] **Day 6** 拆成 Supervisor + 4 个专业 Agent
+- [ ] **Day 7** Docker 沙箱执行 + Human-in-the-Loop
+- [ ] **Day 8** 自托管 Langfuse + 全链路 Trace
+- [ ] **Day 9** 40 条评测集 + 评测报告
+- [ ] **Day 10** 部署到公网（Docker Compose + Nginx + HTTPS）
+- [ ] **Day 11-15** 仓库整理 + 简历 + 面试演练 + 第一批投递
 
 ---
 
@@ -139,11 +171,21 @@ python -m venv .venv
 
 ```
 agentdesk/
-├── check_env.py      # Day 0 验收脚本：验证环境、Key、网络
+├── app/
+│   ├── __init__.py      包说明与目录规划
+│   ├── llm.py           模型调用的统一入口（chat / chat_stream / chat_json）
+│   └── main.py          FastAPI 服务入口（5 个接口）
+├── docs/
+│   └── python-reference.md   Python 速查手册（含笔试四件套 + 报错速查表）
+├── practice/
+│   └── day1/            Day 1 的 5 个练习 + 公共封装
+├── check_env.py        Day 0 验收脚本
 ├── requirements.txt
-├── .env               # 本地密钥（不进仓库）
-├── .env.example       # 模板
+├── .env                 本地密钥（不进仓库）
+├── .env.example         模板
 └── .gitignore
 ```
 
-> Day 4 开始补充 `app/`（编排、Agent、工具、RAG、沙箱、可观测）与 `eval/`、`deploy/`。
+> 后续补充 `app/agents/`、`app/tools/`、`app/mcp_server/`、`app/rag/`、
+> `app/sandbox/`、`app/observability/`，以及 `eval/` 与 `deploy/`。
+

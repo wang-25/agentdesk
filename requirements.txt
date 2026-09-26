@@ -1,21 +1,24 @@
 # ============================================================
 #  Dependencies
 # ------------------------------------------------------------
-#  Day 0 only needs these two.
+#  Add one line each time you add a feature,
+#  then re-run:  pip install -r requirements.txt
 #
-#  Why so few on purpose?
-#  The fewer packages, the fewer places things can go wrong,
-#  and the faster you get the "it works" feedback.
-#  Add one line each time you add a feature, then re-run install.
-#
-#  NOTE: keep this file ASCII-only. pip reads it with the
-#  system locale encoding (GBK on Chinese Windows), so any
-#  non-ASCII character here will crash the install.
+#  NOTE: keep this file ASCII-only. pip reads it with the system
+#  locale encoding (GBK on Chinese Windows), so any non-ASCII
+#  character here will crash the install.
 # ============================================================
 
-# HTTP client. Better async support than requests --
-# FastAPI streaming responses will use it too.
+# ---------- Day 0 ----------
+# HTTP client. Used to call the model API.
 httpx>=0.27
-
 # Read variables from .env so secrets stay out of the code.
 python-dotenv>=1.0
+
+# ---------- Day 2 ----------
+# Web framework. Turns our code into an HTTP service.
+fastapi>=0.115
+# The server that actually runs FastAPI.
+uvicorn[standard]>=0.32
+# Data validation. FastAPI relies on it for request bodies.
+pydantic>=2.9
