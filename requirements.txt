@@ -1,15 +1,21 @@
 # ============================================================
-#  依赖清单
+#  Dependencies
 # ------------------------------------------------------------
-#  Day 0 只装两个。
-#  为什么刻意这么少？因为装得越少，出错的地方越少，
-#  你能更快拿到「跑通了」这个反馈。后面每加一个功能，
-#  再往这里加一行，然后重跑一次安装命令。
+#  Day 0 only needs these two.
+#
+#  Why so few on purpose?
+#  The fewer packages, the fewer places things can go wrong,
+#  and the faster you get the "it works" feedback.
+#  Add one line each time you add a feature, then re-run install.
+#
+#  NOTE: keep this file ASCII-only. pip reads it with the
+#  system locale encoding (GBK on Chinese Windows), so any
+#  non-ASCII character here will crash the install.
 # ============================================================
 
-# 发 HTTP 请求用。比 requests 更好地支持 async，
-# 后面 FastAPI 做流式输出时也是用它
+# HTTP client. Better async support than requests --
+# FastAPI streaming responses will use it too.
 httpx>=0.27
 
-# 读取 .env 文件里的环境变量，把密钥和代码分开
+# Read variables from .env so secrets stay out of the code.
 python-dotenv>=1.0
