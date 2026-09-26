@@ -22,3 +22,11 @@ fastapi>=0.115
 uvicorn[standard]>=0.32
 # Data validation. FastAPI relies on it for request bodies.
 pydantic>=2.9
+
+# ---------- Day 3 (RAG) ----------
+# Vector math. Embeddings are stored as matrices, so similarity search
+# becomes a single matrix multiplication.
+numpy>=1.26
+# Chinese word segmentation, used by BM25 keyword retrieval.
+# Pure Python, no model download required.
+jieba>=0.42

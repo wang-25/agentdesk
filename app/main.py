@@ -14,6 +14,10 @@ AgentDesk 服务入口
     POST /chat/stream     问答，SSE 流式返回（异步版）
     POST /parse           意图解析，把一句人话转成结构化 JSON
     POST /webhook/alert   告警驱动的入口 —— 无人值守自动诊断
+    GET  /rag/stats       知识库索引统计
+    POST /rag/index       重建索引
+    POST /rag/search      只检索不生成（排查检索质量用）
+    POST /rag/ask         RAG 问答，带引用溯源
 
 服务起来后打开 http://127.0.0.1:8000/docs 有自动生成的交互式文档。
 """
@@ -36,7 +40,7 @@ from app.llm import chat_json, chat_stream_async
 app = FastAPI(
     title="AgentDesk",
     description="面向运维场景的多 Agent 智能体系统",
-    version="0.2.0",
+    version="0.3.0",
 )
 
 # ============================================================
@@ -449,3 +453,110 @@ def webhook_alert(payload: dict):
         reports.append(report)
 
     return {"received": len(alerts), "reports": reports}
+
+
+# ============================================================
+# RAG：检索增强
+# ============================================================
+class SearchRequest(BaseModel):
+    question: str = Field(..., min_length=1, max_length=2000,
+                          description="要检索的问题")
+    top_k: int = Field(5, ge=1, le=20, description="返回前几条")
+    mode: str = Field("hybrid", pattern="^(vector|bm25|hybrid)$",
+                      description="检索模式：vector 纯向量 / bm25 纯关键词 / hybrid 混合")
+
+
+def _rag_error(e: Exception):
+    """把 RAG 层的异常翻译成合适的 HTTP 状态码。"""
+    if isinstance(e, FileNotFoundError):
+        # 索引还没建 —— 这是「前置条件不满足」，用 503 而不是 500
+        return HTTPException(status_code=503, detail=(
+            f"{e}。请先调用 POST /rag/index 构建索引，"
+            "或执行 python -m app.rag.pipeline build"))
+    if isinstance(e, RuntimeError):
+        # 索引与当前 embedding 后端不匹配
+        return HTTPException(status_code=409, detail=str(e))
+    return HTTPException(status_code=502, detail=str(e))
+
+
+@app.get("/rag/stats")
+def rag_stats():
+    """索引统计：有多少文档、多少块、用的哪个向量后端。"""
+    from app.rag.pipeline import load_store
+    try:
+        store = load_store()
+    except (FileNotFoundError, RuntimeError) as e:
+        raise _rag_error(e)
+
+    docs = sorted({c.doc_id for c in store.chunks})
+    return {
+        "documents": len(docs),
+        "chunks": len(store.chunks),
+        "doc_ids": docs,
+        "embedder": store.embedder.describe(),
+        "embedder_ready": store.embedder.backend != "local",
+    }
+
+
+@app.post("/rag/index")
+def rag_index():
+    """重建索引。
+
+    语料有更新（新增或修改文档）之后必须重建 —— 向量不会自己更新。
+    生产上这一步会做成增量索引加定时任务；当前规模直接全量重建，
+    几十个块只要一两秒。
+    """
+    from app.rag.pipeline import build_index, load_store
+    try:
+        stats = build_index(verbose=False)
+        load_store(force=True)      # 清掉进程内缓存，让新索引立即生效
+    except (FileNotFoundError, RuntimeError) as e:
+        raise _rag_error(e)
+    write_audit("rag.index_rebuilt", {"documents": stats["documents"],
+                                      "chunks": stats["chunks"]})
+    return stats
+
+
+@app.post("/rag/search")
+def rag_search(req: SearchRequest):
+    """只检索，不生成。
+
+    这个接口是用来定位问题的：回答不对时，
+    先调它看看检索回来的片段对不对 ——
+    如果检索就不对，那是语料或切分的问题，改 Prompt 没用。
+    """
+    from app.rag.pipeline import retrieve
+    try:
+        hits = retrieve(req.question, top_k=req.top_k, mode=req.mode)
+    except (FileNotFoundError, RuntimeError) as e:
+        raise _rag_error(e)
+    return {"question": req.question, "mode": req.mode,
+            "count": len(hits), "hits": hits}
+
+
+@app.post("/rag/ask")
+def rag_ask(req: SearchRequest):
+    """RAG 问答：先检索，再让模型基于检索结果回答，并附引用来源。
+
+    回答里带着 [1][2] 这样的编号，用户可以翻回原文核对 ——
+    这是 RAG 相对「直接问模型」最大的价值：**可验证**。
+    模型有没有编，看一眼引用就能判断。
+    """
+    from app.rag.pipeline import answer as rag_answer
+    try:
+        result = rag_answer(req.question, top_k=req.top_k, mode=req.mode)
+    except (FileNotFoundError, RuntimeError) as e:
+        raise _rag_error(e)
+    except ModelError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+    write_audit("rag.ask", {"question": req.question, "mode": req.mode,
+                            "cited": [c["source"] for c in result["citations"]]})
+
+    # hits 里带完整原文，响应会很大，对外只返回引用信息
+    return {
+        "question": result["question"],
+        "answer": result["answer"],
+        "mode": result["mode"],
+        "citations": result["citations"],
+    }
