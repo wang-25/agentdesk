@@ -130,10 +130,23 @@ python -m venv .venv
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/health` | 健康检查，供容器探活和监控使用 |
+| GET | `/audit` | 读取审计日志（每次关键动作都留痕） |
 | POST | `/chat` | 问答，一次性返回完整回答 |
 | POST | `/chat/stream` | 问答，SSE 流式返回（字逐个蹦出） |
 | POST | `/parse` | 意图解析：把一句人话变成结构化 JSON |
-| POST | `/webhook/alert` | 告警驱动的入口（骨架，待实现） |
+| POST | `/webhook/alert` | 告警驱动入口：无人值守自动诊断 |
+| GET | `/rag/stats` | 知识库索引统计 |
+| POST | `/rag/index` | 重建索引 |
+| POST | `/rag/search` | 只检索不生成（排查检索质量用） |
+| POST | `/rag/ask` | RAG 问答，带引用溯源 |
+
+RAG 也可以用命令行：
+
+```bash
+.venv\Scripts\python.exe -m app.rag.pipeline build     # 构建索引
+.venv\Scripts\python.exe -m app.rag.pipeline eval      # 跑召回率评测
+.venv\Scripts\python.exe -m app.rag.pipeline ask "nginx 报 502 怎么排查"
+```
 
 调用示例（在 Git Bash 下，中文请用文件传参，命令行直传会被编码搞坏）：
 
@@ -150,12 +163,35 @@ curl -sN -X POST http://127.0.0.1:8000/chat/stream -H "Content-Type: application
 
 ---
 
+## RAG 检索效果（实测）
+
+语料：`data/knowledge/` 下 6 篇运维排障文档，切成 50 个块。
+评测集：`eval/qa_set.json`，32 个问题，分**词面型**（用文档里的原词提问）
+和**语义型**（刻意换成完全不同的词表达同一意思）两类。
+
+| 检索模式 | 总体 | 词面型 | 语义型 |
+|---|---|---|---|
+| 纯向量检索 | 93.8% | 96.2% | 83.3% |
+| 纯关键词 BM25 | 96.9% | 100.0% | 83.3% |
+| **混合检索（+RRF 融合）** | **100.0%** | **100.0%** | **100.0%** |
+
+指标是 **Top-3 召回率**：前 3 条结果里是否有片段来自正确的那篇文档。
+
+**混合检索的分数高于两个单项**，这说明两路漏掉的是**不同的**问题，
+融合把它们各自的盲区补上了 —— 这才是 RRF 的价值，不是"取平均"。
+
+> ⚠️ 当前向量后端是本地哈希兜底（没有配 embedding API Key），
+> 它本质上还是词面匹配，所以「语义型」那一列的差距还没体现出来。
+> 配好 `DASHSCOPE_API_KEY` 后重建索引，语义型问题的差距会明显拉开。
+
+---
+
 ## 进度
 
 - [x] **Day 0** 环境搭建、密钥管理、第一次模型调用
 - [x] **Day 1** Python 基础（5 个练习）+ 容错解析结构化输出
-- [x] **Day 2** FastAPI 服务 + SSE 流式 + 意图解析接口
-- [ ] **Day 3** RAG 全链路（解析 → 切分 → 向量化 → 检索 → 重排）
+- [x] **Day 2** FastAPI 服务 + SSE 流式 + 意图解析 + 告警 webhook + 审计留痕
+- [x] **Day 3** RAG 全链路 + 混合检索 + 召回率评测 + 引用溯源问答
 - [ ] **Day 4** 手写 ReAct + LangGraph 双版本
 - [ ] **Day 5** 5 个运维工具 → MCP Server
 - [ ] **Day 6** 拆成 Supervisor + 4 个专业 Agent
@@ -173,10 +209,21 @@ curl -sN -X POST http://127.0.0.1:8000/chat/stream -H "Content-Type: application
 agentdesk/
 ├── app/
 │   ├── __init__.py      包说明与目录规划
-│   ├── llm.py           模型调用的统一入口（chat / chat_stream / chat_json）
-│   └── main.py          FastAPI 服务入口（5 个接口）
+│   ├── llm.py           模型调用统一入口（chat / chat_stream / chat_stream_async / chat_json）
+│   ├── main.py          FastAPI 服务入口（10 个接口）
+│   └── rag/
+│       ├── loader.py    文档加载与语义段落切分
+│       ├── embedder.py  可插拔向量后端（dashscope / local 兜底）
+│       ├── store.py     向量存储 + BM25 + RRF 融合检索
+│       └── pipeline.py  全链路编排 + RAG 问答 + 召回率评测 + CLI
+├── data/
+│   ├── knowledge/       知识库语料（6 篇运维排障文档，进仓库）
+│   └── index/           构建出的索引（可重建，不进仓库）
 ├── docs/
-│   └── python-reference.md   Python 速查手册（含笔试四件套 + 报错速查表）
+│   ├── python-reference.md   Python 速查手册（含笔试四件套 + 报错速查表）
+│   └── knowledge-points.md   知识点清单（面试复习用）
+├── eval/
+│   └── qa_set.json      召回率评测集（32 个问题）
 ├── practice/
 │   └── day1/            Day 1 的 5 个练习 + 公共封装
 ├── check_env.py        Day 0 验收脚本
