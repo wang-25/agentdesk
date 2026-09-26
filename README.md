@@ -58,8 +58,14 @@ AgentDesk 想做到的是：输入「nginx 报 502 了，帮我看下」，由 A
 
 ### 第三层：这两者不是竞争关系
 
-本项目的目标之一，是把 5 个运维操作封装成 **MCP Server**。
-做出来之后，通用 AI 助手反而可以调用 AgentDesk 提供的能力。
+**这一层已经做完了**（Day 5）：6 个运维操作封装成了 **MCP Server**。
+挂上 Cursor / Claude Desktop 之后，通用 AI 助手可以直接调用 AgentDesk 提供的能力。
+
+```bash
+# 挂上之后，在 Cursor 里问「web-01 磁盘满了吗」，它会直接调 check_disk 拿真实数据
+.venv\Scripts\python.exe -m app.mcp_server.server        # stdio 模式
+.venv\Scripts\python.exe scripts\mcp_check.py            # 协议层自检，9 项
+```
 
 **做的不是通用助手的替代品，而是补上它缺的那一块。**
 
@@ -68,7 +74,7 @@ AgentDesk 想做到的是：输入「nginx 报 502 了，帮我看下」，由 A
 
 ## 技术栈
 
-**现在实际在用的（Day 0-3）** —— 只有 7 个第三方包：
+**现在实际在用的（Day 0-5）** —— 直接依赖 9 个：
 
 | 层 | 选型 | 为什么选它 |
 |---|---|---|
@@ -78,15 +84,16 @@ AgentDesk 想做到的是：输入「nginx 报 502 了，帮我看下」，由 A
 | 校验 | pydantic v2 | 定义接口契约，FastAPI 依赖它生成 `/docs` |
 | 检索 | numpy 内存索引 + BM25(jieba) + RRF 融合 | 50 块规模用不上向量库，一次矩阵乘法几毫秒 |
 | 向量化 | 可插拔：百炼 `text-embedding-v3` / local 兜底 | 没有额外 Key 也能跑通链路自测 |
+| Agent 编排 | LangGraph 1.2 | 状态图 + 检查点 + 可视化（与手写版并存对比） |
+| 工具协议 | MCP SDK 2.2 | 6 个工具暴露给任何 MCP 客户端（Cursor / Claude Desktop） |
 | 配置 | python-dotenv | 密钥不落代码、不进仓库 |
 
-**规划中的（Day 4 起）**：
+**规划中的（Day 6 起）**：
 
 | 层 | 选型 |
 |---|---|
-| 编排 | LangGraph（Supervisor 多 Agent）—— 但先手写 ReAct 一遍 |
-| 工具 | FastMCP（MCP Server） |
-| 安全 | Docker 沙箱执行 + 命令白名单 + Human-in-the-Loop |
+| 多 Agent | LangGraph Supervisor + 4 个专业 Agent |
+| 安全 | Docker 沙箱执行 + Human-in-the-Loop |
 | 可观测 | 自托管 Langfuse + Prometheus / Grafana |
 | 评测 | Ragas + LLM-as-Judge（自写召回率评测已有） |
 | 部署 | Docker Compose + Nginx + HTTPS（阿里云 ECS） |
@@ -136,9 +143,9 @@ python -m venv .venv
 .venv\Scripts\python.exe scripts\smoke_test.py
 ```
 
-一条命令跑完四层：**运行环境 → 模型连通 → 检索与问答 → HTTP 十个接口**，
-最后给出 ✅/❌ 汇总表。服务没启动时第 4 层自动跳过（退出码仍为 0）。
-**服务启动后复跑一次，可以确认全部 10 个接口都在工作。**
+一条命令跑完六层：**运行环境 → 模型连通 → 检索与问答 → Agent → MCP Server → HTTP 接口**，
+最后给出 ✅/❌ 汇总表。服务没启动时最后一层自动跳过（退出码仍为 0）。
+加 `--full` 会额外跑一次真实 Agent 调用和 MCP 协议层自检。
 
 ### 5. 启动服务
 
@@ -252,6 +259,63 @@ curl -sN -X POST http://127.0.0.1:8000/chat/stream -H "Content-Type: application
 
 ---
 
+## MCP 能力（实测）
+
+同一批工具挂了两个出口：自家 Agent 循环调用（`app/agents/`），
+以及 **MCP 标准协议**（`app/mcp_server/`）—— 后者让 Cursor / Claude Desktop
+这类客户端能直接调用。
+
+**6 个 tools + 2 个 resources**，工具全带协议级风险提示：
+
+| 协议字段 | 取值 | 含义 |
+|---|---|---|
+| `readOnlyHint` | `True` | 只读，不改任何东西 |
+| `destructiveHint` | `False` | 不会造成破坏性变更 |
+| `idempotentHint` | `True` | 重复调用结果一样 |
+| `openWorldHint` | `True` | 会跟外部系统交互 |
+
+两个资源（只读数据，不是动作）：
+
+| URI | 内容 |
+|---|---|
+| `agentdesk://tools/catalog` | 6 个工具的元数据（名称、风险等级、参数、说明） |
+| `agentdesk://audit/recent` | 最近 20 条审计记录 |
+
+**协议层自检 9/9 通过**（用官方客户端连自己启动的 server）：
+
+```
+✅ initialize 握手成功   server = agentdesk-ops v0.1.0
+✅ list_tools   收到 6 个工具（含 annotations）
+✅ call check_disk(web-01)        最高使用率 96% / 级别 critical
+✅ call tail_log(web-01, nginx)   命中模式 ['磁盘空间耗尽', '上游服务响应超时']
+✅ call search_knowledge          命中 2 条　来源 ['disk-full.md']
+✅ 非法参数被拒绝（防注入）        isError=True　原因已传到客户端=True
+✅ 调用不存在的工具会报错          返回 isError（进程没有崩）
+✅ read agentdesk://tools/catalog 工具数 6
+✅ read agentdesk://audit/recent   8 条审计记录
+```
+
+> **一个必须说清的设计取舍**：同一份工具有**两份 schema** ——
+> 工具层手写的（给 OpenAI 格式用）和 MCP 层从类型注解自动生成的。
+> 重复一定会漂移，而漂移了**不会报错**，只会让客户端拿到过时的参数说明。
+> 所以写了 `verify_schema_consistency()` 逐项比对，并且**实测验证过它能抓到
+> 三类漂移**（多参数 / 必填项不一致 / 类型写错）—— 一个"永远通过"的校验器
+> 比没有更糟。
+
+### MCP 能挂到哪些地方
+
+| 客户端 | 配置位置 |
+|---|---|
+| Cursor | `~/.cursor/mcp.json` |
+| Claude Desktop | 客户端配置文件 |
+| 其他 MCP 客户端 | 统一用 `command` + `args` + `cwd` 三件套 |
+
+> ⚠️ `command` 必须用**绝对路径**指向 `.venv\Scripts\python.exe`，
+> 且必须给 `cwd`（项目根目录）—— 客户端启动子进程时不继承你的虚拟环境激活状态。
+> 完整配置片段和排障顺序见 [`docs/mcp-server.md`](docs/mcp-server.md)。
+
+---
+
 ## 进度
 
 - [x] **Day 0** 环境搭建、密钥管理、第一次模型调用
@@ -259,7 +323,7 @@ curl -sN -X POST http://127.0.0.1:8000/chat/stream -H "Content-Type: application
 - [x] **Day 2** FastAPI 服务 + SSE 流式 + 意图解析 + 告警 webhook + 审计留痕
 - [x] **Day 3** RAG 全链路 + 混合检索 + 召回率评测 + 引用溯源问答
 - [x] **Day 4** 工具层（6 个运维工具）+ 手写 ReAct + LangGraph 双版本 + 对比评测
-- [ ] **Day 5** 把工具暴露成 MCP Server
+- [x] **Day 5** MCP Server：6 个工具暴露成标准协议（含 schema 漂移校验 + 协议层自检）
 - [ ] **Day 6** 拆成 Supervisor + 4 个专业 Agent
 - [ ] **Day 7** Docker 沙箱执行 + Human-in-the-Loop
 - [ ] **Day 8** 自托管 Langfuse + 全链路 Trace
@@ -284,6 +348,8 @@ agentdesk/
 │   │   └── compare.py   两个引擎的对比评测
 │   ├── tools/           工具层（Agent 的「手」）
 │   │   └── ops.py       6 个运维工具 + 参数白名单 + 风险分级 + 双后端
+│   ├── mcp_server/      MCP 出口（同一批工具的第二个调用方）
+│   │   └── server.py    6 tools + 2 resources + schema 一致性校验
 │   └── rag/
 │       ├── loader.py    文档加载与语义段落切分
 │       ├── embedder.py  可插拔向量后端（dashscope / local 兜底）
@@ -296,6 +362,7 @@ agentdesk/
 │   ├── project-map.md        项目框架说明书（每个文件干什么、怎么串起来）
 │   ├── tech-stack.md         技术栈说明（用了什么 / 替代方案 / 怎么测）
 │   ├── react-langgraph.md    ReAct 原理 + 两个实现的对比与取舍
+│   ├── mcp-server.md         MCP 原理 + 三个真实坑 + 怎么配客户端
 │   ├── python-reference.md   Python 速查手册（含笔试四件套 + 报错速查表）
 │   └── knowledge-points.md   知识点清单（面试复习用）
 ├── eval/
@@ -304,7 +371,8 @@ agentdesk/
 ├── practice/
 │   └── day1/            Day 1 的 5 个练习 + 公共封装
 ├── scripts/
-│   └── smoke_test.py    全链路自检：环境 → 模型 → 检索 → Agent → 13 个接口
+│   ├── smoke_test.py    六层自检：环境 → 模型 → 检索 → Agent → MCP → 13 个接口
+│   └── mcp_check.py     MCP 协议层自检（官方客户端连自己，9 项）
 ├── check_env.py        Day 0 验收脚本
 ├── requirements.txt
 ├── .env                 本地密钥（不进仓库）

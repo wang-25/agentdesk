@@ -2,28 +2,30 @@
 """
 全链路自检
 ============================================================
-一条命令跑完五层检查，输出 ✅/❌ 清单 + 汇总表。
+一条命令跑完六层检查，输出 ✅/❌ 清单 + 汇总表。
 
 【为什么需要这个脚本】
 技术栈是分层堆起来的：
 
-    Python 环境  →  模型 API  →  检索(RAG)  →  Agent(工具+编排)  →  HTTP 服务
+    运行环境 → 模型 API → 检索(RAG) → Agent(工具+编排) → MCP Server → HTTP 服务
 
 出问题时必须自下而上逐层确认。手敲命令一个个试，容易漏、也容易看错。
-这个脚本把五层一次性跑完，最后告诉你「哪一层是好的、哪一层断了」。
+这个脚本把六层一次性跑完，最后告诉你「哪一层是好的、哪一层断了」。
 
 【运行】在 agentdesk 目录下：
     .venv\\Scripts\\python.exe scripts\\smoke_test.py           # 快速（推荐，不花钱）
-    .venv\\Scripts\\python.exe scripts\\smoke_test.py --full    # 完整（含真实 Agent 调用）
+    .venv\\Scripts\\python.exe scripts\\smoke_test.py --full    # 完整（含真实 Agent 调用 + MCP 协议自检）
 
 【注意】
-    - 第 5 层需要服务已在运行。没运行会自动跳过，并提示启动命令。
+    - 第 6 层需要服务已在运行。没运行会自动跳过，并提示启动命令。
     - 默认会真实调用模型 3 次（约 ¥0.001）；--full 再加一次 Agent 调用（约 ¥0.02）。
     - 「跳过」和「失败」是两回事：服务没启动只会标 ⏭，退出码仍是 0。
 
 【退出码】0 = 已检查项全通；1 = 有真失败项
 """
 
+import asyncio
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -71,7 +73,7 @@ def brief(exc: Exception) -> str:
 # 第一层：运行环境
 # ============================================================
 def check_env():
-    print("\n[1/5] 运行环境　—— Python 与依赖包")
+    print("\n[1/6] 运行环境　—— Python 与依赖包")
 
     v = sys.version_info
     record("环境", f"Python {v.major}.{v.minor}.{v.micro}",
@@ -110,7 +112,7 @@ def check_env():
 # 第二层：模型连通
 # ============================================================
 def check_model():
-    print("\n[2/5] 模型连通　—— 真实发一次请求")
+    print("\n[2/6] 模型连通　—— 真实发一次请求")
 
     try:
         from app.llm import chat
@@ -139,7 +141,7 @@ def check_model():
 # 第三层：检索与问答（RAG）
 # ============================================================
 def check_rag():
-    print("\n[3/5] 检索与问答　—— RAG 全链路")
+    print("\n[3/6] 检索与问答　—— RAG 全链路")
 
     try:
         from app.rag.pipeline import load_store, answer
@@ -187,7 +189,7 @@ def check_rag():
 # 第四层：Agent（工具 + 编排）
 # ============================================================
 def check_agent(full: bool = False):
-    print("\n[4/5] Agent 层　—— 工具注册表与编排引擎")
+    print("\n[4/6] Agent 层　—— 工具注册表与编排引擎")
 
     # ---- 工具注册表 ----
     try:
@@ -259,10 +261,56 @@ def check_agent(full: bool = False):
 
 
 # ============================================================
-# 第五层：HTTP 服务（需要服务已在运行）
+# 第五层：MCP Server（把工具暴露成标准协议）
+# ============================================================
+def check_mcp(full: bool = False):
+    print("\n[5/6] MCP Server　—— 工具的标准协议出口")
+
+    # ---- 1. 服务端能导入、工具注册正确 ----
+    try:
+        from app.mcp_server.server import server, verify_schema_consistency
+        from app.tools import TOOLS as TOOL_REGISTRY
+        record("MCP", f"服务端载入：{server.name}", True,
+               f"工具 {len(TOOL_REGISTRY)} 个 · 资源 2 个")
+    except Exception as e:
+        record("MCP", "载入 app.mcp_server.server", False, brief(e))
+        return
+
+    # ---- 2. ★ schema 一致性：MCP 自动生成的 vs ops.py 手写的 ----
+    # 两份声明一定会漂移，而且漂移了不报错 —— 只会让客户端拿到过时的参数说明。
+    # 所以这项检查是这一层的核心，不是附带的。
+    try:
+        result = asyncio.run(verify_schema_consistency())
+        record("MCP", "schema 与 ops.py 一致（无漂移）", result["ok"],
+               f"{result['tools']} 个工具全部对齐" if result["ok"]
+               else "；".join(result["problems"]))
+    except Exception as e:
+        record("MCP", "schema 一致性校验", False, brief(e))
+
+    # ---- 3. 协议层自检（可选的完整版）----
+    if full:
+        try:
+            proc = subprocess.run(
+                [sys.executable, str(PROJECT_ROOT / "scripts" / "mcp_check.py")],
+                cwd=str(PROJECT_ROOT), capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=180)
+            tail = [ln.strip() for ln in (proc.stdout or "").splitlines()
+                    if "项通过" in ln]
+            record("MCP", "协议层自检（真客户端连真 server）",
+                   proc.returncode == 0,
+                   tail[0] if tail else f"退出码 {proc.returncode}")
+        except Exception as e:
+            record("MCP", "协议层自检", False, brief(e))
+    else:
+        record("MCP", "协议层自检（默认跳过）", False,
+               "加 --full 才会跑：scripts\\mcp_check.py", skipped=True)
+
+
+# ============================================================
+# 第六层：HTTP 服务（需要服务已在运行）
 # ============================================================
 def check_http(full: bool = False):
-    print("\n[5/5] HTTP 服务　—— 13 个接口")
+    print("\n[6/6] HTTP 服务　—— 13 个接口")
 
     import httpx
 
@@ -436,7 +484,7 @@ def summarize():
     print("  自检汇总")
     print("=" * 62)
 
-    layers = ["环境", "模型", "检索", "问答", "工具", "编排", "服务", "接口"]
+    layers = ["环境", "模型", "检索", "问答", "工具", "编排", "MCP", "服务", "接口"]
     for layer in layers:
         rows = [r for r in results if r[0] == layer]
         if not rows:
@@ -463,7 +511,7 @@ def summarize():
         print("  ✅ 已检查的项目全部通过。")
         print(f"  ⏭  有 {len(skipped)} 项被跳过（服务没在跑 / 未加 --full），可复跑。")
     else:
-        print("  ✅ 全部通过。五层技术栈都在工作。")
+        print("  ✅ 全部通过。六层技术栈都在工作。")
     print("=" * 62)
     return 1 if failed else 0
 
@@ -487,6 +535,7 @@ def main():
              lambda: check_model(),
              lambda: check_rag(),
              lambda: check_agent(args.full),
+             lambda: check_mcp(args.full),
              lambda: check_http(args.full)]
     for step in steps:
         try:

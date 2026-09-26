@@ -37,3 +37,11 @@ jieba>=0.42
 # dependencies -- but installed so the two can be compared side by side.
 # Pulls in langchain-core, langgraph-checkpoint, langsmith, etc.
 langgraph>=0.2
+
+# ---------- Day 5 (MCP) ----------
+# Official Model Context Protocol SDK. Exposes the 6 tools in
+# app/tools/ops.py to any MCP client (Cursor, Claude Desktop, ...).
+# NOTE: v2 renamed FastMCP to MCPServer --
+#       from mcp.server.mcpserver import MCPServer
+#       and the schema field is input_schema, not inputSchema.
+mcp>=2.0

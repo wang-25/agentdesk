@@ -11,12 +11,16 @@
 
 ## 第 0 章｜一页速览
 
-**整个项目的直接依赖只有 8 个。** 这是刻意的——依赖越少，出问题的面越小，面试也越讲得清。
+**整个项目的直接依赖只有 9 个。** 这是刻意的——依赖越少，出问题的面越小，面试也越讲得清。
 
-> 但要注意一个数字：`pip list` 里实际有 **49 个包**。多出来的 41 个是传递依赖 ——
-> 装一个 `langgraph` 就带进来 `langchain-core`、`langgraph-checkpoint`、
-> `langsmith`、`orjson`、`zstandard` 等 7 个直接/间接依赖。
-> **"我只装了 8 个包"和"环境里有 49 个包"是两件事，面试被问到依赖治理时能答出这个区别很加分。**
+> 但要注意一个数字：`pip list` 里实际有 **64 个包**（实测）。
+> 多出来的 55 个全是传递依赖 —— 装 `langgraph` 带进 `langchain-core`、
+> `langgraph-checkpoint`、`langsmith`、`orjson`、`zstandard` 等；
+> 装 `mcp` 又带进 `sse-starlette`、`httpx-sse`、`jsonschema` 等。
+>
+> **"我只装了 9 个包"和"环境里有 64 个包"是两件事。**
+> 面试被问到依赖治理时能答出这个区别很加分 —— 它说明你真的看过环境，
+> 而不是只背了 requirements.txt。
 
 | 层 | 用了什么 | 版本 | 在哪个文件 | 一句话职责 |
 |---|---|---|---|---|
@@ -29,6 +33,7 @@
 | 数值计算 | `numpy` | ≥1.26 | `store.py` `embedder.py` | 向量存成矩阵，相似度=一次矩阵乘法 |
 | 中文分词 | `jieba` | ≥0.42 | `store.py` | 给 BM25 分词（缺了会退化成字符 bigram） |
 | **Agent 编排** | **`langgraph`** | **≥0.2（装的 1.2.12）** | `agents/graph.py` | **状态图编排：检查点、可视化、按节点流式** |
+| **工具协议** | **`mcp`** | **≥2.0（装的 2.2.0）** | `mcp_server/server.py` | **把 6 个工具暴露成标准协议，给外部客户端调** |
 
 **没用的东西同样值得记住**（面试常被问"你为什么不用 X"）：
 
@@ -453,13 +458,81 @@ Agent 生产化的三个真实需求 —— **可中断（人工确认）、可�
 
 ---
 
+---
+
+### 13. MCP SDK —— 工具的标准协议出口（Day 5 引入）
+
+**怎么实现的**（`app/mcp_server/server.py`）：用官方 SDK 把 6 个工具注册成 MCP tools。
+
+```python
+from mcp.server.mcpserver import MCPServer          # 2.x 改名了（v1 是 FastMCP）
+from mcp.types import ToolAnnotations
+
+server = MCPServer(name="agentdesk-ops", version="0.1.0", instructions="...")
+
+@server.tool(name="check_disk", annotations=READ_ONLY,   # 协议级风险提示
+             description=TOOLS["check_disk"]["desc"])     # 描述复用工具层，不重写
+def check_disk(
+    host: Annotated[str, Field(description="主机名，如 web-01")] = "web-01",
+) -> dict:
+    return _call("check_disk", host=host)                     # 转发，不重新实现
+```
+
+**用了三种原语里的两种**：
+
+| 原语 | 本项目 | 判断标准 |
+|---|---|---|
+| tools | 6 个运维工具 | "做一件事" |
+| resources | 工具清单 + 审计记录 | "读一份数据" |
+| prompts | 未使用 | "固化一段话术" |
+
+**替代方案的差异**：
+
+| 替代 | 差异 | 什么时候换成它 |
+|---|---|---|
+| **`fastmcp`（PrefectHQ，独立包）** | 功能更多（内置 auth、proxy、client、中间件），**但和官方 SDK 是两套代码**，版本各自演进 | 需要它独有的 auth/代理能力时 |
+| **自定义 JSON Schema + HTTP 接口** | 完全可控，**但只有自家客户端能用** —— 生态价值归零 | 内部系统、不打算对外开放能力 |
+| **OpenAI function calling 清单** | 是模型侧约定，**不是工具侧协议**，每个客户端仍要各接一遍 | —— |
+| **不用协议，直接给代码** | 最省事，**但对方要跑 Python、要装依赖** | 只有自己用 |
+
+**为什么选 MCP**：这是目前唯一被多家客户端（Cursor / Claude Desktop /
+各类 Agent 平台）共同支持的**工具侧**标准。做完之后，适配成本从 M×N 降到 M+N。
+
+**代价（面试更想听这个）**：
+
+| 代价 | 具体表现 |
+|---|---|
+| **同一份工具出现两份 schema** | 工具层手写的（给 OpenAI 格式用）+ MCP 从类型注解生成的。**重复一定会漂移，而且漂移了不报错** |
+| **版本变化快** | v1→v2：`FastMCP`→`MCPServer`、`inputSchema`→`input_schema`、模块路径也变了 |
+| **参数描述只能靠 `Field`** | docstring 的 `Args:` 段不会被解析，忘了写就是空描述 |
+| **错误类型有讲究** | 抛 `ToolError` 消息才能传到客户端；抛别的异常只给通用文案，**原因被吃掉** |
+| **stdio 模式下 stdout 是协议通道** | 任何调试打印都会破坏协议，且报错完全看不出原因 |
+| 依赖变重 | 又带进 `sse-starlette`、`httpx-sse`、`jsonschema` 等一批 |
+
+**怎么验证**：
+
+```bash
+# schema 一致性（不启动 server，秒回）
+.venv\Scripts\python.exe -m app.mcp_server.server --check
+
+# 协议层自检：官方客户端连自己启动的 server（9 项检查）
+.venv\Scripts\python.exe scripts\mcp_check.py
+
+# 或进总自检的第 5 层
+.venv\Scripts\python.exe scripts\smoke_test.py --full
+```
+
+> 完整的原理、四个坑、客户端配置与排障顺序，见 [`mcp-server.md`](mcp-server.md)。
+
+---
+
 ## 第 2 章｜总表：什么时候该换
 
 把上面所有"升级触发器"收成一张表。**这张表就是"技术选型"面试题的答案骨架**。
 
 | 技术 | 现在够用的理由 | 什么信号出现时该换 | 换成什么 |
 |---|---|---|---|
-| Python + venv | 直接依赖只有 8 个 | 装包开始变慢、要锁版本 | `uv` 或 `poetry` |
+| Python + venv | 直接依赖只有 9 个 | 装包开始变慢、要锁版本 | `uv` 或 `poetry` |
 | httpx 手写 | 要看清协议细节 | 要接 5 家以上模型、要统一重试与限流 | `openai` SDK + 网关（LiteLLM） |
 | DeepSeek | 便宜到能随便试错 | 要处理敏感数据 / 要私有化 | 本地 Ollama / vLLM |
 | FastAPI 单进程 | 本机演示够用 | 上线、要抗并发 | gunicorn + uvicorn worker |
@@ -468,19 +541,21 @@ Agent 生产化的三个真实需求 —— **可中断（人工确认）、可�
 | BM25 手写 | 公式只有几行，好讲 | 上生产 | `rank_bm25` 库或 Elasticsearch |
 | **LangGraph 内存检查点** | 单进程演示够用 | 要跨进程恢复 / 要多人协作查看历史 | 检查点换 Postgres / Redis 存储 |
 | **手写 ReAct** | 原理透明，讲得清 | 复杂分支、要中断续跑 | 全面切 LangGraph（已在用） |
+| MCP stdio 传输 | 本地单客户端够用 | 要给远程 / 多客户端共享 | streamable-http + 挂鉴权 |
+| MCP 返回 `-> dict` | JSON 文本是所有客户端都能解析的最大公约数 | 客户端程序需要结构化字段 | 返回类型改 TypedDict，开 `structured_output` |
 | **工具 mock 后端** | 任何机器都能复现 | 要演示真实故障处置 | `local` 后端，再到 Day 7 的 Docker 沙箱 |
 | `.env` + dotenv | 单人开发 | 配置项超过 10 个 | `pydantic-settings` |
 | 无缓存 | 调用量小 | 调用量上来、开始心疼钱 | Redis 缓存 + 上下文缓存 |
 
 ---
 
-## 第 3 章｜Day 5 起会引入的技术栈
+## 第 3 章｜Day 6 起会引入的技术栈
 
 提前知道"下一步要加什么、以及它们的替代品"，面试时你就能讲"技术演进路线"而不只是"我现在有什么"。
 
 | 要做的 | 主流做法 | 手写替代（本项目风格） | 区别 |
 |---|---|---|---|
-| 工具接入 | **MCP**（模型上下文协议） | 自己定义 JSON schema 的工具函数（**本项目已有**，Day 5 包成 MCP Server） | MCP 是标准协议，能被 Cursor / Claude 等客户端直接调用；自定义只在自家项目内可用 |
+| 工具接入 | **MCP**（模型上下文协议） | 自己定义 JSON schema 的工具函数（**Day 5 已完成 MCP 封装**） | MCP 是标准协议，能被 Cursor / Claude 等客户端直接调用；自定义只在自家项目内可用 |
 | 多 Agent 协同 | **LangGraph Supervisor** | 自己在图上多挂几个节点 + 路由 | Supervisor 管"派活、汇总、决定走哪条边"；适合把职责拆开分别评测 |
 | 可观测 | **Langfuse**（自托管） | 自己写 JSONL 日志（**本项目已有审计**） | Langfuse 有 Trace 树、Token 成本面板、Prompt 版本管理；自己写只能查文本 |
 | 评测 | **Ragas**（LLM-as-Judge） | 自己写召回率 + 双引擎对比（**本项目已有**） | Ragas 有忠实度、答案相关性等成熟指标；自写指标简单但可解释 |
@@ -554,7 +629,7 @@ RAG 模块可以直接当 CLI 跑：
 
 ---
 
-## 第 5 章｜怎么测试：分五层
+## 第 5 章｜怎么测试：分六层
 
 **核心原则：从下往上测。** 下面的层断了，上面的失败都是连带后果——先修下面那个。
 
@@ -564,7 +639,8 @@ RAG 模块可以直接当 CLI 跑：
 | **2 模型** | Key 有效、网络通、能拿到回答 | `smoke_test.py` 第 2 层；或 `check_env.py` | 拿到回答 + 打印 token 用量 |
 | **3 检索** | 索引能载入、三种模式都能召回、问答带引用 | `smoke_test.py` 第 3 层；或 `pipeline eval` | 召回率表跑出来；引用里有来源文件名 |
 | **4 Agent** | 工具注册表能载入、能执行、**能拒绝非法参数**、状态图能编译 | `smoke_test.py` 第 4 层 | 6 项全 ✅ |
-| **5 服务** | 13 个接口都能通、参数校验生效、告警分级正确 | `smoke_test.py` 第 5 层；或 `/docs` 逐点点 | 12 项接口全 ✅ |
+| **5 MCP** | schema 无漂移、协议层握手/调用/资源读取、错误路径 | `smoke_test.py` 第 5 层；或 `mcp_check.py` | 3 项全 ✅（协议层 9/9） |
+| **6 服务** | 13 个接口都能通、参数校验生效、告警分级正确 | `smoke_test.py` 第 6 层；或 `/docs` 逐点点 | 12 项接口全 ✅ |
 
 **几个"故意制造错误"的测试**（比"能跑通"更能证明你理解系统）：
 
@@ -578,6 +654,8 @@ RAG 模块可以直接当 CLI 跑：
 | **防命令注入真的生效** | `execute_tool("check_disk", {"host": "web-01; rm -rf /"})` | 返回「主机名不合法」，**被拒绝** |
 | **Agent 不会无限循环** | `--max-steps 1` 跑一个复杂问题 | `stop_reason: max_steps`，且给出了收口答案 |
 | **Agent 不会硬找问题** | 问一个一切正常的主机（Q3 负例） | 如实回答"没发现问题"，而不是编一个隐患 |
+| **MCP 错误原因能传到客户端** | 通过 MCP 调 `check_disk` 传非法主机名 | `isError=true` **且消息里带"主机名不合法"**，不是只有通用文案 |
+| **schema 漂移会被抓** | 临时给 `ops.py` 加一个 MCP 侧没有的参数 | 一致性校验报 `MCP 缺少参数 [...]`，退出码 1 |
 
 ---
 
