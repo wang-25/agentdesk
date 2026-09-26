@@ -42,3 +42,6 @@ output/
 # 测试用的临时 payload
 _t*.json
 _q.json
+
+# 接口测试用的临时 payload
+_*.json

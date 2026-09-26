@@ -9,14 +9,17 @@
 加成本统计的时候，就要改十几个地方 —— 改漏一个就是一个线上 bug。
 统一入口之后，这些能力只要在这里加一次，全项目都受益。
 
-这个文件是 `practice/day1/llm_client.py` 的正式版：
-多了流式输出、专门的异常类型、以及模型输出的容错解析。
+本文件提供四个函数：
+    chat                  一次性返回
+    chat_stream           流式返回（同步生成器）
+    chat_stream_async     流式返回（异步生成器，高并发时用）
+    chat_json             要模型返回 JSON 的便捷方法
 """
 
 import json
 import os
 from pathlib import Path
-from typing import Iterator
+from typing import AsyncIterator, Iterator
 
 import httpx
 from dotenv import load_dotenv
@@ -68,7 +71,57 @@ def _headers(api_key):
 
 
 # ============================================================
-# 一、一次性返回（非流式）
+# 一、SSE 数据行的解析（同步流和异步流共用）
+# ============================================================
+# 流结束标记。单独定义成常量，避免在多个地方硬编码字符串写错。
+SSE_DONE = "__SSE_DONE__"
+
+
+def extract_delta(line: str):
+    """从一行 SSE 文本里取出文本片段。
+
+    返回：
+        None      这行不是数据（空行、注释行、半截 JSON），跳过
+        SSE_DONE  流结束
+        其他字符串  模型这次吐出的文本片段
+
+    【为什么单独抽成一个函数】
+    解析逻辑有二十来行，同步版和异步版都要用。
+    复制一份的话，以后要改解析规则就得改两处 —— 迟早会忘掉一处。
+    抽出来两边共用，这是消除重复的标准做法。
+    """
+    # SSE 协议里，数据行必须以 "data:" 开头，其他行（空行、注释）忽略
+    if not line or not line.startswith("data:"):
+        return None
+
+    payload = line[5:].strip()      # 去掉 "data:" 这 5 个字符
+
+    if payload == "[DONE]":
+        return SSE_DONE
+
+    # 网络分包时可能收到半截 JSON，解析不了就跳过这一块，
+    # 不要因为一行坏了就把整个流断掉
+    try:
+        chunk = json.loads(payload)
+    except json.JSONDecodeError:
+        return None
+
+    # 取值路径：choices[0].delta.content
+    # 有些块只带角色信息不带内容（比如流的第一块），所以要 or None
+    return chunk.get("choices", [{}])[0].get("delta", {}).get("content") or None
+
+
+def _build_stream_payload(cfg, messages, temperature):
+    return {
+        "model": cfg["model"],
+        "messages": messages,
+        "temperature": temperature,
+        "stream": True,
+    }
+
+
+# ============================================================
+# 二、一次性返回（非流式）
 # ============================================================
 def chat(messages, temperature=0.7, timeout=60) -> str:
     """发一次对话请求，等模型把整段话说完再返回。
@@ -101,7 +154,7 @@ def chat(messages, temperature=0.7, timeout=60) -> str:
 
 
 # ============================================================
-# 二、流式返回
+# 三、流式返回 —— 同步版
 # ============================================================
 def chat_stream(messages, temperature=0.7, timeout=120) -> Iterator[str]:
     """逐块返回模型输出，每 yield 一小段文本。
@@ -111,29 +164,19 @@ def chat_stream(messages, temperature=0.7, timeout=120) -> Iterator[str]:
     流式让字一个个蹦出来，首字延迟从十几秒降到一秒内 ——
     用户体验的差别是天壤之别，而且实现成本很低。
 
-    【这个函数是怎么做到的】
-    请求体里加 "stream": True，服务端就不再一次性返回，
-    而是持续推送若干行，每行形如：
-        data: {"choices":[{"delta":{"content":"运"}}]}
-    直到最后推一行：
-        data: [DONE]
-    我们要做的就是把每行切出来、解析、取出 content 片段。
-
-    【yield 是什么】
-    普通函数用 return 一次性交出结果；带 yield 的函数是"生成器"，
-    每次 yield 交出一小块，调用方可以边收边处理。
-    这就是"流式"在 Python 里的实现方式。
+    【什么时候用同步版、什么时候用异步版】
+    同步版内部会阻塞线程。FastAPI 会把 def 接口丢进线程池，
+    所以少量并发没问题；但线程池有上限（默认 40），
+    并发再高就会排队 —— 这时必须换异步版。
     """
     _, cfg, api_key = _pick()
 
-    # 这里必须用 httpx.stream(...) 而不是 httpx.post(...)，
+    # 必须用 httpx.stream(...) 而不是 httpx.post(...)，
     # 因为前者不会等响应体完整下载完，可以边下边读。
     with httpx.stream(
-        "POST",
-        cfg["url"],
+        "POST", cfg["url"],
         headers=_headers(api_key),
-        json={"model": cfg["model"], "messages": messages,
-              "temperature": temperature, "stream": True},
+        json=_build_stream_payload(cfg, messages, temperature),
         timeout=timeout,
     ) as resp:
 
@@ -143,28 +186,59 @@ def chat_stream(messages, temperature=0.7, timeout=120) -> Iterator[str]:
             raise ModelError(f"请求失败 HTTP {resp.status_code}: {detail}")
 
         for line in resp.iter_lines():
-            # 跳过空行（SSE 协议里用来分隔事件的）和不以 data: 开头的行
-            if not line or not line.startswith("data:"):
-                continue
-
-            payload = line[5:].strip()   # 去掉 "data:" 这 5 个字符
-            if payload == "[DONE]":
+            piece = extract_delta(line)
+            if piece == SSE_DONE:
                 break
-
-            # 偶尔会有半截的 JSON（网络分包），解析不了就跳过这一块，
-            # 不要因为一行坏了就把整个流断掉
-            try:
-                chunk = json.loads(payload)
-            except json.JSONDecodeError:
-                continue
-
-            delta = chunk.get("choices", [{}])[0].get("delta", {}).get("content")
-            if delta:
-                yield delta
+            if piece:
+                yield piece
 
 
 # ============================================================
-# 三、容错解析模型返回的 JSON
+# 四、流式返回 —— 异步版
+# ============================================================
+async def chat_stream_async(messages, temperature=0.7,
+                            timeout=120) -> AsyncIterator[str]:
+    """异步流式返回。
+
+    【和同步版的唯一区别】
+    同步版在等模型吐字的时候，会占住一个线程什么都不干；
+    异步版在这段时间会把控制权交还给事件循环，去处理其他请求。
+
+    效果差别有多大？同步版 40 个并发请求就把线程池占满，
+    第 41 个开始排队；异步版单进程能扛几百上千个并发连接 ——
+    因为等待的时间没有浪费，只是挂起了一个协程。
+
+    这就是 JD 里"高并发"三个字背后的实际含义。
+    """
+    _, cfg, api_key = _pick()
+
+    # AsyncClient 要配合 async with；整个生命周期结束后连接自动回收。
+    # 注意：Client 的创建和复用本身有讲究（复用一个 Client 能省掉重复握手），
+    # 但这里为了代码清晰，每次请求新建一个。
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        async with client.stream(
+            "POST", cfg["url"],
+            headers=_headers(api_key),
+            json=_build_stream_payload(cfg, messages, temperature),
+        ) as resp:
+
+            if resp.status_code != 200:
+                # 异步版读响应体要 await
+                body = await resp.aread()
+                detail = body.decode("utf-8", errors="replace")[:300]
+                raise ModelError(f"请求失败 HTTP {resp.status_code}: {detail}")
+
+            # aiter_lines 是异步迭代器，用 async for
+            async for line in resp.aiter_lines():
+                piece = extract_delta(line)
+                if piece == SSE_DONE:
+                    break
+                if piece:
+                    yield piece
+
+
+# ============================================================
+# 五、容错解析模型返回的 JSON
 # ============================================================
 def parse_json_reply(text: str) -> dict:
     """把模型返回的文本解析成字典，容忍几种常见的不规范格式。
@@ -200,5 +274,4 @@ def chat_json(messages, temperature=0, timeout=60) -> dict:
     try:
         return parse_json_reply(raw)
     except json.JSONDecodeError as e:
-        # 这里翻译一下异常，让上层能明确区分"模型没按格式来"
         raise ModelError(f"模型返回的不是合法 JSON：{raw[:200]}") from e
