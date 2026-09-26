@@ -220,6 +220,7 @@ agentdesk/
 │   ├── knowledge/       知识库语料（6 篇运维排障文档，进仓库）
 │   └── index/           构建出的索引（可重建，不进仓库）
 ├── docs/
+│   ├── project-map.md        项目框架说明书（每个文件干什么、怎么串起来）
 │   ├── python-reference.md   Python 速查手册（含笔试四件套 + 报错速查表）
 │   └── knowledge-points.md   知识点清单（面试复习用）
 ├── eval/
