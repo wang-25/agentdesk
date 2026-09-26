@@ -7,6 +7,7 @@
     app/rag/            （Day 3 ✓）检索增强
     app/tools/          （Day 4 ✓）6 个运维工具 + 安全边界
     app/agents/         （Day 4 ✓）ReAct 编排：手写 + LangGraph 双版本
+                        （Day 6 ✓）Supervisor + 4 个专业 Agent
     app/mcp_server/     （Day 5 ✓）把工具暴露成 MCP Server
     app/sandbox/        （Day 7）Docker 沙箱执行
     app/observability/  （Day 8）Langfuse 接入

@@ -20,7 +20,10 @@ AgentDesk 服务入口
     POST /rag/ask         RAG 问答，带引用溯源
     GET  /agent/tools     Agent 能调用的工具清单（含风险等级）
     GET  /agent/graph     导出状态图的 mermaid 定义
-    POST /agent/ask       ★ Agent 自主诊断：它自己决定调哪些工具、几轮
+    POST /agent/ask       ★ Agent 自主诊断（engine 可选三档）
+                          handwritten  手写 ReAct 循环
+                          langgraph    状态图（默认）
+                          supervisor   ★ 多 Agent 编排（意图/知识/诊断/校验）
 
 服务起来后打开 http://127.0.0.1:8000/docs 有自动生成的交互式文档。
 """
@@ -573,8 +576,11 @@ def rag_ask(req: SearchRequest):
 class AgentRequest(BaseModel):
     question: str = Field(..., min_length=1, max_length=2000,
                           description="要诊断的问题")
-    engine: str = Field("langgraph", pattern="^(handwritten|langgraph)$",
-                        description="编排引擎：handwritten 手写循环 / langgraph 状态图")
+    engine: str = Field("langgraph", pattern="^(handwritten|langgraph|supervisor)$",
+                        description="编排引擎：handwritten 手写循环 / "
+                                    "langgraph 状态图 / supervisor 多 Agent 编排")
+    max_retries: int = Field(1, ge=0, le=3,
+                             description="仅 supervisor：校验不通过时最多重查几次")
     max_steps: int = Field(6, ge=1, le=12,
                            description="最多几轮工具调用。这既是成本上限，也是防死循环的护栏")
     include_trace: bool = Field(True, description="是否返回完整执行轨迹")
@@ -596,7 +602,9 @@ def agent_tools():
 
 
 @app.get("/agent/graph")
-def agent_graph(max_steps: int = Query(6, ge=1, le=12)):
+def agent_graph(max_steps: int = Query(6, ge=1, le=12),
+                engine: str = Query("react", pattern="^(react|supervisor)$"),
+                max_retries: int = Query(1, ge=0, le=3)):
     """导出状态图的 mermaid 定义。
 
     LangGraph 白送的能力：图的结构不用手画，直接导出。
@@ -606,8 +614,14 @@ def agent_graph(max_steps: int = Query(6, ge=1, le=12)):
     面试时这张图比任何口头描述都直观：**一眼能看出哪里是循环**。
     """
     from app.agents.graph import mermaid
+    if engine == "supervisor":
+        from app.agents.supervisor import mermaid as sup_mermaid
+        text = sup_mermaid(max_retries)
+        return {"engine": engine, "max_retries": max_retries,
+                "format": "mermaid", "graph": text}
     text = mermaid(max_steps)
-    return {"max_steps": max_steps, "format": "mermaid", "graph": text}
+    return {"engine": engine, "max_steps": max_steps,
+            "format": "mermaid", "graph": text}
 
 
 @app.post("/agent/ask")
@@ -625,13 +639,21 @@ def agent_ask(req: AgentRequest):
     """
     started_ts = datetime.now().isoformat(timespec="seconds")
 
+    # 三个引擎的返回结构是统一的（question/answer/steps/rounds/...），
+    # 所以这里只需要换实现，下面的响应组装代码完全一样。
+    # **这就是"统一返回结构"的价值** —— 加第三个引擎没有改动下游任何一行。
     if req.engine == "handwritten":
         from app.agents.react import run as engine_run
+        runner = lambda: engine_run(req.question, max_steps=req.max_steps)
+    elif req.engine == "supervisor":
+        from app.agents.supervisor import run as engine_run
+        runner = lambda: engine_run(req.question, max_retries=req.max_retries)
     else:
         from app.agents.graph import run as engine_run
+        runner = lambda: engine_run(req.question, max_steps=req.max_steps)
 
     try:
-        result = engine_run(req.question, max_steps=req.max_steps)
+        result = runner()
     except ModelError as e:
         # 模型层故障 → 502（上游问题，可重试）
         raise HTTPException(status_code=502, detail=str(e))
@@ -665,6 +687,30 @@ def agent_ask(req: AgentRequest):
             "stop_reason": result["stop_reason"],
         },
     }
+    # 多 Agent 编排特有的产出：意图标签、校验结论、执行路径、Supervisor 决策。
+    # 这些是"单 Agent 模式拿不到的信息" —— 也是拆分之后才能讲出来的东西。
+    if req.engine == "supervisor":
+        payload["orchestration"] = {
+            "intent": result.get("intent"),
+            "intent_status": result.get("intent_status"),
+            "knowledge": {
+                "query": (result.get("knowledge") or {}).get("query"),
+                "count": (result.get("knowledge") or {}).get("count"),
+                "sources": [r["source"] for r
+                            in (result.get("knowledge") or {}).get("results", [])],
+            },
+            "verdict": result.get("verdict"),
+            "path": result.get("path"),
+            "node_log": result.get("node_log"),
+            "supervisor_decisions": result.get("supervisor_decisions"),
+            "agents": 4,
+        }
+
     if req.include_trace:
-        payload["trace"] = result["steps"]
+        # ★ 去掉 observation_text —— 那是给内部校验用的完整工具返回，
+        #   对外只需要预览。**数据在源头保留完整，由出口决定裁剪**（见 common.py）。
+        payload["trace"] = [
+            {k: v for k, v in step.items() if k != "observation_text"}
+            for step in result["steps"]
+        ]
     return payload

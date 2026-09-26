@@ -1,0 +1,284 @@
+{
+  "_comment": "意图路由 Agent 的标注评测集。这个 Agent 不调工具、输入输出都是结构化 JSON，所以字段可以被逐项判定对错 —— 这是多 Agent 拆分'可单独评测'这条收益的具体兑现。",
+  "_fields": {
+    "task_type": "diagnose（报告具体异常要查原因）/ query（只想问状态）/ explain（问原理做法）/ other",
+    "hosts": "数组；没提到具体主机必须是空数组（考察它会不会自己猜）",
+    "services": "数组",
+    "needs_live_data": "是否需要查真实主机数据",
+    "needs_knowledge": "是否需要查历史经验/手册"
+  },
+  "_difficulty": {
+    "basic": "字段齐全、表达直白",
+    "edge": "边界情况：没提主机、多主机、无异常只是查询",
+    "tricky": "容易判错：表面像查询其实是诊断；表面像诊断其实不用查现场"
+  },
+  "cases": [
+    {
+      "id": "i01",
+      "difficulty": "basic",
+      "question": "web-01 上的网站访问很慢，有时报 502，帮我看下原因",
+      "expect": {
+        "task_type": "diagnose",
+        "hosts": [
+          "web-01"
+        ],
+        "needs_live_data": true,
+        "needs_knowledge": true
+      }
+    },
+    {
+      "id": "i02",
+      "difficulty": "basic",
+      "question": "cache-01 上的 Redis 容器一直在重启，帮我查下原因",
+      "expect": {
+        "task_type": "diagnose",
+        "hosts": [
+          "cache-01"
+        ],
+        "services": [
+          "redis"
+        ],
+        "needs_live_data": true,
+        "needs_knowledge": true
+      }
+    },
+    {
+      "id": "i03",
+      "difficulty": "basic",
+      "question": "db-01 的磁盘是不是快满了？",
+      "expect": {
+        "task_type": "query",
+        "hosts": [
+          "db-01"
+        ],
+        "needs_live_data": true
+      }
+    },
+    {
+      "id": "i04",
+      "difficulty": "basic",
+      "question": "为什么清理日志文件建议用 truncate 而不是 rm？",
+      "expect": {
+        "task_type": "explain",
+        "hosts": [],
+        "needs_live_data": false
+      }
+    },
+    {
+      "id": "i05",
+      "difficulty": "basic",
+      "question": "web-01 上的 nginx 服务还在运行吗",
+      "expect": {
+        "task_type": "query",
+        "hosts": [
+          "web-01"
+        ],
+        "services": [
+          "nginx"
+        ],
+        "needs_live_data": true
+      }
+    },
+    {
+      "id": "i06",
+      "difficulty": "edge",
+      "question": "帮我看看磁盘使用率",
+      "expect": {
+        "task_type": "query",
+        "hosts": [],
+        "needs_live_data": true
+      },
+      "note": "★ 关键边界：没提主机 → hosts 必须是空数组，不能猜一个"
+    },
+    {
+      "id": "i07",
+      "difficulty": "edge",
+      "question": "web-01 和 db-01 现在负载怎么样",
+      "expect": {
+        "task_type": "query",
+        "hosts": [
+          "web-01",
+          "db-01"
+        ],
+        "needs_live_data": true
+      },
+      "note": "多主机"
+    },
+    {
+      "id": "i08",
+      "difficulty": "edge",
+      "question": "容器退出码 137 是什么意思",
+      "expect": {
+        "task_type": "explain",
+        "hosts": [],
+        "needs_live_data": false
+      },
+      "note": "问概念，不该去查机器"
+    },
+    {
+      "id": "i09",
+      "difficulty": "edge",
+      "question": "今天天气怎么样",
+      "expect": {
+        "task_type": "other",
+        "hosts": [],
+        "needs_live_data": false
+      },
+      "note": "完全无关的问题"
+    },
+    {
+      "id": "i10",
+      "difficulty": "edge",
+      "question": "怎么给 nginx 做滚动重启",
+      "expect": {
+        "task_type": "explain",
+        "hosts": [],
+        "services": [
+          "nginx"
+        ],
+        "needs_live_data": false
+      }
+    },
+    {
+      "id": "i11",
+      "difficulty": "edge",
+      "question": "web-01 的内存还有多少",
+      "expect": {
+        "task_type": "query",
+        "hosts": [
+          "web-01"
+        ],
+        "needs_live_data": true
+      }
+    },
+    {
+      "id": "i12",
+      "difficulty": "basic",
+      "question": "db-01 的 mysql 连不上了，报 Too many connections",
+      "expect": {
+        "task_type": "diagnose",
+        "hosts": [
+          "db-01"
+        ],
+        "services": [
+          "mysql"
+        ],
+        "needs_live_data": true,
+        "needs_knowledge": true
+      }
+    },
+    {
+      "id": "i13",
+      "difficulty": "tricky",
+      "question": "db-01 最近的负载好像有点高吧？",
+      "expect": {
+        "task_type": "query",
+        "hosts": [
+          "db-01"
+        ],
+        "needs_live_data": true
+      },
+      "note": "★ 带'好像'的软描述 + 句尾问号，容易被判成 diagnose（因为没有具体异常，判 query 更准）"
+    },
+    {
+      "id": "i14",
+      "difficulty": "tricky",
+      "question": "web-01 的负载是不是太高了，要不要扩容",
+      "expect": {
+        "task_type": "diagnose",
+        "hosts": [
+          "web-01"
+        ],
+        "needs_live_data": true
+      },
+      "note": "★ 表面像 query（问当前负载），也可以判 diagnose（要判断+给建议）。**两种都说得通** —— 硬钉一个只会让指标失去可信度。",
+      "accept": {
+        "task_type": [
+          "query",
+          "diagnose"
+        ]
+      }
+    },
+    {
+      "id": "i15",
+      "difficulty": "tricky",
+      "question": "我的博客偶尔打不开，是什么问题",
+      "expect": {
+        "task_type": "diagnose",
+        "hosts": [],
+        "needs_live_data": true,
+        "needs_knowledge": true
+      },
+      "note": "★ 没提主机但描述的是真实故障 → hosts 空但 needs_live_data 为 true"
+    },
+    {
+      "id": "i16",
+      "difficulty": "tricky",
+      "question": "nginx 和 apache 有什么区别",
+      "expect": {
+        "task_type": "explain",
+        "services": [
+          "nginx",
+          "apache"
+        ],
+        "needs_live_data": false
+      },
+      "note": "★ 提到服务名但是纯概念对比，不需要现场数据。【修正记录】最初只标了 nginx，漏了自己写的 apache —— 标签错了，不是模型错了。"
+    },
+    {
+      "id": "i17",
+      "difficulty": "basic",
+      "question": "cache-01 上现在有哪些容器在跑",
+      "expect": {
+        "task_type": "query",
+        "hosts": [
+          "cache-01"
+        ],
+        "needs_live_data": true
+      }
+    },
+    {
+      "id": "i18",
+      "difficulty": "edge",
+      "question": "网站 502 一般是什么原因造成的？",
+      "expect": {
+        "task_type": "explain",
+        "hosts": [],
+        "needs_live_data": false,
+        "needs_knowledge": true
+      },
+      "note": "★ 症状描述 + '一般是什么原因' → 是问通用知识，不是查你自己那台机器"
+    },
+    {
+      "id": "i19",
+      "difficulty": "basic",
+      "question": "web-01 根分区满了，怎么处理",
+      "expect": {
+        "task_type": "diagnose",
+        "hosts": [
+          "web-01"
+        ],
+        "needs_live_data": true,
+        "needs_knowledge": true
+      }
+    },
+    {
+      "id": "i20",
+      "difficulty": "edge",
+      "question": "vue3 的 setup 语法怎么写",
+      "expect": {
+        "task_type": "other",
+        "hosts": [],
+        "needs_live_data": false
+      },
+      "note": "完全无关的干扰项。判 explain（在问做法）或 other（不属于运维范畴）都合理。",
+      "accept": {
+        "task_type": [
+          "explain",
+          "other"
+        ]
+      }
+    }
+  ],
+  "_accept_field": "部分用例的某些字段有多种合理答案，写在 accept 里而不是硬标一个 —— 评测集要区分「唯一正确答案」和「多种合理答案」，否则指标会失真。"
+}

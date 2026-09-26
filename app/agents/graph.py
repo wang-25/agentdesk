@@ -228,20 +228,33 @@ def payload_messages(messages: list) -> list:
 # ============================================================
 # 三、节点
 # ============================================================
-def agent_node(state: AgentState) -> dict:
-    """节点一：让模型决策。
+def make_agent_node(tool_names: list = None):
+    """节点工厂：返回一个"只带指定工具"的 agent 节点。
 
-    对应手写版循环体的第 1、2 步。
-    差别在于：手写版是"读变量 → 判断 → break"，这里是
-    "读 state → 返回更新 → 由边决定下一步走哪"。
+    【为什么要工厂，而不是直接写个 agent_node】
+    多 Agent 拆分之后，同一个 ReAct 图标会被复用多次，但**每次要用不同的工具子集**：
+        工具执行 Agent   只给 5 个运维工具（不给 search_knowledge）
+        单 Agent 模式    给全部 6 个
+
+    LangGraph 的节点是普通可调用对象，所以"用闭包带上配置"是最直接的做法。
+    另一种做法是把配置塞进 state —— 但那是"运行时数据"，
+    而工具清单是"图的结构"，混在一起会让状态变得难懂。
+
+    对应手写版循环体的第 1、2 步。差别在于：手写版是"读变量 → 判断 → break"，
+    这里是"读 state → 返回更新 → 由边决定下一步走哪"。
     """
-    out = chat_step(payload_messages(state["messages"]),
-                    tools=tool_payload(), temperature=0)
-    return {
-        "messages": [ai_message_from(out["message"])],
-        "usage": out["usage"] or {},
-        "rounds": 1,
-    }
+    tools = tool_payload(tool_names)
+
+    def agent_node(state: AgentState) -> dict:
+        out = chat_step(payload_messages(state["messages"]),
+                        tools=tools, temperature=0)
+        return {
+            "messages": [ai_message_from(out["message"])],
+            "usage": out["usage"] or {},
+            "rounds": 1,
+        }
+
+    return agent_node
 
 
 def tools_node(state: AgentState) -> dict:
@@ -285,12 +298,77 @@ def tools_node(state: AgentState) -> dict:
     }
 
 
+def close_dangling_tool_calls(messages: list) -> list:
+    """给「没有执行」的 tool_calls 补上占位 tool 消息。
+
+    ★ 这是一个真实踩出来的 bug，值得完整说清楚。
+
+    【现象】
+    撞上 max_steps 上限时，收口阶段直接报 400：
+
+        An assistant message with 'tool_calls' must be followed by tool
+        messages responding to each 'tool_call_id'
+        (insufficient tool messages following tool_calls message)
+
+    【根因】
+    协议要求 assistant 的 `tool_calls` 和 role=tool 的应答消息**成对出现**。
+    而路由是**在 agent 节点产出新 tool_calls 之后**才判断"步数用完了"：
+
+        agent 产出 3 个 tool_calls
+          → 路由：steps 已 >= max_steps → 直接去 finalize
+          → 那 3 个 tool_calls 永远没有人应答
+          → finalize 把它们连同历史一起发给模型 → 服务端拒绝
+
+    也就是说：**循环被掐断在了"半路"—— 正好掐在发出请求、还没收到结果的中间。**
+
+    【为什么手写版没这个问题】
+    手写版的结构是"先执行完这一轮所有工具调用，再进入下一轮"，
+    所以它停下来的时候，最后一条消息一定是 tool 消息，天然成对。
+
+    同一个逻辑，两种结构 —— **一个天然避开，一个没有。**
+    这不是"框架不好"，而是提醒你：**换实现方式时，协议约束要重新过一遍。**
+
+    【修法为什么是"补占位"而不是"删掉"】
+    删掉那条 assistant 消息也能绕过报错，但会**丢掉"模型想查什么"这条信息**。
+    补一条说明「因为达到上限，本次调用未执行」的 tool 消息：
+      - 协议上成对，合法
+      - 语义上真实：这些调用确实没执行
+      - 模型知道"我想查但没查成"，收口结论会更诚实（会说明还缺什么）
+
+    **修 bug 时优先保住信息，而不是把报错消掉。**
+    """
+    answered = {m.tool_call_id for m in messages
+                if isinstance(m, ToolMessage)}
+    pending = []
+    for m in messages:
+        if isinstance(m, AIMessage):
+            for call in (m.tool_calls or []):
+                if call.get("id") not in answered:
+                    pending.append(call)
+    if not pending:
+        return messages
+
+    placeholders = [
+        ToolMessage(
+            content=json.dumps({
+                "skipped": True,
+                "tool": c.get("name"),
+                "reason": "已达工具调用上限，本次调用未执行",
+            }, ensure_ascii=False),
+            tool_call_id=c["id"],
+        )
+        for c in pending
+    ]
+    return list(messages) + placeholders
+
+
 def finalize_node(state: AgentState) -> dict:
     """节点三：超上限时强制收口。
 
     同样是把 tools 参数去掉，让它只能输出文字。
     """
-    msgs = payload_messages(state["messages"])
+    # ★ 先补齐未应答的 tool_calls，否则发出去会被服务端 400 拒绝
+    msgs = payload_messages(close_dangling_tool_calls(state["messages"]))
     msgs.append({"role": "user", "content": LIMIT_NOTICE})
     out = chat_step(msgs, tools=None, temperature=0)
     return {
@@ -328,7 +406,7 @@ def make_router(max_steps: int):
 _GRAPH_CACHE = {}
 
 
-def build_graph(max_steps: int = DEFAULT_MAX_STEPS):
+def build_graph(max_steps: int = DEFAULT_MAX_STEPS, tool_names: list = None):
     """编译并缓存图。
 
     【为什么缓存】
@@ -339,12 +417,16 @@ def build_graph(max_steps: int = DEFAULT_MAX_STEPS):
     这也是手写版没有的收益：手写版每次都"从零开始循环"，
     而编译好的图可以当成一个常驻的"运行时"。
     """
-    if max_steps in _GRAPH_CACHE:
-        return _GRAPH_CACHE[max_steps]
+    # 缓存键必须带上工具子集 —— 否则"给 5 个工具"的图和"给 6 个工具"的图
+    # 会互相覆盖，而且是**静默**的：第二次拿到的是第一次编译的对象，
+    # 工具清单是错的却不报错。缓存键漏字段是这类 bug 的经典来源。
+    key = (max_steps, tuple(sorted(tool_names)) if tool_names else None)
+    if key in _GRAPH_CACHE:
+        return _GRAPH_CACHE[key]
 
     graph = StateGraph(AgentState)
 
-    graph.add_node("agent", agent_node)          # 想
+    graph.add_node("agent", make_agent_node(tool_names))   # 想
     graph.add_node("tools", tools_node)          # 做 + 看
     graph.add_node("finalize", finalize_node)    # 收口
 
@@ -357,7 +439,7 @@ def build_graph(max_steps: int = DEFAULT_MAX_STEPS):
     graph.add_edge("finalize", END)
 
     compiled = graph.compile()
-    _GRAPH_CACHE[max_steps] = compiled
+    _GRAPH_CACHE[key] = compiled
     return compiled
 
 
@@ -374,13 +456,18 @@ def mermaid(max_steps: int = DEFAULT_MAX_STEPS) -> str:
 # 六、入口
 # ============================================================
 def run(question: str, max_steps: int = DEFAULT_MAX_STEPS,
-        verbose: bool = False) -> dict:
-    """跑一次。返回结构和手写版完全一致（这样对比脚本才不用写两套）。"""
+        verbose: bool = False, tool_names: list = None,
+        system_prompt: str = None) -> dict:
+    """跑一次。返回结构和手写版完全一致（这样对比脚本才不用写两套）。
+
+    tool_names   限制可用工具（多 Agent 拆分时用）
+    system_prompt 换一套系统提示（子 Agent 用另一种身份时用）
+    """
     started = time.time()
-    graph = build_graph(max_steps)
+    graph = build_graph(max_steps, tool_names)
 
     init = {
-        "messages": [SystemMessage(content=SYSTEM_PROMPT),
+        "messages": [SystemMessage(content=system_prompt or SYSTEM_PROMPT),
                      HumanMessage(content=question)],
         "steps": [],
         "rounds": 0,

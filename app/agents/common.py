@@ -176,8 +176,18 @@ def run_tool_calls(tool_calls: list, seen_calls: dict, round_no: int,
             "repeat": repeat,
             "elapsed_ms": result.get("elapsed_ms", 0),
             "observation_chars": len(observation),
-            # 只留预览：完整结果可能几千字，轨迹里不需要全存
+            # 只留预览：完整结果可能有几千字，轨迹给人看时不需要全存
             "observation_preview": observation[:400],
+            # ★ 但完整文本要保留 —— 为什么？
+            #   多 Agent 拆分后，「结果校验 Agent」要做**数值溯源**：
+            #   检查结论里出现的每个数字能不能在工具返回里找到出处。
+            #   拿被截断的预览去比对，会把"有出处"的数字误判成"没出处" ——
+            #   校验器自己产出假警报，比不校验还糟。
+            #
+            #   所以：数据在源头不要销毁，由**出口**决定要不要裁剪。
+            #   API 返回轨迹时会把 observation_text 去掉（见 main.py），
+            #   内部数据保持完整。这个原则叫「不要把信息损失埋在数据转换里」。
+            "observation_text": observation,
             "error": result.get("error"),
         })
 
@@ -201,9 +211,32 @@ def add_usage(total: dict, usage: dict) -> dict:
     return total
 
 
-def tool_payload() -> list:
-    """模型看到的工具清单（转成 OpenAI 兼容格式）。"""
-    return tool_schemas()
+def tool_payload(only: list = None) -> list:
+    """模型看到的工具清单（转成 OpenAI 兼容格式）。
+
+    【only 参数为什么存在】
+    多 Agent 拆分之后，不同的专业 Agent 应该只拿到**自己该用的那部分工具**。
+    比如"工具执行 Agent"不该看见 search_knowledge —— 查知识库是"知识检索 Agent"
+    的职责。
+
+    这不只是"分工好看"，而是有实际效果：
+        1. 上下文隔离：每个 Agent 的上下文里只装自己那类数据
+        2. 选择变少 → 模型选错的概率变低（工具越多，选错率越高）
+        3. 权限最小化：Agent 只能碰它该碰的东西
+
+    传 None 表示不限制（单 Agent 模式用）。
+    """
+    schemas = tool_schemas()
+    if only is None:
+        return schemas
+    allowed = set(only)
+    picked = [s for s in schemas if s["function"]["name"] in allowed]
+    # 静默过滤是危险的：名字写错一个，模型就永远拿不到那个工具，
+    # 而且没有任何提示。所以这里主动报错。
+    missing = allowed - {s["function"]["name"] for s in picked}
+    if missing:
+        raise ValueError(f"tool_payload 收到了不存在的工具名：{sorted(missing)}")
+    return picked
 
 
 def summarize(engine: str, question: str, answer: str, steps: list,

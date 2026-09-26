@@ -171,8 +171,8 @@ python -m venv .venv
 | POST | `/rag/search` | 只检索不生成（排查检索质量用） |
 | POST | `/rag/ask` | RAG 问答，带引用溯源 |
 | GET | `/agent/tools` | Agent 能调用的工具清单（含风险等级） |
-| GET | `/agent/graph` | 导出状态图的 mermaid 定义 |
-| POST | `/agent/ask` | **Agent 自主诊断**：它自己决定调哪些工具、跑几轮 |
+| GET | `/agent/graph` | 导出状态图的 mermaid（`engine=react\|supervisor`） |
+| POST | `/agent/ask` | **Agent 自主诊断**（`engine` 三档：handwritten / langgraph / **supervisor**） |
 
 RAG 也可以用命令行：
 
@@ -182,7 +182,7 @@ RAG 也可以用命令行：
 .venv\Scripts\python.exe -m app.rag.pipeline ask "nginx 报 502 怎么排查"
 ```
 
-Agent 也可以用命令行（两个引擎任选）：
+Agent 也可以用命令行（三个引擎任选）：
 
 ```bash
 # 手写 ReAct 循环
@@ -194,8 +194,15 @@ Agent 也可以用命令行（两个引擎任选）：
 # 看状态图长什么样（mermaid）
 .venv\Scripts\python.exe -m app.agents.graph --graph
 
+# 多 Agent 编排（Supervisor + 4 个专业 Agent）
+.venv\Scripts\python.exe -m app.agents.supervisor "web-01 上的网站很慢，帮我查下"
+.venv\Scripts\python.exe -m app.agents.supervisor --graph      # 看编排图
+
 # 两个引擎横向对比（会真实调用模型，约 ¥0.1）
 .venv\Scripts\python.exe -m app.agents.compare
+
+# 意图路由 Agent 的准确率评测（20 条，约 ¥0.02）
+.venv\Scripts\python.exe scripts\eval_specialists.py
 ```
 
 调用示例（在 Git Bash 下，中文请用文件传参，命令行直传会被编码搞坏）：
@@ -256,6 +263,58 @@ curl -sN -X POST http://127.0.0.1:8000/chat/stream -H "Content-Type: application
 | 依赖 | 零 | +7 个包 |
 
 两个版本共用 `common.py` 里的同一份 Prompt 与工具执行逻辑 —— **唯一的变量是编排方式**。
+
+---
+
+## 多 Agent 编排（实测）
+
+在单 Agent ReAct 循环外面套一层调度。**4 个 Agent，7 个节点**：
+
+| Agent | 节点 | 工具 | 职责 |
+|---|---|---|---|
+| **意图路由** | `intent` | 无 | 把人话压成结构化标签（task_type / hosts / services / 是否查资料） |
+| **知识检索** | `knowledge` | `search_knowledge` | 查历史故障经验 |
+| **工具执行** | `diagnose` / `reason` | 5 个运维工具 / **空** | 查现场 / 纯推理 |
+| **结果校验** | `verify` | 无 | 检查结论站不站得住 |
+
+**拆分的四条收益（都能验证）**：上下文隔离、**可单独评测**、
+**权限最小化**（工具执行 Agent 的 schema 里根本没有 `search_knowledge`）、
+可换不同档次的模型。
+
+**意图路由 Agent 准确率实测**（20 条标注用例，逐字段判定）：
+
+| 字段 | 准确率 | 对了/总数 |
+|---|---|---|
+| `task_type` | **100.0%** | 20/20 |
+| `hosts` | **100.0%** | 19/19 |
+| `services` | 80.0% | 4/5 |
+| `needs_live_data` | **100.0%** | 20/20 |
+| `needs_knowledge` | 83.3% | 5/6 |
+
+**全字段全对率 90.0%（18/20）**，需要二次修正的用例 0/20。
+
+> ⚠️ 第一轮跑出来 5 个失败，逐条分析后发现**有一半是我自己标错了标签**
+> （比如"nginx 和 apache 有什么区别"漏标了 apache），
+> 还有两条是"多种答案都合理"。修正标签 + 加 `accept` 多解声明之后才是上面的数字。
+> **不能靠改标准答案让指标好看 —— 那叫改测试，不叫改代码。**
+
+**校验 Agent 的设计**（这一块最值得看）：**能规则化的用规则，规则查不了的才用模型**。
+
+```
+规则查（确定、可复现、零成本、无幻觉）：数值溯源 / 越权声明 / 无证据下结论
+模型查（只能它查）：因果链是否成立 / 置信度是否合理
+
+而且规则先跑 —— 能判否就直接判否，一次模型调用都不花。
+```
+
+> 数值溯源规则踩了三轮误报（来源池漏了用户问题 / 把建议里的 `chmod 755` 当声称的数据 /
+> 主机名 `web-01` 里的数字），**收窄作用范围之后正例反例全部验证过** ——
+> 这 6 个正反例现在跑在自检脚本里。
+> **一个"永远返回通过"的校验器比没有更糟。**
+
+完整原理、五个真实踩到的坑、面试问答见 [`docs/multi-agent.md`](docs/multi-agent.md)。
+
+---
 
 ---
 
@@ -324,7 +383,7 @@ curl -sN -X POST http://127.0.0.1:8000/chat/stream -H "Content-Type: application
 - [x] **Day 3** RAG 全链路 + 混合检索 + 召回率评测 + 引用溯源问答
 - [x] **Day 4** 工具层（6 个运维工具）+ 手写 ReAct + LangGraph 双版本 + 对比评测
 - [x] **Day 5** MCP Server：6 个工具暴露成标准协议（含 schema 漂移校验 + 协议层自检）
-- [ ] **Day 6** 拆成 Supervisor + 4 个专业 Agent
+- [x] **Day 6** Supervisor + 4 个专业 Agent（意图路由/知识检索/工具执行/结果校验）+ 意图路由准确率评测
 - [ ] **Day 7** Docker 沙箱执行 + Human-in-the-Loop
 - [ ] **Day 8** 自托管 Langfuse + 全链路 Trace
 - [ ] **Day 9** 40 条评测集 + 评测报告
@@ -345,6 +404,8 @@ agentdesk/
 │   │   ├── common.py    两个引擎共用的 Prompt、消息处理、工具执行
 │   │   ├── react.py     手写 ReAct 循环（零依赖，原理在这里）
 │   │   ├── graph.py     LangGraph 状态图版本
+│   │   ├── specialists.py  4 个专业 Agent（含校验 Agent 的规则库）
+│   │   ├── supervisor.py   Supervisor 多 Agent 编排
 │   │   └── compare.py   两个引擎的对比评测
 │   ├── tools/           工具层（Agent 的「手」）
 │   │   └── ops.py       6 个运维工具 + 参数白名单 + 风险分级 + 双后端
@@ -362,7 +423,8 @@ agentdesk/
 │   ├── project-map.md        项目框架说明书（每个文件干什么、怎么串起来）
 │   ├── tech-stack.md         技术栈说明（用了什么 / 替代方案 / 怎么测）
 │   ├── react-langgraph.md    ReAct 原理 + 两个实现的对比与取舍
-│   ├── mcp-server.md         MCP 原理 + 三个真实坑 + 怎么配客户端
+│   ├── mcp-server.md         MCP 原理 + 四个真实坑 + 怎么配客户端
+│   ├── multi-agent.md        多 Agent 拆分理由 + 校验 Agent 设计 + 五个坑
 │   ├── python-reference.md   Python 速查手册（含笔试四件套 + 报错速查表）
 │   └── knowledge-points.md   知识点清单（面试复习用）
 ├── eval/
@@ -372,7 +434,8 @@ agentdesk/
 │   └── day1/            Day 1 的 5 个练习 + 公共封装
 ├── scripts/
 │   ├── smoke_test.py    六层自检：环境 → 模型 → 检索 → Agent → MCP → 13 个接口
-│   └── mcp_check.py     MCP 协议层自检（官方客户端连自己，9 项）
+│   ├── mcp_check.py     MCP 协议层自检（官方客户端连自己，9 项）
+│   └── eval_specialists.py  意图路由 Agent 逐字段准确率评测
 ├── check_env.py        Day 0 验收脚本
 ├── requirements.txt
 ├── .env                 本地密钥（不进仓库）

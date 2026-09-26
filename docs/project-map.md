@@ -217,11 +217,24 @@ Agent 的「手」：能去查真实的磁盘、日志、服务状态、容器
 ### `app/agents/` —— 编排层（Day 4 的产出）
 
 ```
-common.py     两个引擎共用的 Prompt、消息处理、工具执行
-react.py      手写 ReAct 循环（零依赖，原理在这里）
-graph.py      LangGraph 状态图版本
-compare.py    两个引擎的对比评测 → 输出报告
+common.py       两个引擎共用的 Prompt、消息处理、工具执行
+react.py        手写 ReAct 循环（零依赖，原理在这里）
+graph.py        LangGraph 状态图版本
+specialists.py  4 个专业 Agent（多 Agent 拆分，Day 6）
+supervisor.py   Supervisor 编排：调度 + 条件边 + 汇总（Day 6）
+compare.py      两个引擎的对比评测 → 输出报告
 ```
+
+**Day 6 又加了一层：在单 Agent 循环外面套了一层调度。** 三层的关系：
+
+```
+supervisor.py        管编排：谁来做、按什么顺序、失败了要不要重来
+  └─ specialists.py  4 个专业 Agent（工具执行 Agent 内部又跑一个受限的 ReAct 子图）
+       └─ graph.py   ReAct 循环 —— "想 → 做 → 看"
+```
+
+**加这一层的时候，`tools/`、`rag/`、`common.py` 一行都没改** ——
+改动全在新加的两个文件里。**这就是分层攒下来的复利。**
 
 **为什么同一个循环写两遍**：为了回答「LangGraph 底层在做什么」。
 手写版是 `for` + `break`；图里 `add_edge("tools","agent")` 那条回头边就是循环。
@@ -360,7 +373,7 @@ Day 1 的 5 个 Python 练习（变量类型 / 容器 / 函数 / 文件 JSON / �
 
 ---
 
-## 第 3 章｜一次请求怎么走（五条主线）
+## 第 3 章｜一次请求怎么走（六条主线）
 
 ### 主线 A：普通问答（`POST /chat`）
 
@@ -480,6 +493,51 @@ Day 1 的 5 个 Python 练习（变量类型 / 容器 / 函数 / 文件 JSON / �
 完整的原理、四个真实踩到的坑、客户端配置与排障顺序，
 见 [`mcp-server.md`](mcp-server.md)。
 
+### 主线 F：多 Agent 编排（`POST /agent/ask` engine=supervisor）★ 最新的一条
+
+**和主线 D 的区别**：主线 D 是一个 Agent 自己从头跑到尾；
+这条是**四个 Agent 分工协作，中间还有一道校验岗**。
+
+```
+用户提问「web-01 上的网站很慢，有时报 502」
+  → 循环开始（每一步干完都回到 supervisor）：
+      ① supervisor 决策：先做意图分类
+         ② intent Agent（无工具）→ {task_type: diagnose, hosts: [web-01],
+                                   symptoms: [访问慢, 502], needs_knowledge: true}
+      ③ supervisor 决策：意图说需要经验 → 去查知识库
+         ④ knowledge Agent → 检索「访问慢 502 排查 处理」，命中 3 篇
+      ⑤ supervisor 决策：意图说需要现场数据 → 派给工具执行 Agent
+         ⑥ diagnose Agent → 内部跑一个**受限 ReAct 子图**
+                            （只有 5 个运维工具，没有 search_knowledge）
+      ⑦ supervisor 决策：结论出来了 → 先校验
+         ⑧ verify Agent → **先跑规则**（数值溯源 / 越权声明 / 有无证据）
+                          规则过了才**再问模型**判因果链
+      ⑨ 校验没过且有额度 → 回到 ⑥ 重查（带上上次的问题 + 已查过的数据）
+      ⑩ supervisor 决策：收工 → finalize
+  → 汇总输出：路由标签 + 诊断结论 + 参考文档 + 校验结论
+```
+
+**实测顺利路径**：`intent → knowledge → diagnose → verify → finalize`，
+5 次工具调用、token 4286、8.8 秒。
+
+**实测带重试路径**：`intent → knowledge → diagnose → verify → diagnose → finalize`，
+12 步。
+
+**★ 这条链路最大的价值在 ⑧ 那一步。**
+Day 4 说过"模型永远不执行任何东西"；多 Agent 这里补上另一半：
+**它也不该是唯一判断自己对不对的人。**
+
+```
+让模型自己"再检查一遍" → 同一批信息、同一个脑子，自证清白
+本项目的做法           → 能规则化的用规则（确定、可复现、零成本、无幻觉），
+                        规则查不了的才用模型，而且规则先跑
+```
+
+完整的拆分理由、校验规则的三轮误报收窄、五个真实坑，
+见 [`multi-agent.md`](multi-agent.md)。
+
+---
+
 ---
 
 ## 第 4 章｜还没做的是什么
@@ -498,11 +556,8 @@ Day 1 的 5 个 Python 练习（变量类型 / 容器 / 函数 / 文件 JSON / �
 |---|---|---|
 | `app/rag/` | ✅ Day 3 | RAG、向量检索、混合检索 |
 | `app/tools/` | ✅ Day 4 | 工具调用 / Function Calling |
-| `app/agents/` | ✅ Day 4（单 Agent 版） | Agent 框架、ReAct、编排 |
+| `app/agents/` | ✅ Day 4 单 Agent<br>✅ Day 6 多 Agent | Agent 框架、ReAct、编排、多 Agent 协同 |
 | `app/mcp_server/` | ✅ Day 5 | MCP、工具生态、协议对接 |
-
-> 多 Agent 协同（Supervisor + 4 个专业 Agent）在 Day 6 —— 那是在现在这个
-> 单 Agent 循环外面再套一层调度，`app/agents/` 里会多出 `supervisor.py`。
 
 **这张表就是你的"下一步路线图"。** 面试时如果被问"这个项目还有哪些没做"，
 照着说一遍，比说"还在完善"强得多 —— 它证明你知道一个完整的 Agent 系统该有哪些部件。
@@ -523,6 +578,10 @@ Day 1 的 5 个 Python 练习（变量类型 / 容器 / 函数 / 文件 JSON / �
   "`tools/` 被两个箭头指向" —— 你不做替代品，你做它能接进去的那一块
 - 问"你项目里有什么难点" → 挑第 2 章里那几个"设计决定"讲（为什么切分、为什么混合检索、
   为什么 RRF、为什么工具里做阈值判断、为什么两个引擎都写、为什么 MCP 要校验 schema 漂移）
+- **问"多 Agent 是不是过度设计"** → 答「拆分的四条收益 + 三条代价」，
+  再补一句"**拆分的门槛是有没有需要被单独评测或隔离上下文的部件**"（第 2 章的 agents 段）
+- **问"你怎么保证结论是对的"** → 讲校验 Agent：**规则先跑、模型兜底**，
+  以及"让模型自检是自证清白"这个理由
 - 问"还没做什么" → 讲第 4 章那张表
 
 **一句话记住整个项目**：

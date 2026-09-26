@@ -7,7 +7,7 @@
 【为什么需要这个脚本】
 技术栈是分层堆起来的：
 
-    运行环境 → 模型 API → 检索(RAG) → Agent(工具+编排) → MCP Server → HTTP 服务
+    运行环境 → 模型 API → 检索(RAG) → Agent(工具+编排+多Agent) → MCP Server → HTTP 服务
 
 出问题时必须自下而上逐层确认。手敲命令一个个试，容易漏、也容易看错。
 这个脚本把六层一次性跑完，最后告诉你「哪一层是好的、哪一层断了」。
@@ -242,6 +242,70 @@ def check_agent(full: bool = False):
     except Exception as e:
         record("编排", "LangGraph 状态图", False, brief(e))
 
+    # ---- 多 Agent 编排：图能编译，且 4 个 Agent 都在 ----
+    try:
+        from app.agents.supervisor import build_graph as build_multi, mermaid as multi_mermaid
+        build_multi(1)
+        mm = multi_mermaid(1)
+        # 每个专业节点干完都要回到 supervisor —— 这就是多 Agent 的"循环"
+        back_edges = sum(1 for n in ("intent", "knowledge", "diagnose",
+                                     "reason", "verify")
+                         if f"{n} --> supervisor" in mm)
+        record("编排", "多 Agent 状态图编译", True,
+               f"mermaid {len(mm)} 字符　回边 {back_edges}/5")
+    except Exception as e:
+        record("编排", "多 Agent 状态图", False, brief(e))
+
+    try:
+        from app.agents.specialists import DIAGNOSE_TOOLS, diagnose
+        record("编排", "4 个专业 Agent 可导入", True,
+               f"工具执行 Agent 的受限工具集：{len(DIAGNOSE_TOOLS)} 个（不含 search_knowledge）")
+    except Exception as e:
+        record("编排", "专业 Agent 导入", False, brief(e))
+
+    # ---- ★ 校验器自己也要被验证 ----
+    # 一个"永远返回通过"的校验器比没有更糟 —— 它会给你虚假的安全感。
+    # 所以这里用已知的**正例和反例**去测它，两边都要对。
+    try:
+        from app.agents.specialists import check_numbers, _check_overreach
+
+        evidence = ['{"use_percent":96,"size":"40G","used":"38.4G","host":"web-01"}']
+        cases = [
+            # (说明, 结论片段, 期望是否发现问题)
+            ("数字有出处 → 应通过",
+             "**依据**\n- /dev/vda1 使用率 96%，共 40G，主机 web-01", False),
+            ("数字来自用户问题 → 应通过",
+             "**依据**\n- 用户提到的 502 由上游超时引起", False),
+            ("数字凭空出现 → 应发现",
+             "**依据**\n- 使用率 98%，剩余 2G", True),
+            ("建议里的参数值 → 应通过（不是事实主张）",
+             "**建议**\n1. chmod 755 /var/log\n2. chown 999:999 /data", False),
+        ]
+        bad_nums = 0
+        for label, claim, want_problem in cases:
+            probs, _note = check_numbers(claim, evidence,
+                                         "nginx 报 502 了" if "用户问题" in label else "")
+            found = bool(probs)
+            if found != want_problem:
+                bad_nums += 1
+                print(f"      ✗ {label}：期望{'发现问题' if want_problem else '通过'}，"
+                      f"实际 {'发现' if found else '通过'}")
+        record("校验", f"数值溯源 {len(cases)} 个正反例", bad_nums == 0,
+               "正例反例全对" if bad_nums == 0 else f"{bad_nums} 个不符预期")
+
+        over_cases = [
+            ("只读建议 → 应通过", "建议清理 /var/log 下的旧日志", False),
+            ("越权声明 → 应发现", "我已经清理了 /var/log 下的旧日志", True),
+        ]
+        bad_over = 0
+        for label, claim, want in over_cases:
+            if bool(_check_overreach(claim)) != want:
+                bad_over += 1
+        record("校验", f"越权检测 {len(over_cases)} 个正反例", bad_over == 0,
+               "正例反例全对" if bad_over == 0 else f"{bad_over} 个不符预期")
+    except Exception as e:
+        record("校验", "校验器自测", False, brief(e))
+
     # ---- 可选：真跑一轮（花钱，默认不跑） ----
     if full:
         try:
@@ -254,6 +318,20 @@ def check_agent(full: bool = False):
                    f"token {res['usage'].get('total_tokens', 0)}")
         except Exception as e:
             record("编排", "LangGraph 真跑一轮", False, brief(e))
+        # 多 Agent 比单 Agent 贵（4 次以上模型调用，约 ¥0.02），
+        # 所以也放在 --full 后面 —— 但它验证的是完全不同的东西：
+        # 单 Agent 只证明 ReAct 循环能跑，多 Agent 还证明"调度 + 校验 + 汇总"这条链路通。
+        try:
+            from app.agents.supervisor import run as multi_run
+            t0 = time.time()
+            res = multi_run("web-01 上的磁盘用满了吗", max_retries=0)
+            record("编排", "多 Agent 真跑一轮", bool(res["answer"]),
+                   f"{time.time() - t0:.1f}s · "
+                   f"路径 {'→'.join(res['path'])} · "
+                   f"token {res['usage'].get('total_tokens', 0)} · "
+                   f"校验 {'通过' if res['verdict'].get('pass') else '未通过'}")
+        except Exception as e:
+            record("编排", "多 Agent 真跑一轮", False, brief(e))
     else:
         record("编排", "真实一轮 Agent 调用（默认跳过）", False,
                "加 --full 参数才会跑：python scripts/smoke_test.py --full",
@@ -484,7 +562,7 @@ def summarize():
     print("  自检汇总")
     print("=" * 62)
 
-    layers = ["环境", "模型", "检索", "问答", "工具", "编排", "MCP", "服务", "接口"]
+    layers = ["环境", "模型", "检索", "问答", "工具", "编排", "校验", "MCP", "服务", "接口"]
     for layer in layers:
         rows = [r for r in results if r[0] == layer]
         if not rows:
