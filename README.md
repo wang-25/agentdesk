@@ -66,18 +66,32 @@ AgentDesk 想做到的是：输入「nginx 报 502 了，帮我看下」，由 A
 
 ---
 
-## 技术栈（规划）
+## 技术栈
+
+**现在实际在用的（Day 0-3）** —— 只有 7 个第三方包：
+
+| 层 | 选型 | 为什么选它 |
+|---|---|---|
+| 语言 | Python 3.12 | 3.10-3.12 是 AI 生态验证最充分的区间 |
+| 模型调用 | httpx 手写 + DeepSeek（OpenAI 兼容） | 手写看得清协议细节；两家兼容格式，换服务商只改配置 |
+| 服务 | FastAPI + uvicorn | 原生 async（SSE 流式必需）+ pydantic 自动校验与文档 |
+| 校验 | pydantic v2 | 定义接口契约，FastAPI 依赖它生成 `/docs` |
+| 检索 | numpy 内存索引 + BM25(jieba) + RRF 融合 | 50 块规模用不上向量库，一次矩阵乘法几毫秒 |
+| 向量化 | 可插拔：百炼 `text-embedding-v3` / local 兜底 | 没有额外 Key 也能跑通链路自测 |
+| 配置 | python-dotenv | 密钥不落代码、不进仓库 |
+
+**规划中的（Day 4 起）**：
 
 | 层 | 选型 |
 |---|---|
-| 编排 | LangGraph（Supervisor 多 Agent） |
-| 服务 | FastAPI + SSE 流式输出 |
-| 检索 | Milvus / Qdrant + BGE-M3 embedding + 混合检索 + 重排 |
+| 编排 | LangGraph（Supervisor 多 Agent）—— 但先手写 ReAct 一遍 |
 | 工具 | FastMCP（MCP Server） |
 | 安全 | Docker 沙箱执行 + 命令白名单 + Human-in-the-Loop |
-| 可观测 | 自托管 Langfuse + OpenTelemetry + Prometheus / Grafana |
-| 评测 | Ragas + LLM-as-Judge |
+| 可观测 | 自托管 Langfuse + Prometheus / Grafana |
+| 评测 | Ragas + LLM-as-Judge（自写召回率评测已有） |
 | 部署 | Docker Compose + Nginx + HTTPS（阿里云 ECS） |
+
+> **每一项的替代方案、取舍、升级时机，以及"怎么验证它在工作"，见 [`docs/tech-stack.md`](docs/tech-stack.md)。**
 
 ---
 
@@ -116,7 +130,17 @@ python -m venv .venv
 
 **通过标准**：屏幕出现模型的一句回答，并打印出本次调用的 token 用量与成本估算。
 
-### 4. 启动服务
+### 4. 全链路自检
+
+```bash
+.venv\Scripts\python.exe scripts\smoke_test.py
+```
+
+一条命令跑完四层：**运行环境 → 模型连通 → 检索与问答 → HTTP 十个接口**，
+最后给出 ✅/❌ 汇总表。服务没启动时第 4 层自动跳过（退出码仍为 0）。
+**服务启动后复跑一次，可以确认全部 10 个接口都在工作。**
+
+### 5. 启动服务
 
 ```bash
 .venv\Scripts\python.exe -m uvicorn app.main:app --reload --port 8000
@@ -125,7 +149,7 @@ python -m venv .venv
 启动后打开 **http://127.0.0.1:8000/docs** —— FastAPI 自动生成的交互式文档，
 不用写前端就能点着测每一个接口。
 
-### 5. 接口一览
+### 6. 接口一览
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
@@ -221,12 +245,15 @@ agentdesk/
 │   └── index/           构建出的索引（可重建，不进仓库）
 ├── docs/
 │   ├── project-map.md        项目框架说明书（每个文件干什么、怎么串起来）
+│   ├── tech-stack.md         技术栈说明（用了什么 / 替代方案 / 怎么测）
 │   ├── python-reference.md   Python 速查手册（含笔试四件套 + 报错速查表）
 │   └── knowledge-points.md   知识点清单（面试复习用）
 ├── eval/
 │   └── qa_set.json      召回率评测集（32 个问题）
 ├── practice/
 │   └── day1/            Day 1 的 5 个练习 + 公共封装
+├── scripts/
+│   └── smoke_test.py    全链路自检：环境 → 模型 → 检索 → 10 个接口
 ├── check_env.py        Day 0 验收脚本
 ├── requirements.txt
 ├── .env                 本地密钥（不进仓库）
