@@ -23,7 +23,12 @@ AgentDesk 服务入口
     POST /agent/ask       ★ Agent 自主诊断（engine 可选三档）
                           handwritten  手写 ReAct 循环
                           langgraph    状态图（默认）
-                          supervisor   ★ 多 Agent 编排（意图/知识/诊断/校验）
+                          supervisor   ★ 多 Agent 编排（意图/知识/诊断/校验/处置）
+    GET  /sandbox         沙箱状态 + 命令白名单（准入规则一览）
+    GET  /approvals       ★ 待人工确认的审批单列表
+    POST /approvals/{id}/approve   批准（必须填审批人）
+    POST /approvals/{id}/reject    驳回
+    POST /approvals/{id}/execute   执行已批准的命令（一次性）
 
 服务起来后打开 http://127.0.0.1:8000/docs 有自动生成的交互式文档。
 """
@@ -700,10 +705,16 @@ def agent_ask(req: AgentRequest):
                             in (result.get("knowledge") or {}).get("results", [])],
             },
             "verdict": result.get("verdict"),
+            # ★ 处置结果。pending_approvals 是响应里最该被看一眼的字段 ——
+            #   它代表「Agent 想做但还没做」的全部内容。
+            "remediation": result.get("remediation"),
+            "pending_approvals": result.get("pending_approvals") or [],
+            "executed_commands": result.get("executed_commands") or [],
+            "denied_commands": result.get("denied_commands") or [],
             "path": result.get("path"),
             "node_log": result.get("node_log"),
             "supervisor_decisions": result.get("supervisor_decisions"),
-            "agents": 4,
+            "agents": 5,
         }
 
     if req.include_trace:
@@ -714,3 +725,230 @@ def agent_ask(req: AgentRequest):
             for step in result["steps"]
         ]
     return payload
+
+
+# ============================================================
+# 十二、沙箱与人工确认（Day 7）
+# ============================================================
+# 这一组接口是**给人用的**，不是给 Agent 用的。
+#
+# 前面所有接口（/chat /rag /agent/ask）的调用方都是"程序"或者"模型"；
+# 这四个的调用方是**值班的人**：
+#
+#     GET  /sandbox                   "现在这套东西到底能执行什么？"
+#     GET  /approvals?status=pending  "有什么在等我批？"
+#     POST /approvals/{id}/approve    "我同意这一条"
+#     POST /approvals/{id}/execute    "执行它"
+#
+# ★ 为什么"批准"和"执行"要分成两个动作？
+#
+#   合成一个"批准并执行"看起来更省事，但会丢掉一个关键信息：
+#   **批准是一个决定，执行是一个动作。** 拧在一起之后，
+#   你没法表达"我同意这么做，但现在先别做"（比如要等到维护窗口）。
+#
+#   而且分开之后，"谁批准了"和"谁执行的"可以不是同一个人 ——
+#   这在有审批流程的团队里是常态，也是审计真正关心的东西。
+class ApprovalAction(BaseModel):
+    """审批动作。by 必填 —— 见下面 approve 接口的说明。"""
+
+    by: str = Field(..., min_length=1, max_length=64,
+                    description="审批人标识（姓名 / 工号 / 邮箱均可）。"
+                                "**必填**，它是审计里最关键的一个字段")
+    note: str = Field("", max_length=300, description="备注")
+
+
+@app.get("/sandbox")
+def sandbox_status():
+    """沙箱状态 + 命令白名单。
+
+    面试演示时这个接口很有用：它一次回答了"你能执行什么、哪些要人批、
+    **哪些真的有隔离**"三个问题。
+    """
+    from app.sandbox import executor, policy
+
+    info = executor.preflight()
+    info["policy"] = policy.describe()
+    info["commands"] = policy.catalog()
+    return info
+
+
+@app.get("/approvals")
+def list_approvals(status: Optional[str] = Query(
+        None, pattern="^(pending|approved|rejected|consumed|expired)$",
+        description="按状态过滤，不传返回全部"),
+    limit: int = Query(50, ge=1, le=200)):
+    """列出审批单。默认按时间倒序。
+
+    ★ pending 是运维最关心的那个视图 ——
+      "有什么在等我批"，这句话应该有一个接口能直接回答，
+      而不是让人去翻日志。
+    """
+    from app.sandbox import approvals
+
+    st = approvals.store()
+    return {
+        "counts": st.counts(),
+        "status_filter": status,
+        "items": st.list(status=status, limit=limit),
+    }
+
+
+@app.get("/approvals/{approval_id}")
+def get_approval(approval_id: str):
+    from app.sandbox import approvals
+
+    try:
+        return approvals.store().get(approval_id)
+    except approvals.ApprovalError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@app.post("/approvals/{approval_id}/approve")
+def approve(approval_id: str, req: ApprovalAction):
+    """批准一张审批单。
+
+    ★ 为什么 by 是必填的？
+
+      一张没有审批人的审批单，等于**没有审批**。
+
+      它在审计上回答问题"谁批准了这次变更"时是空的 ——
+      事故复盘时，"系统批准的"不是一个能交差的回答。
+      所以这里宁可多要一个字段，也不要事后追责时发现查不到人。
+
+      （这条约束写在 approvals.py 的 store 层，不只是这里。
+        接口层可以绕过（比如别的调用方），store 层绕不过。）
+    """
+    from app.sandbox import approvals
+
+    try:
+        rec = approvals.store().approve(approval_id, by=req.by, note=req.note)
+    except approvals.ApprovalError as e:
+        # 409 = 状态冲突（比如已经批过了）。用 409 不用 400，
+        # 因为"你这个请求本身没问题，是对象当前状态不允许"——
+        # 调用方看到 409 就知道该刷新一下状态，看到 400 会去改参数。
+        raise HTTPException(status_code=409, detail=str(e))
+
+    write_audit("approval.approved", {
+        "approval_id": approval_id, "by": req.by, "note": req.note,
+        "command": rec.get("command"), "fingerprint": rec.get("fingerprint"),
+    })
+    return rec
+
+
+@app.post("/approvals/{approval_id}/reject")
+def reject(approval_id: str, req: ApprovalAction):
+    """驳回一张审批单。驳回理由会被记录 —— 它是改进 Prompt 的素材。"""
+    from app.sandbox import approvals
+
+    try:
+        rec = approvals.store().reject(approval_id, by=req.by, note=req.note)
+    except approvals.ApprovalError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+
+    write_audit("approval.rejected", {
+        "approval_id": approval_id, "by": req.by, "note": req.note,
+        "command": rec.get("command"),
+    })
+    return rec
+
+
+@app.post("/approvals/{approval_id}/execute")
+def execute_approval(approval_id: str, req: ApprovalAction):
+    """执行一张**已批准**的审批单。
+
+    【这里做三道校验，缺一道都不行】
+
+      ① 状态必须是 approved（approvals.consume 里卡）
+         → 挡住"没批就执行"
+
+      ② 只能消费一次（consumed 是终态）
+         → 挡住"一次批准执行一百次"。**审批系统的头号漏洞就是重放。**
+
+      ③ 命令指纹必须和审批时一致
+         → 挡住 TOCTOU：批准的命令和执行的命令必须是同一条
+
+    这三道都在 store 层实现，**不在这个接口里** ——
+    因为接口层是可以被绕过的（换个调用方、写个脚本直接调），
+    只有放在状态机里，约束才是真的。
+
+    ★ 这也是本项目反复出现的那个原则的又一次应用：
+      **把约束放在"绕不过去"的那一层。**
+      提示词可以被忽略，接口可以被绕过，状态机绕不过。
+    """
+    from app.sandbox import approvals, executor, policy
+
+    st = approvals.store()
+
+    # 先取出来 —— 需要它的 command 去重新决策（拿到执行用的 argv）
+    try:
+        rec = st.get(approval_id)
+    except approvals.ApprovalError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+    if rec["status"] != "approved":
+        raise HTTPException(
+            status_code=409,
+            detail=f"审批单状态是 {rec['status']}，必须先批准才能执行"
+                   f"（当前状态：{rec['status']}）")
+    if rec.get("consumed_at"):
+        raise HTTPException(
+            status_code=409,
+            detail=f"这张审批单已在 {rec['consumed_at']} 执行过，不能重复执行")
+
+    # ★ 重新走一遍策略，拿到带 argv 的 Decision。
+    #
+    #   为什么不把 argv 存进审批单？因为**策略可能已经变了** ——
+    #   白名单调整过、撤回了一条规则。这时候正确的行为是**重新判定**，
+    #   而不是拿几天前的决定去执行。
+    #
+    #   「批准时合法」和「执行时合法」是两件事，
+    #   两个时刻都要成立才允许执行。
+    decision = policy.decide(rec["command"])
+
+    if decision.decision == policy.DENY:
+        write_audit("approval.execute_blocked", {
+            "approval_id": approval_id, "by": req.by,
+            "command": rec["command"], "reason": decision.reason,
+        })
+        raise HTTPException(
+            status_code=409,
+            detail=f"这条命令现在已被策略禁止，拒绝执行：{decision.reason}")
+
+    # 指纹比对（防 TOCTOU）。用当前决策算出的指纹去对审批时记下的。
+    if decision.fingerprint != rec.get("fingerprint"):
+        raise HTTPException(
+            status_code=409,
+            detail=f"命令指纹不匹配，拒绝执行。"
+                   f"审批时：{rec.get('fingerprint')}，"
+                   f"现在：{decision.fingerprint}")
+
+    try:
+        # 先消费（占位），再执行 —— 顺序很重要。
+        #
+        # 反过来的话：执行成功但消费失败（比如写日志时崩了），
+        # 这张单子会停留在 approved，下次还能再执行一次。
+        # **宁可出现"已标记消费但执行失败"，也不要出现"执行成功还能再执行"。**
+        # 前者是少做了一次（人能看到错误），后者是重复做（可能造成事故）。
+        st.consume(approval_id, expected_fingerprint=decision.fingerprint,
+                   by=req.by, ok=True)
+    except approvals.ApprovalError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+
+    try:
+        result = executor.run(decision)
+    except executor.SandboxUnavailable as e:
+        # 沙箱不可用 → **不降级执行**。记审计，如实返回失败。
+        write_audit("approval.execute_failed", {
+            "approval_id": approval_id, "by": req.by,
+            "command": rec["command"], "error": str(e),
+        })
+        raise HTTPException(status_code=503, detail=str(e))
+
+    payload = result.to_dict()
+    write_audit("approval.executed", {
+        "approval_id": approval_id, "by": req.by,
+        "command": rec["command"], "ok": result.ok,
+        "isolated": result.isolated, "backend": result.backend,
+        "exit_code": result.exit_code, "elapsed_ms": result.elapsed_ms,
+    })
+    return {"approval": st.get(approval_id), "result": payload}

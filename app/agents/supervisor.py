@@ -80,6 +80,7 @@ from app.agents.specialists import (
     DIAGNOSE_TOOLS,
     compose_answer,
     diagnose,
+    remediate,
     retrieve_knowledge,
     route_intent,
     verify,
@@ -112,6 +113,7 @@ class MultiAgentState(TypedDict):
     knowledge: dict
     diagnosis: dict
     verdict: dict
+    remediation: dict      # ★ Day 7：处置结果（提交了哪些审批 / 执行了什么）
     next_step: str
     supervisor_reason: str
     visited: Annotated[list, operator.add]
@@ -201,11 +203,37 @@ def make_supervisor_node(max_retries: int):
             out["retries"] = 1
             return out
 
-        # 6. 全部走完（或重试用尽）→ 汇总
+        # 6. ★ 需要处置，且校验已通过 → 派给处置 Agent（Day 7 新增）
+        #
+        #    ★★ 这里有一道安全规则，是本项目刻意加的：
+        #
+        #       **结论没过校验，就不许据此动手。**
+        #
+        #       推理很简单：处置动作是「基于诊断结论」的。
+        #       如果校验 Agent 说「这个结论的数值找不到出处 / 因果链不成立」，
+        #       那它给出的建议同样可疑 —— 这时候去执行它，等于把
+        #       「没被验证的结论」直接变成了「对生产系统的改动」。
+        #
+        #       代价是：有些本来能自动修的问题，会因为结论表述不严谨而不动手。
+        #       这个代价我认为值得付 —— **宁可少修一次，不能修错一次。**
+        #       而人看到「结论未通过校验」这条提示，可以自己判断要不要动手。
+        needs_remediate = intent.get("task_type") == "remediate"
+        if needs_remediate and verdict.get("pass") and not counts.get("remediate"):
+            return decide(
+                "remediate",
+                "意图为 remediate 且诊断结论已通过校验"
+                f"（依据：{intent.get('reason') or '-'}）")
+
+        # 7. 全部走完（或重试用尽）→ 汇总
         if not verdict.get("pass"):
+            # 若意图要求处置但结论没过校验，必须明确说明「没有动手」
+            tail = ("；且因结论未通过校验，**未执行任何处置动作**"
+                    if needs_remediate and not counts.get("remediate") else "")
             return decide("finalize",
                           f"校验仍未通过且重试额度已用尽（{attempts - 1}/{max_retries}），"
-                          f"带标记出结论")
+                          f"带标记出结论{tail}")
+        if needs_remediate and not counts.get("remediate"):
+            return decide("finalize", "意图要求处置但未满足处置条件，只出结论")
         return decide("finalize", "校验通过，汇总输出")
 
     return supervisor_node
@@ -311,13 +339,48 @@ def verify_node(state: MultiAgentState) -> dict:
     }
 
 
+def make_remediate_node():
+    """处置 Agent 节点。
+
+    ★ 它只在校验通过之后才会被调到 —— 这条约束写在 Supervisor 的决策里，
+      不在这里。**约束写在一处，比写两处可靠**：
+      如果这里也写一遍 `if not verdict.pass: return`，那两处就有不一致的可能，
+      而"同一条件判断两遍"正是最容易出现分歧的地方。
+    """
+
+    def node(state: MultiAgentState) -> dict:
+        t0 = time.time()
+        result = remediate(state["question"], state.get("intent") or {},
+                           state.get("diagnosis") or {})
+        elapsed = int((time.time() - t0) * 1000)
+
+        n_ap = len(result["approvals"])
+        n_ex = len(result["executed"])
+        n_dn = len(result["denied"])
+        summary = (f"提交审批 {n_ap} 条 · 已执行 {n_ex} 条 · 被拒 {n_dn} 条"
+                   f"｜{result['tool_calls']} 次工具调用")
+        if result["approvals"]:
+            summary += ("｜待批：" + "、".join(
+                a["approval_id"] for a in result["approvals"]))
+
+        return {
+            "remediation": result,
+            "visited": ["remediate"],
+            "usage": result.get("usage") or {},
+            "node_log": _log("remediate", bool(result["answer"]), elapsed, summary),
+        }
+
+    return node
+
+
 def make_finalize_node(config: dict):
     def finalize_node(state: MultiAgentState) -> dict:
         t0 = time.time()
         answer = compose_answer(
             state["question"], state.get("intent") or {},
             state.get("knowledge") or {}, state.get("diagnosis") or {},
-            state.get("verdict") or {}, config)
+            state.get("verdict") or {}, config,
+            state.get("remediation") or {})
         elapsed = int((time.time() - t0) * 1000)
         return {
             "answer": answer,
@@ -348,6 +411,7 @@ def build_graph(max_retries: int = 1, config: dict = None):
     graph.add_node("diagnose", make_diagnose_node(DIAGNOSE_TOOLS, "diagnose"))
     graph.add_node("reason", make_diagnose_node([], "reason"))
     graph.add_node("verify", verify_node)
+    graph.add_node("remediate", make_remediate_node())     # ★ Day 7
     graph.add_node("finalize", make_finalize_node(config))
 
     graph.add_edge(START, "supervisor")
@@ -358,11 +422,13 @@ def build_graph(max_retries: int = 1, config: dict = None):
         "supervisor", lambda s: s["next_step"],
         {"intent": "intent", "knowledge": "knowledge",
          "diagnose": "diagnose", "reason": "reason",
-         "verify": "verify", "finalize": "finalize"},
+         "verify": "verify", "remediate": "remediate",
+         "finalize": "finalize"},
     )
 
     # 每个专业 Agent 干完都回到 Supervisor —— 这就是多 Agent 的"循环"
-    for node in ("intent", "knowledge", "diagnose", "reason", "verify"):
+    for node in ("intent", "knowledge", "diagnose", "reason", "verify",
+                 "remediate"):
         graph.add_edge(node, "supervisor")
     graph.add_edge("finalize", END)
 
@@ -392,6 +458,7 @@ def run(question: str, max_retries: int = 1, verbose: bool = False,
     init = {
         "question": question,
         "intent": {}, "knowledge": {}, "diagnosis": {}, "verdict": {},
+        "remediation": {},
         "next_step": "", "supervisor_reason": "",
         "visited": [], "retries": 0, "node_log": [],
         "usage": new_usage(), "answer": "",
@@ -413,6 +480,7 @@ def run(question: str, max_retries: int = 1, verbose: bool = False,
 
     diagnosis = final.get("diagnosis") or {}
     verdict = final.get("verdict") or {}
+    remediation = final.get("remediation") or {}
     usage = final.get("usage") or new_usage()
 
     return {
@@ -425,6 +493,12 @@ def run(question: str, max_retries: int = 1, verbose: bool = False,
         else "ok",
         "knowledge": final.get("knowledge") or {},
         "verdict": verdict,
+        "remediation": remediation,
+        # ★ 待人工确认的审批单。这张列表就是「Agent 想做什么但还没做」的
+        #   全部内容 —— 它也是 /agent/ask 响应里最该被人看一眼的字段。
+        "pending_approvals": remediation.get("approvals") or [],
+        "executed_commands": remediation.get("executed") or [],
+        "denied_commands": remediation.get("denied") or [],
         "node_log": log,
         "path": [item["node"] for item in log if item["node"] != "supervisor"],
         "supervisor_decisions": [
@@ -436,9 +510,10 @@ def run(question: str, max_retries: int = 1, verbose: bool = False,
         "distinct_tools": diagnosis.get("tools") or [],
         "usage": usage,
         "elapsed_ms": int((time.time() - started) * 1000),
-        "stop_reason": ("verification_failed" if not verdict.get("pass")
+        "stop_reason": ("awaiting_approval" if remediation.get("approvals")
+                        else "verification_failed" if not verdict.get("pass")
                         else "answered"),
-        "agent_count": 4,
+        "agent_count": 5,
         "node_count": len([n for n in (final.get("visited") or [])
                            if n != "supervisor"]),
     }
@@ -478,6 +553,14 @@ def _main(argv=None):
     print(result["answer"])
     print("\n" + "=" * 62)
     print(f"  路径：{' → '.join(result['path'])}")
+    if result["pending_approvals"]:
+        print("\n  待人工确认（批准后才会执行）：")
+        for a in result["pending_approvals"]:
+            print(f"    · {a['approval_id']}  {a['command']}")
+            print(f"       原因：{a['reason']}")
+        print("    → 查看：GET  /approvals?status=pending")
+        print("    → 批准：POST /approvals/{id}/approve")
+        print("    → 执行：POST /approvals/{id}/execute")
     print(f"  工具调用 {result['tool_calls']} 次 · "
           f"token {result['usage'].get('total_tokens', 0)} · "
           f"耗时 {result['elapsed_ms']}ms")

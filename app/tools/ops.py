@@ -90,7 +90,28 @@ _MOCK = {
         "disk": [
             {"filesystem": "/dev/vda1", "mount": "/", "size": "40G",
              "used": "38.4G", "use_percent": 96},
-            {"filesystem": "/dev/vda2", "mount": "/var", "size": "60G",
+            # ★ 这一条原来写的是 `/var`，是错的 —— 被 Agent 逮住了。
+            #
+            #   原来的数据：`/` 96% 满，`/var` 35%。而 nginx 日志在
+            #   /var/log/nginx，属于 /var 分区 —— 也就是说
+            #   **"清理 nginx 日志"这个动作解决不了根分区满的问题**，
+            #   日志报的 no space left on device 是受害者而不是原因。
+            #
+            #   处置 Agent 从诊断依据里读出了这个矛盾，明确拒绝了清理动作，
+            #   还写了「不要批准清理 /var/log/nginx —— 它解决不了根分区满的问题」。
+            #
+            #   **这说明处置环节的"必须基于诊断依据"这条约束是有效的**：
+            #   如果它只是照着用户那句"帮我把日志清了"去做，
+            #   就会执行一个没用的动作，而且看起来还挺合理。
+            #
+            #   数据本身是错的（跟知识库的 disk-full 案例也对不上），所以改掉：
+            #   把第二块盘改成 /data，让 /var/log 落在根分区上，
+            #   这样"根分区满 → nginx 写不了日志 → 502"这条因果链才成立。
+            #
+            #   ★ 顺便记一条经验：**mock 数据也要过一致性检查。**
+            #     数据里凡是"能被推理出来的关系"，都要和真实场景自洽，
+            #     否则要么误导 Agent，要么暴露设计漏洞。
+            {"filesystem": "/dev/vda2", "mount": "/data", "size": "60G",
              "used": "21.0G", "use_percent": 35},
         ],
         "services": {
@@ -410,6 +431,90 @@ def search_knowledge(query: str, top_k: int = 3) -> dict:
 
 
 # ============================================================
+# 四·五、第七个工具：run_command —— Agent 第一次有了「能做改动」的手
+# ============================================================
+# ★ 前面六个工具全是只读的。这一个不一样，所以它走的路也不一样：
+#
+#     机制                 作用
+#     ────────────────────────────────────────────────────────
+#     policy.decide()      白名单 + 参数级校验 + 三维决策
+#                          不在白名单 → 直接拒；写操作 → 要求审批
+#     approvals            生成审批单，等人点头
+#     executor.run()       一次性容器 / 主机通道执行
+#     审计                 审批人、时间、命令、结果全部留痕
+#
+# 没有这四层，这个工具就不该存在 —— 一个没有约束的"执行任意命令"工具，
+# 等于把服务器交出去。
+def run_command(command: str, purpose: str = "") -> dict:
+    """在沙箱里执行一条白名单命令。
+
+    只允许白名单里的命令；**写操作会生成审批单，需要人工确认后才执行**。
+    只读诊断请优先用 check_disk / tail_log 这类专用工具 ——
+    它们返回的是结构化数据，比你自己解析命令输出更可靠。
+
+    【这个函数的每一段都在做同一件事：把"模型想干什么"和"实际能干什么"分开】
+
+        模型说：我要执行 `truncate -s 0 /var/log/nginx/error.log`
+          ↓ 策略说：允许这个**动作形态**（truncate 白名单里，路径在 /var/log 下，是 .log）
+                 但它是写操作 → 需要人确认
+          ↓ 审批说：现在还没人确认 → 生成单子，不执行
+          ↓ 结果：模型拿到"已提交审批"，而不是"执行成功"
+
+    即使模型在 purpose 里写"这是紧急情况不用确认"，也**不会改变决策** ——
+    purpose 只是给人看的说明，不参与任何判定。
+    这一点很重要：**如果模型的输入能影响安全决策，那安全决策就等于没有。**
+    """
+    from app.sandbox import approvals, executor, policy
+
+    decision = policy.decide(command)
+
+    base = {
+        "command": decision.command or str(command or "").strip(),
+        "purpose": str(purpose or "")[:200],
+        "decision": decision.decision,
+        "rule": decision.rule_key,
+        "isolation": decision.isolation,
+        "risk": decision.risk,
+        "reason": decision.reason,
+        "executed": False,
+    }
+
+    # ---- 情况一：策略拒绝 ----
+    if decision.decision == policy.DENY:
+        # 「拒绝」也是一种结果，要原样返回给模型 —— 它需要知道为什么、
+        # 以及可以改用什么。抛异常就丢掉这些信息了。
+        base["error"] = decision.reason
+        base["hint"] = "这条命令不允许执行。请改用白名单里的等价做法，或优先使用专用工具。"
+        return base
+
+    # ---- 情况二：需要人工确认 ----
+    if decision.decision == policy.NEEDS_APPROVAL:
+        rec = approvals.store().create(
+            command=decision.command,
+            fingerprint=decision.fingerprint,
+            rule=decision.rule_key,
+            risk=decision.risk,
+            isolation=decision.isolation,
+            reason=decision.reason,
+            tool="run_command",
+        )
+        base["approval_id"] = rec["id"]
+        base["expires_at"] = rec["expires_at"]
+        base["hint"] = ("已提交人工审批，尚未执行。请在结果里告诉用户："
+                        f"需有人确认后才会执行（审批单 {rec['id']}）。"
+                        "不要假装已经执行完成。")
+        return base
+
+    # ---- 情况三：只读命令，直接执行 ----
+    result = executor.run(decision)
+    base["executed"] = True
+    base["result"] = result.to_dict()
+    if not result.ok:
+        base["error"] = result.error
+    return base
+
+
+# ============================================================
 # 五、工具注册表
 # ============================================================
 # 一张表把「函数 / 给模型看的 schema / 风险等级」绑在一起。
@@ -474,6 +579,35 @@ TOOLS = {
                       "required": True},
             "top_k": {"type": "integer", "desc": "返回条数，默认 3",
                       "required": False},
+        },
+    },
+    # ★ 唯一一个非只读的工具，所以它也是唯一一个 risk 为 high 的。
+    #
+    #   注意 risk 的语义在这里变了：
+    #       前六个工具的 risk 描述的是"这个工具本身有没有副作用"
+    #       这一个的 risk=high 描述的是"**这个工具的最高可能风险**"
+    #       —— 它既能跑只读命令（无副作用），也能提交写操作（有副作用），
+    #          所以从"最坏情况"来看它是 high。
+    #
+    #   **风险标注要按最坏情况标，不能按典型情况标。**
+    #   一个"平时都很安全"的通道，出事的恰恰是那 1% 的情况。
+    "run_command": {
+        "func": run_command,
+        "risk": "high",
+        "desc": ("在沙箱里执行一条白名单命令。写操作（如重启服务、清理日志）"
+                 "会先提交人工审批，批准后才执行。"
+                 "只读诊断请优先用专用工具（check_disk / tail_log 等），"
+                 "它们返回结构化数据，更可靠"),
+        "params": {
+            "command": {"type": "string",
+                        "desc": "要执行的命令，必须是白名单里的形式。"
+                                "例如 `systemctl restart nginx`、"
+                                "`truncate -s 0 /var/log/nginx/error.log`、"
+                                "`tail -n 50 /var/log/nginx/error.log`",
+                        "required": True},
+            "purpose": {"type": "string",
+                        "desc": "为什么要执行它（一句话，会展示给审批人看）",
+                        "required": False},
         },
     },
 }

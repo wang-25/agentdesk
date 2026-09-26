@@ -65,7 +65,7 @@
           验证侧：eval/qa_set.json    （32 个检索问题）
                   eval/reports/       （跑出来的报告，可重建）
 
-          ⬜ 还没做：app/sandbox/（Day 7）  app/observability/（Day 8）
+          ⬜ 还没做：app/observability/（Day 8）  deploy/（Day 10）
                     deploy/（Day 10）
 ```
 
@@ -373,7 +373,7 @@ Day 1 的 5 个 Python 练习（变量类型 / 容器 / 函数 / 文件 JSON / �
 
 ---
 
-## 第 3 章｜一次请求怎么走（六条主线）
+## 第 3 章｜一次请求怎么走（七条主线）
 
 ### 主线 A：普通问答（`POST /chat`）
 
@@ -540,13 +540,51 @@ Day 4 说过"模型永远不执行任何东西"；多 Agent 这里补上另一�
 
 ---
 
+### 主线 G：沙箱执行 + 人工确认（★ Day 7 最新）
+
+**这是唯一一条"会改系统"的链路**，所以它比前面所有主线都多了一道门。
+
+```
+模型（处置 Agent）想执行 truncate -s 0 /var/log/nginx/error.log
+  → policy.decide()
+      白名单命中 truncate → 决策 needs_approval
+      路径在 /var/log 下、是 .log → 通过
+      算指纹（argv + 通道 + 挂载）
+  → approvals.create()
+      生成 ap-xxxxxxxx，状态 pending，追加写入 logs/approvals.jsonl
+  → 工具把审批单作为观察结果返回
+      模型据此回答「已提交审批，等待人工确认」（而不是「已清理」）
+  → 人：GET /approvals?status=pending 看到它
+        POST /approvals/{id}/approve {by:"张三"}   ← by 必填
+        POST /approvals/{id}/execute
+  → 执行时三道校验（都在 store 状态机里，接口层绕不过）：
+      ① 状态必须 approved（挡住没批就执行）
+      ② 只能消费一次，consumed 是终态（挡住重放）
+      ③ 命令指纹必须与审批时一致（挡住 TOCTOU）
+  → executor.run() → 一次性容器：无网络、根只读、掉全部 capability
+  → 结果写审计；审批单 → consumed
+```
+
+**★ 这条链路有两条安全规则，是全项目最重要的两句话：**
+
+```
+1. 结论没过校验，就不许据此动手。
+   —— Supervisor 只在 verdict.pass 为真时才派发处置 Agent。
+
+2. 沙箱不可用就 fail-closed，不降级。
+   —— 探测不到 Docker 时落到 mock 仿真，绝不悄悄变成无隔离执行。
+```
+
+完整的策略设计、三个坑、面试四问，见 [`sandbox-hitl.md`](sandbox-hitl.md)。
+
+---
+
 ## 第 4 章｜还没做的是什么
 
 `app/__init__.py` 里写着的目录规划，目前这些还是空的：
 
 | 目录 | 计划做什么 | 对应 JD 要求 |
 |---|---|---|
-| `app/sandbox/` | Docker 沙箱执行 + Human-in-the-Loop（Day 7） | 沙箱执行、权限控制 |
 | `app/observability/` | Langfuse 接入，全链路 Trace（Day 8） | AgentOps、可观测性 |
 | `deploy/` | docker-compose + Nginx + HTTPS（Day 10） | 部署与稳定性 |
 
@@ -556,7 +594,8 @@ Day 4 说过"模型永远不执行任何东西"；多 Agent 这里补上另一�
 |---|---|---|
 | `app/rag/` | ✅ Day 3 | RAG、向量检索、混合检索 |
 | `app/tools/` | ✅ Day 4 | 工具调用 / Function Calling |
-| `app/agents/` | ✅ Day 4 单 Agent<br>✅ Day 6 多 Agent | Agent 框架、ReAct、编排、多 Agent 协同 |
+| `app/agents/` | ✅ Day 4 单 Agent<br>✅ Day 6 多 Agent<br>✅ Day 7 处置 Agent | Agent 框架、ReAct、编排、多 Agent 协同 |
+| `app/sandbox/` | ✅ Day 7 | 沙箱执行、权限控制、人工确认（HITL） |
 | `app/mcp_server/` | ✅ Day 5 | MCP、工具生态、协议对接 |
 
 **这张表就是你的"下一步路线图"。** 面试时如果被问"这个项目还有哪些没做"，
@@ -582,6 +621,8 @@ Day 4 说过"模型永远不执行任何东西"；多 Agent 这里补上另一�
   再补一句"**拆分的门槛是有没有需要被单独评测或隔离上下文的部件**"（第 2 章的 agents 段）
 - **问"你怎么保证结论是对的"** → 讲校验 Agent：**规则先跑、模型兜底**，
   以及"让模型自检是自证清白"这个理由
+- 问"你敢让 Agent 碰生产系统吗" → 讲 sandbox + HITL：
+  **结论没过校验不许动手 / 写操作必须人批 / 沙箱不可用就 fail-closed**
 - 问"还没做什么" → 讲第 4 章那张表
 
 **一句话记住整个项目**：

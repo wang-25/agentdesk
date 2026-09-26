@@ -73,7 +73,7 @@ def brief(exc: Exception) -> str:
 # 第一层：运行环境
 # ============================================================
 def check_env():
-    print("\n[1/6] 运行环境　—— Python 与依赖包")
+    print("\n[1/7] 运行环境　—— Python 与依赖包")
 
     v = sys.version_info
     record("环境", f"Python {v.major}.{v.minor}.{v.micro}",
@@ -81,7 +81,7 @@ def check_env():
 
     # 逐个 import，缺哪个补哪个，而不是笼统说"依赖有问题"
     packages = ["httpx", "dotenv", "fastapi", "pydantic", "numpy", "jieba",
-                "uvicorn", "langgraph"]
+                "uvicorn", "langgraph", "mcp"]
     missing = []
     for name in packages:
         try:
@@ -112,7 +112,7 @@ def check_env():
 # 第二层：模型连通
 # ============================================================
 def check_model():
-    print("\n[2/6] 模型连通　—— 真实发一次请求")
+    print("\n[2/7] 模型连通　—— 真实发一次请求")
 
     try:
         from app.llm import chat
@@ -141,7 +141,7 @@ def check_model():
 # 第三层：检索与问答（RAG）
 # ============================================================
 def check_rag():
-    print("\n[3/6] 检索与问答　—— RAG 全链路")
+    print("\n[3/7] 检索与问答　—— RAG 全链路")
 
     try:
         from app.rag.pipeline import load_store, answer
@@ -189,7 +189,7 @@ def check_rag():
 # 第四层：Agent（工具 + 编排）
 # ============================================================
 def check_agent(full: bool = False):
-    print("\n[4/6] Agent 层　—— 工具注册表与编排引擎")
+    print("\n[4/7] Agent 层　—— 工具注册表与编排引擎")
 
     # ---- 工具注册表 ----
     try:
@@ -258,8 +258,8 @@ def check_agent(full: bool = False):
 
     try:
         from app.agents.specialists import DIAGNOSE_TOOLS, diagnose
-        record("编排", "4 个专业 Agent 可导入", True,
-               f"工具执行 Agent 的受限工具集：{len(DIAGNOSE_TOOLS)} 个（不含 search_knowledge）")
+        record("编排", "5 个专业 Agent 可导入", True,
+               f"工具执行 Agent 的受限工具集：{len(DIAGNOSE_TOOLS)} 个（不含 search_knowledge / run_command）")
     except Exception as e:
         record("编排", "专业 Agent 导入", False, brief(e))
 
@@ -339,10 +339,99 @@ def check_agent(full: bool = False):
 
 
 # ============================================================
-# 第五层：MCP Server（把工具暴露成标准协议）
+# 第五层：沙箱与人工确认（离线，不花钱，不需要服务在跑）
+# ============================================================
+def check_sandbox(full: bool = False):
+    print("\n[5/7] 沙箱与人工确认　—— 准入策略 + 审批状态机")
+
+    import tempfile
+
+    from app.sandbox import executor, policy
+    from app.sandbox import approvals as ap
+
+    # ---- 1. 后端与 fail-closed ----
+    info = executor.describe()
+    note = {"mock": "未装 Docker，仿真执行；装了 Docker 设 "
+                    "SANDBOX_BACKEND=docker 即真隔离",
+            "docker": f"真隔离，镜像 {info.get('image')}",
+            "subprocess": "⚠️ 无隔离，直接在目标主机执行"}.get(
+        info["backend"], "")
+    record("沙箱", f"执行后端 {info['backend']}", True, note)
+    if info.get("fail_closed") is True:
+        record("沙箱", "fail-closed（不可用即拒绝，不降级）", True,
+               "这是安全设计里最容易搞反的一点")
+
+    # ---- 2. 规则表自检：每条 example 必须命中自己 ----
+    #     ★ 这一条是 Day 7 踩出来的真实教训的固化：
+    #       第一版 12 条规则里有 5 条（systemctl / docker 的）因为
+    #       子命令约定不一致，**从来没生效过**，而且不报错。
+    bad = 0
+    for r in policy.catalog():
+        d = policy.decide(r["example"])
+        want = "needs_approval" if r["requires_approval"] else "allow"
+        if d.decision != want:
+            bad += 1
+    record("沙箱", f"白名单 {len(policy.catalog())} 条规则自检", bad == 0,
+           "全部命中自己的示例" if bad == 0 else f"{bad} 条失效")
+
+    # ---- 3. 攻击面必须全拒 ----
+    attacks = ["rm -rf /", "truncate -s 0 /etc/passwd",
+               "df -h; rm -rf /", "bash -c id",
+               "tail -n 5 ../../etc/passwd", "cat /etc/shadow",
+               "du -sh /root", "lsof -i", "systemctl disable firewalld"]
+    leaked = [a for a in attacks if policy.decide(a).decision != "deny"]
+    record("沙箱", f"攻击面 {len(attacks)} 条全拒", not leaked,
+           "全部拒绝" if not leaked else f"漏了：{leaked}")
+
+    # ---- 4. mock 后端能返回可信数据 ----
+    d = policy.decide("du -h -d1 /var/log")
+    r = executor.run(d)
+    record("沙箱", "mock 执行 du 返回真实数字",
+           r.ok and "nginx" in r.stdout, r.stdout.strip()[:40])
+
+    # ---- 5. 审批状态机（临时 store，不污染 logs/approvals.jsonl）----
+    st = ap.ApprovalStore(path=Path(tempfile.mkdtemp()) / "approvals.jsonl")
+
+    rec = st.create(command="truncate -s 0 /var/log/nginx/error.log",
+                    fingerprint="fp1", rule="truncate", risk="reversible",
+                    isolation="container", reason="测试")
+    aid = rec["id"]
+
+    # 批准必须填审批人
+    ok_noby = False
+    try:
+        st.approve(aid, by="   ")
+    except ap.ApprovalError:
+        ok_noby = True
+    record("审批", "批准必须填审批人", ok_noby, "缺 by 被拒")
+
+    # 批准 → 消费 → 重放
+    st.approve(aid, by="test")
+    st.consume(aid, expected_fingerprint="fp1")
+    ok_replay = False
+    try:
+        st.consume(aid, expected_fingerprint="fp1")
+    except ap.ApprovalError:
+        ok_replay = True
+    record("审批", "已消费不可重放", ok_replay, "第二次 consume 被拒")
+
+    # 指纹不匹配（TOCTOU 防护）
+    rec2 = st.create(command="x", fingerprint="fpA", rule="t", risk="r",
+                     isolation="c", reason="t")
+    st.approve(rec2["id"], by="t")
+    ok_fp = False
+    try:
+        st.consume(rec2["id"], expected_fingerprint="fpB")
+    except ap.ApprovalError:
+        ok_fp = True
+    record("审批", "指纹不符拒绝执行", ok_fp, "TOCTOU 防护生效")
+
+
+# ============================================================
+# 第六层：MCP Server（把工具暴露成标准协议）
 # ============================================================
 def check_mcp(full: bool = False):
-    print("\n[5/6] MCP Server　—— 工具的标准协议出口")
+    print("\n[6/7] MCP Server　—— 工具的标准协议出口")
 
     # ---- 1. 服务端能导入、工具注册正确 ----
     try:
@@ -388,7 +477,7 @@ def check_mcp(full: bool = False):
 # 第六层：HTTP 服务（需要服务已在运行）
 # ============================================================
 def check_http(full: bool = False):
-    print("\n[6/6] HTTP 服务　—— 13 个接口")
+    print("\n[7/7] HTTP 服务　—— 13 个接口")
 
     import httpx
 
@@ -562,7 +651,7 @@ def summarize():
     print("  自检汇总")
     print("=" * 62)
 
-    layers = ["环境", "模型", "检索", "问答", "工具", "编排", "校验", "MCP", "服务", "接口"]
+    layers = ["环境", "模型", "检索", "问答", "工具", "编排", "校验", "沙箱", "审批", "MCP", "服务", "接口"]
     for layer in layers:
         rows = [r for r in results if r[0] == layer]
         if not rows:
@@ -589,7 +678,7 @@ def summarize():
         print("  ✅ 已检查的项目全部通过。")
         print(f"  ⏭  有 {len(skipped)} 项被跳过（服务没在跑 / 未加 --full），可复跑。")
     else:
-        print("  ✅ 全部通过。六层技术栈都在工作。")
+        print("  ✅ 全部通过。七层技术栈都在工作。")
     print("=" * 62)
     return 1 if failed else 0
 
@@ -613,6 +702,7 @@ def main():
              lambda: check_model(),
              lambda: check_rag(),
              lambda: check_agent(args.full),
+             lambda: check_sandbox(args.full),
              lambda: check_mcp(args.full),
              lambda: check_http(args.full)]
     for step in steps:

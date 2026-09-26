@@ -89,9 +89,14 @@ INTENT_SYSTEM = """你是一个运维请求的意图分类器。你的唯一任�
 
 字段定义：
 
-- task_type：请求的类型，四选一
+- task_type：请求的类型，五选一
     diagnose  用户报告了一个**具体的异常现象**，需要查明原因
               （例：网站报 502、容器一直重启、机器很卡）
+    remediate 用户**明确要求执行一个处置动作**（不只是想知道原因）
+              （例：帮我把日志清了、重启一下 nginx、把磁盘腾出空间）
+              ★ remediate 和 diagnose 的区别：diagnose 是"帮我看看为什么"，
+                remediate 是"帮我处理掉"。**用户要动手，才算 remediate。**
+                只是"建议怎么处理"仍然是 diagnose。
     query     用户只是想知道**某个状态**，没有报告异常
               （例：db-01 现在负载多少、磁盘还剩多少）
     explain   用户在问**原理或做法**，不需要真实数据
@@ -118,6 +123,15 @@ INTENT_SYSTEM = """你是一个运维请求的意图分类器。你的唯一任�
 只输出 JSON 对象，不要任何解释文字。"""
 
 
+# task_type 的合法取值。**定义一次，两处引用。**
+#
+# 原来是字面量写了两遍（校验一处、归一化一处）。加 remediate 的时候，
+# 只改一处就会变成：校验通过 → 归一化时被判回 "other" → 静默走错分支。
+# 这正是 _clamp_intent 自己的注释里警告的那类 bug —— 只不过这次的坑
+# 在"同一个列表写了两遍"。**重复定义是这类 bug 的固定来源。**
+_TASK_TYPES = ("diagnose", "remediate", "query", "explain", "other")
+
+
 def _clamp_intent(data: dict) -> tuple:
     """校验并归一化意图标签。返回 (cleaned, problems)。
 
@@ -133,8 +147,9 @@ def _clamp_intent(data: dict) -> tuple:
     problems = []
 
     task_type = data.get("task_type")
-    if task_type not in ("diagnose", "query", "explain", "other"):
-        problems.append(f"task_type 取值不合法：{task_type!r}")
+    if task_type not in _TASK_TYPES:
+        problems.append(f"task_type 取值不合法：{task_type!r}，"
+                        f"只允许 {list(_TASK_TYPES)}")
 
     hosts = data.get("hosts")
     if not isinstance(hosts, list):
@@ -157,8 +172,7 @@ def _clamp_intent(data: dict) -> tuple:
         symptoms = []
 
     cleaned = {
-        "task_type": task_type if task_type in
-        ("diagnose", "query", "explain", "other") else "other",
+        "task_type": task_type if task_type in _TASK_TYPES else "other",
         "hosts": hosts,
         "services": [str(s) for s in services],
         "symptoms": [str(s) for s in symptoms],
@@ -265,7 +279,9 @@ def retrieve_knowledge(question: str, intent: dict, top_k: int = 3) -> dict:
     # 症状和服务名都没有时，退回用原问题（总不能空着查）
     query = " ".join(keywords) if keywords else question
     # 补一个指向性词，让检索偏向"处理办法"而不是"现象描述"
-    if intent.get("task_type") in ("diagnose", "query"):
+    # remediate 也要查 —— 处置前先看有没有现成的操作手册，
+    # 这比模型自己发挥可靠得多。
+    if intent.get("task_type") in ("diagnose", "query", "remediate"):
         query = f"{query} 排查 处理".strip()
 
     try:
@@ -405,6 +421,141 @@ def diagnose(question: str, intent: dict, knowledge: dict = None,
         "stop_reason": result["stop_reason"],
         "elapsed_ms": result["elapsed_ms"],
         "mode": "inspect" if tool_names else "reason",
+    }
+
+
+# ============================================================
+# 三·五、处置 Agent —— 唯一一个有「写权限」的 Agent（Day 7）
+# ============================================================
+# ★ 为什么它必须是**独立的一个 Agent**，而不是给诊断 Agent 加个工具？
+#
+#   因为「诊断」和「处置」是两种性质完全不同的活动：
+#
+#       诊断   只读。错了的代价 = 结论不准，人一眼能看出来
+#       处置   会改系统。错了的代价 = 服务中断、数据丢失
+#
+#   把这两种权限混在一个 Agent 手里，就等于为了让它可以重启服务，
+#   顺带把"随时能重启服务"的能力给了它做诊断的每一步。
+#   **权限一旦给出去，就没有"只在这一步有效"这回事。**
+#
+#   拆开之后：
+#       诊断 Agent 的工具集 = 5 个只读工具，**它连 run_command 长什么样都不知道**
+#       处置 Agent 的工具集 = 只有 run_command，而且里面全是需要审批的写操作
+#
+#   这样即使诊断 Agent 被 Prompt 注入攻破，它也做不了任何改动 ——
+#   因为它手上根本没有那个工具。**这是结构上的隔离，不是提示词上的约定。**
+#
+#   （同一招在 Day 5 用过：MCP 的 schema 里没有某工具 = 客户端根本调不到。
+#     在 Day 6 也用过：从工具清单里删掉 search_knowledge。
+#     **能用结构约束的，就不要靠提示词请求。**）
+REMEDIATE_TOOLS = ["run_command"]
+
+REMEDIATE_SYSTEM = """你是一个运维处置执行者。你的职责是**把诊断结论落实成一个具体动作**。
+
+你只有一个工具：run_command，它只能执行白名单命令。
+
+【你必须理解的规则】
+1. 命令必须在白名单里，格式必须完全正确。不在白名单里的命令会被直接拒绝。
+2. **写操作（重启服务、清理日志）不会立刻执行** —— 它会变成一张人工审批单。
+   这是设计如此，不是你操作失败。
+3. 提交审批单之后，你的回答要**如实说明"等待人工确认"**，
+   **绝对不要**说成"已经执行完成"、"已清理"、"已重启"。
+   即使你「觉得」它一定会被批准，你也不能那么说 —— 那是事实错误。
+
+【可以做的事】
+- 清理日志：用 `truncate -s 0 <日志路径>`，**不要用 rm**
+  （rm 之后正在写日志的进程还攥着文件句柄，空间不会释放；
+   truncate 把长度截为零，句柄仍有效，空间立刻释放）
+- 重启服务：`systemctl restart <服务名>`、`docker restart <容器名>`
+- 只读核查：`df -h`、`tail -n <行数> <日志路径>`、`systemctl is-active <服务名>`
+
+【工作要求】
+1. 只做诊断结论明确要求的动作，不要顺手多做。
+2. 一次只提交一个动作，方便人逐条判断。
+3. 最终回答结构：
+   - **要做什么**：一句话
+   - **命令**：完整命令原文
+   - **为什么**：基于哪条诊断依据（带数值）
+   - **当前状态**：已提交审批 / 已执行 / 被策略拒绝，如实说
+   - **需要人工做什么**：如果提交了审批，说明批准后如何执行"""
+
+
+def remediate(question: str, intent: dict, diagnosis: dict,
+              max_steps: int = 6) -> dict:
+    """处置 Agent：跑一个只能用 run_command 的受限 ReAct 子图。
+
+    【为什么把「诊断结论」作为输入传进来，而不是让它自己重新判断】
+    因为处置动作必须**有据可依**。如果它自己去查数据、自己下结论、自己动手，
+    那"依据"和"动作"之间就没有可追溯的关系了 ——
+
+        诊断 Agent 说「磁盘 96% 满，建议清理 /var/log」
+        处置 Agent 执行「truncate -s 0 /var/log/nginx/error.log」
+
+    这两句话之间是有一条线的，审批人看到的正是这条线。
+    如果处置 Agent 自己重新判断一遍，它可能得出别的结论，
+    于是**审批人批的和实际执行的就对不上了**。
+
+    **让每一步都建立在上一部的产出之上，是可追溯性的前提。**
+    """
+    parts = [f"【用户的问题】{question}"]
+
+    if intent.get("hosts"):
+        parts.append(f"【涉及主机】{', '.join(intent['hosts'])}")
+    if intent.get("services"):
+        parts.append(f"【涉及服务】{', '.join(intent['services'])}")
+
+    parts.append("【诊断结论（你的动作必须基于这个结论）】\n"
+                 + (diagnosis.get("answer") or "（无诊断结论）")[:1500])
+
+    if diagnosis.get("tools"):
+        parts.append(f"【诊断已查过的工具】{', '.join(diagnosis['tools'])}")
+
+    result = _react_run("\n\n".join(parts), max_steps=max_steps,
+                        tool_names=REMEDIATE_TOOLS,
+                        system_prompt=REMEDIATE_SYSTEM)
+
+    # ★ 从工具调用记录里把「审批单」和「执行的命令」抽出来。
+    #   这些不是我另外维护的状态，而是**从真实发生过的调用里读出来的** ——
+    #   如果 Agent 声称执行了但轨迹里没有对应的工具调用，那就是在编。
+    approvals, executed, denied = [], [], []
+    for step in result["steps"]:
+        if step.get("tool") != "run_command":
+            continue
+        try:
+            payload = json.loads(step.get("observation_text") or "{}")
+        except (json.JSONDecodeError, TypeError):
+            continue
+        record = payload.get("result") or payload
+        decision = record.get("decision")
+        entry = {
+            "command": record.get("command"),
+            "purpose": record.get("purpose"),
+            "reason": record.get("reason"),
+            "isolation": record.get("isolation"),
+        }
+        if decision == "needs_approval" and record.get("approval_id"):
+            entry["approval_id"] = record["approval_id"]
+            entry["expires_at"] = record.get("expires_at")
+            approvals.append(entry)
+        elif decision == "allow" and record.get("executed"):
+            entry["output"] = (record.get("result") or {}).get("stdout", "")[:400]
+            executed.append(entry)
+        elif decision == "deny":
+            entry["error"] = record.get("error")
+            denied.append(entry)
+
+    return {
+        "answer": result["answer"],
+        "steps": result["steps"],
+        "rounds": result["rounds"],
+        "tool_calls": result["tool_calls"],
+        "tools": result["distinct_tools"],
+        "usage": result["usage"],
+        "stop_reason": result["stop_reason"],
+        "elapsed_ms": result["elapsed_ms"],
+        "approvals": approvals,     # 待人工确认的
+        "executed": executed,       # 已执行的（只读命令）
+        "denied": denied,           # 被策略拒绝的
     }
 
 
@@ -684,7 +835,8 @@ def verify(question: str, diagnosis: dict, intent: dict,
 # 五、汇总：把四个 Agent 的产出合成最终回答（Supervisor 用）
 # ============================================================
 def compose_answer(question: str, intent: dict, knowledge: dict,
-                   diagnosis: dict, verdict: dict, config: dict) -> str:
+                   diagnosis: dict, verdict: dict, config: dict,
+                   remediation: dict = None) -> str:
     """把各 Agent 的产出拼成最终回答。
 
     【为什么用模板拼，而不是再让模型"总结一下"】
@@ -726,5 +878,55 @@ def compose_answer(question: str, intent: dict, knowledge: dict,
         if not v.get("pass"):
             block.append("- **以上问题需要人工核对后再采用本结论**")
         parts.append("\n".join(block))
+
+    # ---- ★ 处置结果（Day 7）----
+    # 这一段的作用只有一个：**让"想做什么"和"已经做了什么"在回答里分得清清楚楚。**
+    #
+    # 不这么写会出什么事？—— 处置 Agent 的提示词里我写了"不要说成已执行"，
+    # 但提示词是请求。**这里用结构保证：待审批的动作永远出现在
+    # 「待人工确认」这个小标题下面，而不是混在诊断结论的正文里。**
+    # 人扫一眼就知道现在系统改了没有。
+    rem = remediation or {}
+    if rem:
+        blocks = []
+
+        if rem.get("approvals"):
+            lines = ["**待人工确认（尚未执行，需要有人批准）**"]
+            for a in rem["approvals"]:
+                lines.append(f"- `{a['command']}`")
+                lines.append(f"  - 审批单：`{a['approval_id']}`"
+                             f"（{a.get('expires_at', '')} 前有效）")
+                lines.append(f"  - 原因：{a.get('reason') or '-'}")
+                if a.get("purpose"):
+                    lines.append(f"  - 说明：{a['purpose']}")
+                lines.append(f"  - 通道：{a.get('isolation')}"
+                             f"（{'真隔离' if a.get('isolation') == 'container' else '无容器隔离'}）")
+            lines.append("")
+            lines.append("> 批准：`POST /approvals/{id}/approve`　"
+                         "执行：`POST /approvals/{id}/execute`")
+            blocks.append("\n".join(lines))
+
+        if rem.get("executed"):
+            lines = ["**已执行（只读命令）**"]
+            for e in rem["executed"]:
+                lines.append(f"- `{e['command']}`")
+                if e.get("output"):
+                    # 只取前几行，完整输出在接口响应里
+                    head = "\n".join(e["output"].splitlines()[:4])
+                    lines.append(f"  ```\n  {head}\n  ```")
+            blocks.append("\n".join(lines))
+
+        if rem.get("denied"):
+            lines = ["**被策略拒绝（未执行）**"]
+            for d in rem["denied"]:
+                lines.append(f"- `{d['command']}` —— {d.get('error') or d.get('reason')}")
+            blocks.append("\n".join(lines))
+
+        if not blocks:
+            # 处置 Agent 跑过但什么都没提 —— 这也是信息，要说出来。
+            # "没提议处置"和"没跑处置"是两件事，人需要能区分。
+            blocks.append(f"**处置**：未提出任何动作\n\n{rem.get('answer', '')[:300]}")
+
+        parts.append("\n\n".join(blocks))
 
     return "\n\n".join(parts)

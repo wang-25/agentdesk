@@ -92,6 +92,25 @@ READ_ONLY = ToolAnnotations(
     open_world_hint=True,
 )
 
+# ★ run_command 不是只读的 —— 它能执行写操作（重启服务、清理日志）。
+#   所以它的 annotation 必须如实标成"可能造成变更"。
+#
+#   这里有个之前没遇到的判断：run_command 既能跑只读命令，也能提交写操作，
+#   那 annotation 怎么标？
+#
+#   答案是**按最坏情况标**。annotations 是给客户端做安全决策用的 ——
+#   客户端靠它决定"要不要弹确认框"。如果你按"典型情况"标成只读，
+#   那它真正跑写操作时，客户端不会给用户任何提示。
+#
+#   （这跟 tools/ops.py 里 run_command 标 risk="high" 是同一个原则：
+#     **风险要按最坏情况标，不能按典型情况标。**）
+MUTATING = ToolAnnotations(
+    read_only_hint=False,
+    destructive_hint=True,
+    idempotent_hint=False,     # 重启服务、清日志都不是幂等的
+    open_world_hint=True,
+)
+
 # 工具清单与审计日志两个资源的地址。用 URI 形式是 MCP 的约定。
 CATALOG_URI = "agentdesk://tools/catalog"
 AUDIT_URI = "agentdesk://audit/recent"
@@ -105,8 +124,11 @@ server = MCPServer(
     title="AgentDesk 运维工具",
     version="0.1.0",
     instructions=(
-        "提供 Linux 主机与容器的只读诊断工具。"
-        "所有工具都不会修改系统状态 —— 可以放心调用。"
+        "提供 Linux 主机与容器的运维工具。"
+        "前 6 个（check_disk / check_load / check_service / list_containers / "
+        "tail_log / search_knowledge）都是只读诊断，不会修改系统状态。"
+        "run_command 是唯一能执行写操作的工具：它只接受白名单命令，"
+        "写操作（重启服务、清理日志）会提交人工审批，批准后才执行。"
         "典型用法：先用 check_disk / check_load / list_containers 看整体，"
         "再用 tail_log 定位具体原因，需要经验时用 search_knowledge 查知识库。"
         "已知主机：web-01（Web）、db-01（数据库）、cache-01（缓存）。"
@@ -216,6 +238,29 @@ def search_knowledge(
     top_k: Annotated[int, Field(description="返回条数，默认 3")] = 3,
 ) -> dict:
     return _call("search_knowledge", query=query, top_k=top_k)
+
+
+# ★ run_command：唯一一个非只读工具，标注 MUTATING。
+#
+#   它走的是「沙箱准入 + 人工审批」那条路：
+#       - 只读命令 → 直接执行（当前 mock 后端仿真）
+#       - 写操作   → 生成审批单，**返回审批单 ID 而不是执行结果**，
+#                     人批准后才真正执行
+#
+#   所以即使客户端（Cursor 等）调它，也**不可能**越过审批直接改系统 ——
+#   那道门在 tools/ops.py 的 run_command 里，不在协议层。
+@server.tool(name="run_command", title="在沙箱里执行白名单命令",
+             annotations=MUTATING,
+             description=TOOLS["run_command"]["desc"])
+def run_command(
+    command: Annotated[str, Field(
+        description="要执行的命令，必须是白名单里的形式，如 "
+                    "`truncate -s 0 /var/log/nginx/error.log`。"
+                    "写操作会提交人工审批，返回审批单 ID 而不是执行结果")],
+    purpose: Annotated[str, Field(
+        description="为什么要执行（一句话，会展示给审批人看）")] = "",
+) -> dict:
+    return _call("run_command", command=command, purpose=purpose)
 
 
 # ============================================================

@@ -74,7 +74,7 @@ AgentDesk 想做到的是：输入「nginx 报 502 了，帮我看下」，由 A
 
 ## 技术栈
 
-**现在实际在用的（Day 0-5）** —— 直接依赖 9 个：
+**现在实际在用的（Day 0-7）** —— 直接依赖 9 个：
 
 | 层 | 选型 | 为什么选它 |
 |---|---|---|
@@ -85,15 +85,15 @@ AgentDesk 想做到的是：输入「nginx 报 502 了，帮我看下」，由 A
 | 检索 | numpy 内存索引 + BM25(jieba) + RRF 融合 | 50 块规模用不上向量库，一次矩阵乘法几毫秒 |
 | 向量化 | 可插拔：百炼 `text-embedding-v3` / local 兜底 | 没有额外 Key 也能跑通链路自测 |
 | Agent 编排 | LangGraph 1.2 | 状态图 + 检查点 + 可视化（与手写版并存对比） |
-| 工具协议 | MCP SDK 2.2 | 6 个工具暴露给任何 MCP 客户端（Cursor / Claude Desktop） |
+| 工具协议 | MCP SDK 2.2 | 7 个工具暴露给任何 MCP 客户端（Cursor / Claude Desktop） |
+| 沙箱执行 | Docker 一次性容器 + 命令白名单 | 写操作隔离执行（无 Docker 时 fail-closed 仿真，不降级） |
+| 人工确认 | 审批单（HITL）+ 指纹绑定 | 写操作必须人批准，防重放、防 TOCTOU |
 | 配置 | python-dotenv | 密钥不落代码、不进仓库 |
 
-**规划中的（Day 6 起）**：
+**规划中的（Day 8 起）**：
 
 | 层 | 选型 |
 |---|---|
-| 多 Agent | LangGraph Supervisor + 4 个专业 Agent |
-| 安全 | Docker 沙箱执行 + Human-in-the-Loop |
 | 可观测 | 自托管 Langfuse + Prometheus / Grafana |
 | 评测 | Ragas + LLM-as-Judge（自写召回率评测已有） |
 | 部署 | Docker Compose + Nginx + HTTPS（阿里云 ECS） |
@@ -143,7 +143,7 @@ python -m venv .venv
 .venv\Scripts\python.exe scripts\smoke_test.py
 ```
 
-一条命令跑完六层：**运行环境 → 模型连通 → 检索与问答 → Agent → MCP Server → HTTP 接口**，
+一条命令跑完七层：**运行环境 → 模型连通 → 检索与问答 → Agent → 沙箱/审批 → MCP → HTTP 接口**，
 最后给出 ✅/❌ 汇总表。服务没启动时最后一层自动跳过（退出码仍为 0）。
 加 `--full` 会额外跑一次真实 Agent 调用和 MCP 协议层自检。
 
@@ -384,7 +384,7 @@ curl -sN -X POST http://127.0.0.1:8000/chat/stream -H "Content-Type: application
 - [x] **Day 4** 工具层（6 个运维工具）+ 手写 ReAct + LangGraph 双版本 + 对比评测
 - [x] **Day 5** MCP Server：6 个工具暴露成标准协议（含 schema 漂移校验 + 协议层自检）
 - [x] **Day 6** Supervisor + 4 个专业 Agent（意图路由/知识检索/工具执行/结果校验）+ 意图路由准确率评测
-- [ ] **Day 7** Docker 沙箱执行 + Human-in-the-Loop
+- [x] **Day 7** Docker 沙箱执行 + Human-in-the-Loop（命令白名单 + 一次性容器 + 审批单 + 指纹防重放）
 - [ ] **Day 8** 自托管 Langfuse + 全链路 Trace
 - [ ] **Day 9** 40 条评测集 + 评测报告
 - [ ] **Day 10** 部署到公网（Docker Compose + Nginx + HTTPS）
@@ -404,13 +404,17 @@ agentdesk/
 │   │   ├── common.py    两个引擎共用的 Prompt、消息处理、工具执行
 │   │   ├── react.py     手写 ReAct 循环（零依赖，原理在这里）
 │   │   ├── graph.py     LangGraph 状态图版本
-│   │   ├── specialists.py  4 个专业 Agent（含校验 Agent 的规则库）
+│   │   ├── specialists.py  5 个专业 Agent（含校验 Agent 规则库 + 处置 Agent）
 │   │   ├── supervisor.py   Supervisor 多 Agent 编排
 │   │   └── compare.py   两个引擎的对比评测
 │   ├── tools/           工具层（Agent 的「手」）
-│   │   └── ops.py       6 个运维工具 + 参数白名单 + 风险分级 + 双后端
+│   │   └── ops.py       7 个运维工具（含 run_command）+ 参数白名单 + 风险分级
+│   ├── sandbox/         沙箱执行 + 人工确认（Day 7）
+│   │   ├── policy.py    命令白名单 + 参数级校验 + 三维决策
+│   │   ├── executor.py  容器 / 主机 / 仿真三通道，fail-closed
+│   │   └── approvals.py 审批单：指纹绑定 + 单次消费 + 追加日志
 │   ├── mcp_server/      MCP 出口（同一批工具的第二个调用方）
-│   │   └── server.py    6 tools + 2 resources + schema 一致性校验
+│   │   └── server.py    7 tools + 2 resources + schema 一致性校验
 │   └── rag/
 │       ├── loader.py    文档加载与语义段落切分
 │       ├── embedder.py  可插拔向量后端（dashscope / local 兜底）
@@ -425,6 +429,7 @@ agentdesk/
 │   ├── react-langgraph.md    ReAct 原理 + 两个实现的对比与取舍
 │   ├── mcp-server.md         MCP 原理 + 四个真实坑 + 怎么配客户端
 │   ├── multi-agent.md        多 Agent 拆分理由 + 校验 Agent 设计 + 五个坑
+│   ├── sandbox-hitl.md       沙箱 + 人工确认：三层职责、五个坑、面试四问
 │   ├── python-reference.md   Python 速查手册（含笔试四件套 + 报错速查表）
 │   └── knowledge-points.md   知识点清单（面试复习用）
 ├── eval/
@@ -433,7 +438,7 @@ agentdesk/
 ├── practice/
 │   └── day1/            Day 1 的 5 个练习 + 公共封装
 ├── scripts/
-│   ├── smoke_test.py    六层自检：环境 → 模型 → 检索 → Agent → MCP → 13 个接口
+│   ├── smoke_test.py    七层自检：环境 → 模型 → 检索 → Agent → 沙箱/审批 → MCP → 13 个接口
 │   ├── mcp_check.py     MCP 协议层自检（官方客户端连自己，9 项）
 │   └── eval_specialists.py  意图路由 Agent 逐字段准确率评测
 ├── check_env.py        Day 0 验收脚本
@@ -443,6 +448,5 @@ agentdesk/
 └── .gitignore
 ```
 
-> 后续补充 `app/agents/`、`app/tools/`、`app/mcp_server/`、`app/rag/`、
-> `app/sandbox/`、`app/observability/`，以及 `eval/` 与 `deploy/`。
+> 后续补充 `app/observability/`、`deploy/`（Day 8-10）。
 

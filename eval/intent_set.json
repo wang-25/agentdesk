@@ -278,6 +278,36 @@
           "other"
         ]
       }
+    },
+    {
+      "id": "i21",
+      "difficulty": "basic",
+      "question": "web-01 上 nginx 的日志把磁盘写满了，帮我把旧日志清理掉",
+      "expect": {
+        "task_type": "remediate",
+        "hosts": [
+          "web-01"
+        ],
+        "services": [
+          "nginx"
+        ],
+        "needs_live_data": true,
+        "needs_knowledge": true
+      },
+      "note": "★ remediate：用户明确要求动手（清理），不是只问原因。"
+    },
+    {
+      "id": "i22",
+      "difficulty": "edge",
+      "question": "磁盘满了，帮我看看是不是日志的问题（先别动）",
+      "expect": {
+        "task_type": "diagnose",
+        "hosts": [],
+        "services": [],
+        "needs_live_data": true,
+        "needs_knowledge": true
+      },
+      "note": "★ 反面：虽然提到清理方向，但用户说「先别动」—— 是 diagnose 不是 remediate。这一条是考验模型区分「建议怎么做」和「要求动手」。"
     }
   ],
   "_accept_field": "部分用例的某些字段有多种合理答案，写在 accept 里而不是硬标一个 —— 评测集要区分「唯一正确答案」和「多种合理答案」，否则指标会失真。"
