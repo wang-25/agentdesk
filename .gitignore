@@ -47,3 +47,6 @@ _q.json
 
 # 接口测试用的临时 payload
 _*.json
+
+# Langfuse 自托管的本地密钥
+deploy/langfuse.env

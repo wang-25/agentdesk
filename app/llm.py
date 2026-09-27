@@ -131,27 +131,37 @@ def chat(messages, temperature=0.7, timeout=60) -> str:
     """
     _, cfg, api_key = _pick()
 
-    try:
-        resp = httpx.post(
-            cfg["url"],
-            headers=_headers(api_key),
-            json={"model": cfg["model"], "messages": messages,
-                  "temperature": temperature},
-            timeout=timeout,
-        )
-    except httpx.ConnectError as e:
-        # 把底层网络异常翻译成我们自己的异常类型。
-        # 为什么要翻译？因为上层不应该需要知道 httpx 的存在 ——
-        # 万一哪天换成别的 HTTP 库，上层代码不用改。
-        raise ModelError(f"连不上模型服务：{e}") from e
-    except httpx.TimeoutException as e:
-        raise ModelError(f"请求超时（{timeout}s）") from e
+    # ★ 观测从这里开始（Day 8）。span 挂在统一入口 = 所有调用方自动被记录，
+    #   而不是每个业务函数自己记 —— 和"统一入口"是同一个原则。
+    #   没有活跃 trace 时 span 内部静默跳过（见 tracer.py 的 _NullSpan）。
+    from app.observability import tracer
+    with tracer.span(tracer.TYPE_LLM, name="chat",
+                     model=cfg["model"], temperature=temperature) as sp:
+        try:
+            resp = httpx.post(
+                cfg["url"],
+                headers=_headers(api_key),
+                json={"model": cfg["model"], "messages": messages,
+                      "temperature": temperature},
+                timeout=timeout,
+            )
+        except httpx.ConnectError as e:
+            # 把底层网络异常翻译成我们自己的异常类型。
+            # 为什么要翻译？因为上层不应该需要知道 httpx 的存在 ——
+            # 万一哪天换成别的 HTTP 库，上层代码不用改。
+            sp.set_error(e)
+            raise ModelError(f"连不上模型服务：{e}") from e
+        except httpx.TimeoutException as e:
+            sp.set_error("timeout")
+            raise ModelError(f"请求超时（{timeout}s）") from e
 
-    if resp.status_code != 200:
-        raise ModelError(f"请求失败 HTTP {resp.status_code}: {resp.text[:300]}")
+        if resp.status_code != 200:
+            sp.set_error(f"HTTP {resp.status_code}")
+            raise ModelError(f"请求失败 HTTP {resp.status_code}: {resp.text[:300]}")
 
-    data = resp.json()
-    return data["choices"][0]["message"]["content"]
+        data = resp.json()
+        sp.set_usage(data.get("usage") or {})
+        return data["choices"][0]["message"]["content"]
 
 
 # ============================================================
@@ -192,25 +202,39 @@ def chat_step(messages, tools=None, temperature=0, timeout=90) -> dict:
         # 评测时经常用 required 来测"它到底会不会选工具"。
         payload["tool_choice"] = "auto"
 
-    try:
-        resp = httpx.post(cfg["url"], headers=_headers(api_key), json=payload,
-                          timeout=timeout)
-    except httpx.ConnectError as e:
-        raise ModelError(f"连不上模型服务：{e}") from e
-    except httpx.TimeoutException as e:
-        raise ModelError(f"请求超时（{timeout}s）") from e
+    # ★ 观测（Day 8）：Agent 循环里**每一次**模型调用都是一个 span。
+    #   没有活跃 trace 时静默跳过。
+    from app.observability import tracer
+    with tracer.span(tracer.TYPE_LLM, name="chat_step",
+                     model=cfg["model"],
+                     tools_count=len(tools or []),
+                     messages_count=len(messages)) as sp:
+        try:
+            resp = httpx.post(cfg["url"], headers=_headers(api_key), json=payload,
+                              timeout=timeout)
+        except httpx.ConnectError as e:
+            sp.set_error(e)
+            raise ModelError(f"连不上模型服务：{e}") from e
+        except httpx.TimeoutException as e:
+            sp.set_error("timeout")
+            raise ModelError(f"请求超时（{timeout}s）") from e
 
-    if resp.status_code != 200:
-        raise ModelError(f"请求失败 HTTP {resp.status_code}: {resp.text[:300]}")
+        if resp.status_code != 200:
+            sp.set_error(f"HTTP {resp.status_code}")
+            raise ModelError(f"请求失败 HTTP {resp.status_code}: {resp.text[:300]}")
 
-    data = resp.json()
-    choice = data["choices"][0]
-    return {
-        "message": choice["message"],
-        "finish_reason": choice.get("finish_reason"),
-        "usage": data.get("usage") or {},
-        "model": data.get("model") or cfg["model"],
-    }
+        data = resp.json()
+        choice = data["choices"][0]
+        out = {
+            "message": choice["message"],
+            "finish_reason": choice.get("finish_reason"),
+            "usage": data.get("usage") or {},
+            "model": data.get("model") or cfg["model"],
+        }
+        sp.set_usage(out["usage"])
+        # 这个分支有没有产生工具调用，是 Agent 行为分析最有用的一个维度
+        sp.set("made_tool_calls", bool(choice["message"].get("tool_calls")))
+        return out
 
 
 # ============================================================

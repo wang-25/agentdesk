@@ -43,6 +43,7 @@ ReAct = Reasoning + Acting。名字听着玄，实现起来就是一个 while �
 
 import time
 
+from app.observability import tracer
 from app.agents.common import (
     DEFAULT_MAX_STEPS,
     SYSTEM_PROMPT,
@@ -56,6 +57,7 @@ from app.agents.common import (
 from app.llm import ModelError, chat_step
 
 
+@tracer.traced("handwritten")          # ★ Day 8：一次运行 = 一个 trace
 def run(question: str, max_steps: int = DEFAULT_MAX_STEPS,
         verbose: bool = False) -> dict:
     """跑一次完整的 ReAct 循环。

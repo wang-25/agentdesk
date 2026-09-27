@@ -42,6 +42,11 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from app.llm import PROJECT_ROOT, ModelError
+from app.observability import costs as obs_costs
+from app.observability import langfuse_export, tracer as obs
+
+# 配了 LANGFUSE_* 环境变量才生效；没配就是本地记录模式，功能不受影响
+langfuse_export.install()
 from app.llm import chat as llm_chat
 from app.llm import chat_json, chat_stream_async
 
@@ -314,16 +319,20 @@ def read_audit(limit: int = Query(20, ge=1, le=200, description="返回最近多
 @app.post("/chat", response_model=ChatResponse)
 async def chat_endpoint(req: ChatRequest):
     """一次性返回完整回答。实现最简单，但用户要等。"""
-    try:
-        answer = llm_chat([
-            {"role": "system", "content": "你是一个简洁的运维助手，回答不超过 100 字。"},
-            {"role": "user", "content": req.question},
-        ])
-    except ModelError as e:
-        # 模型层出问题 → 502 Bad Gateway（上游服务故障）
-        # 用户参数不对 → 422（FastAPI 自动处理）
-        # 调用方看状态码就知道该找谁。
-        raise HTTPException(status_code=502, detail=str(e))
+    # ★ Day 8：一次 HTTP 请求 = 一个 trace。
+    #   /chat 也会被记录 —— 因为"成本看板"需要覆盖所有调用方，
+    #   只看 Agent 的成本会低估真实开销。
+    with obs.trace("chat", question=req.question):
+        try:
+            answer = llm_chat([
+                {"role": "system", "content": "你是一个简洁的运维助手，回答不超过 100 字。"},
+                {"role": "user", "content": req.question},
+            ])
+        except ModelError as e:
+            # 模型层出问题 → 502 Bad Gateway（上游服务故障）
+            # 用户参数不对 → 422（FastAPI 自动处理）
+            # 调用方看状态码就知道该找谁。
+            raise HTTPException(status_code=502, detail=str(e))
 
     return ChatResponse(answer=answer)
 
@@ -405,6 +414,8 @@ def parse_endpoint(req: ChatRequest):
 # ============================================================
 @app.post("/webhook/alert")
 def webhook_alert(payload: dict):
+    # ★ Day 8：无人值守链路也必须有 trace —— 这恰恰是"凌晨三点谁在干活"
+    #   唯一的答案来源。里面每个 Agent 节点的 span 由 supervisor 自动挂。
     """接收告警系统推送的事件，自动完成判断并给出处置方案。
 
     【这个接口存在的意义】
@@ -952,3 +963,68 @@ def execute_approval(approval_id: str, req: ApprovalAction):
         "exit_code": result.exit_code, "elapsed_ms": result.elapsed_ms,
     })
     return {"approval": st.get(approval_id), "result": payload}
+
+
+# ============================================================
+# 十三、可观测查询接口（Day 8）
+# ============================================================
+# 这三个接口回答运维/面试中最值钱的三类问题：
+#     GET /traces           "刚才那次运行到底发生了什么？"（逐步轨迹）
+#     GET /traces/{id}      "这一步为什么慢/为什么错？"（单次详情）
+#     GET /metrics/summary  "钱花在哪了？哪一步最慢？"（聚合看板）
+#
+# ★ 它们读的是本地 logs/traces.jsonl —— 不依赖任何外部服务。
+#   配了 Langfuse 只是"多了一个可视化的面板"，不是"唯一的数据源"。
+class _NoBody(BaseModel):
+    pass
+
+
+@app.get("/traces")
+def list_traces(limit: int = Query(20, ge=1, le=100)):
+    """最近的 trace 列表（不含 span 明细）。"""
+    items = obs.recent_traces(limit=limit)
+    # 列表视图不带 spans —— 一条 trace 几十个 span，列表页会被撑爆
+    for it in items:
+        it.pop("spans", None)
+    return {
+        "count": len(items),
+        "langfuse": langfuse_export.describe(),
+        "export_failures": obs.export_failures(),
+        "items": items,
+    }
+
+
+@app.get("/traces/{trace_id}")
+def get_trace(trace_id: str):
+    """单条 trace 的完整详情（含全部 span）。
+
+    排障时的用法：/traces 看到某次运行慢 → 拿 trace_id 来这里 →
+    按 elapsed_ms 排序找最慢的 span → 它就是瓶颈。
+    """
+    detail = obs.trace_detail(trace_id)
+    if not detail:
+        raise HTTPException(status_code=404, detail=f"没有这条 trace：{trace_id}")
+    return detail
+
+
+@app.get("/metrics/summary")
+def metrics_summary(limit: int = Query(50, ge=1, le=500,
+                                       description="聚合最近多少次 trace")):
+    """成本与性能的聚合看板。
+
+    ★ 这个接口是「用数据驱动优化」的落点。它至少能回答：
+      - 平均一次运行花多少钱、多少 token
+      - 成本按 Agent（intent/knowledge/diagnose/verify/remediate）怎么分布
+      - 成本按工具（check_disk / run_command…）怎么分布
+      - P95 延迟在哪、错误率多少
+      - DeepSeek 缓存命中率（命中率低 = system prompt 每次都在变，白花钱）
+    """
+    traces = obs.recent_traces(limit=limit)
+    report = obs_costs.aggregate(traces)
+    report["langfuse"] = langfuse_export.describe()
+    report["export_failures"] = obs.export_failures()
+    report["store"] = {
+        "path": str(obs.TRACE_PATH.relative_to(PROJECT_ROOT)),
+        "exists": obs.TRACE_PATH.exists(),
+    }
+    return report

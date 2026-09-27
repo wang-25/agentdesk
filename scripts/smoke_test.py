@@ -73,7 +73,7 @@ def brief(exc: Exception) -> str:
 # 第一层：运行环境
 # ============================================================
 def check_env():
-    print("\n[1/7] 运行环境　—— Python 与依赖包")
+    print("\n[1/8] 运行环境　—— Python 与依赖包")
 
     v = sys.version_info
     record("环境", f"Python {v.major}.{v.minor}.{v.micro}",
@@ -112,7 +112,7 @@ def check_env():
 # 第二层：模型连通
 # ============================================================
 def check_model():
-    print("\n[2/7] 模型连通　—— 真实发一次请求")
+    print("\n[2/8] 模型连通　—— 真实发一次请求")
 
     try:
         from app.llm import chat
@@ -141,7 +141,7 @@ def check_model():
 # 第三层：检索与问答（RAG）
 # ============================================================
 def check_rag():
-    print("\n[3/7] 检索与问答　—— RAG 全链路")
+    print("\n[3/8] 检索与问答　—— RAG 全链路")
 
     try:
         from app.rag.pipeline import load_store, answer
@@ -189,7 +189,7 @@ def check_rag():
 # 第四层：Agent（工具 + 编排）
 # ============================================================
 def check_agent(full: bool = False):
-    print("\n[4/7] Agent 层　—— 工具注册表与编排引擎")
+    print("\n[4/8] Agent 层　—— 工具注册表与编排引擎")
 
     # ---- 工具注册表 ----
     try:
@@ -342,7 +342,7 @@ def check_agent(full: bool = False):
 # 第五层：沙箱与人工确认（离线，不花钱，不需要服务在跑）
 # ============================================================
 def check_sandbox(full: bool = False):
-    print("\n[5/7] 沙箱与人工确认　—— 准入策略 + 审批状态机")
+    print("\n[5/8] 沙箱与人工确认　—— 准入策略 + 审批状态机")
 
     import tempfile
 
@@ -383,11 +383,23 @@ def check_sandbox(full: bool = False):
     record("沙箱", f"攻击面 {len(attacks)} 条全拒", not leaked,
            "全部拒绝" if not leaked else f"漏了：{leaked}")
 
-    # ---- 4. mock 后端能返回可信数据 ----
+    # ---- 4. 执行器真的在干活（后端感知的断言）----
+    #   ★ 这条断言吃过一次亏：第一版写死了"mock 后端必须返回仿真数据"。
+    #     用户装上 Docker 后 auto 切到真执行，du 走主机通道在 Windows 上
+    #     找不到 /var/log，断言就错了 —— **断言不该绑定后端实现细节。**
+    #     改成：无论哪个后端，执行器都要给出"确定性的结果"（成功或明确的失败），
+    #     并如实暴露 isolated 标记。
     d = policy.decide("du -h -d1 /var/log")
     r = executor.run(d)
-    record("沙箱", "mock 执行 du 返回真实数字",
-           r.ok and "nginx" in r.stdout, r.stdout.strip()[:40])
+    info = executor.describe()
+    if info["backend"] == "mock":
+        record("沙箱", "mock 执行 du 返回仿真数据",
+               r.ok and "nginx" in r.stdout, r.stdout.strip()[:40])
+    else:
+        record("沙箱", f"真实执行（后端 {info['backend']}）",
+               isinstance(r.ok, bool) and (r.ok or r.error),
+               f"isolated={r.isolated}　exit={r.exit_code}　"
+               + (r.error or r.stdout.strip()[:30]))
 
     # ---- 5. 审批状态机（临时 store，不污染 logs/approvals.jsonl）----
     st = ap.ApprovalStore(path=Path(tempfile.mkdtemp()) / "approvals.jsonl")
@@ -428,10 +440,140 @@ def check_sandbox(full: bool = False):
 
 
 # ============================================================
-# 第六层：MCP Server（把工具暴露成标准协议）
+# 第六层：可观测（离线，不花钱）
+# ============================================================
+def check_observability(full: bool = False):
+    print("\n[6/8] 可观测　—— trace 记录 + 成本核算 + 导出 payload")
+
+    from app.observability import costs, langfuse_export, tracer
+
+    # ---- 1. trace + 嵌套 span 的记录与聚合 ----
+    started_count = 0
+    try:
+        with tracer.trace("smoke", question="自检用例") as tid:
+            with tracer.span(tracer.TYPE_AGENT, name="intent") as sp:
+                sp.set_usage({"prompt_tokens": 100, "completion_tokens": 20,
+                              "prompt_cache_hit_tokens": 60,
+                              "prompt_cache_miss_tokens": 40})
+                with tracer.span(tracer.TYPE_TOOL, name="check_disk") as tsp:
+                    tsp.set("host", "web-01")
+        traces = tracer.recent_traces(limit=5)
+        t = next((x for x in traces if x["trace_id"] == tid), None)
+        ok_trace = t is not None
+        spans_ok = ok_trace and t.get("span_count") == 2 and len(t.get("spans") or []) == 2
+        # ★ 按 name 找，不按位置 —— spans 是按「结束顺序」收集的，
+        #   内层 span 先结束先入列，位置断言会随嵌套方向翻反
+        by_name = {sp.get("name"): sp for sp in (t.get("spans") or []) if t}
+        parent_ok = (spans_ok
+                     and (by_name.get("check_disk", {}).get("parent_id")
+                          == by_name.get("intent", {}).get("span_id")))
+        usage_ok = (ok_trace and t.get("usage", {}).get("prompt_tokens") == 100)
+        cost_ok = ok_trace and (t.get("cost_cny") or 0) > 0
+        record("观测", "trace + 嵌套 span 记录", ok_trace and spans_ok,
+               f"span {t.get('span_count') if t else '?'} 个")
+        record("观测", "父子关系正确（嵌套 span 挂对父节点）", parent_ok, "")
+        record("观测", "usage 聚合 + 成本核算", usage_ok and cost_ok,
+               f"cost=¥{t.get('cost_cny') if t else '?'}")
+    except Exception as e:
+
+        record("观测", "trace 记录", False, brief(e))
+
+    # ---- 1.5 ★ 嵌套 usage 字段不能破坏归并（踩过的坑，固化成断言）----
+    #   DeepSeek 的 usage 里有 `prompt_tokens_details`（嵌套 dict）。
+    #   第一版归并写的是 `parent.usage[k] = parent.usage.get(k, 0) + v`，
+    #   遍历到嵌套字段时 `0 + dict` 抛 TypeError，被吞掉 → **归并半途中断**：
+    #   前三个字段（prompt/completion/total）正常，后面的缓存字段全丢，
+    #   于是节点成本按"全部未命中"算，看板数字虚高。
+    try:
+        with tracer.trace("smoke-nested") as tid2:
+            with tracer.span(tracer.TYPE_AGENT, name="node"):
+                with tracer.span(tracer.TYPE_LLM, name="chat_step") as lsp:
+                    lsp.set_usage({
+                        "prompt_tokens": 1004, "completion_tokens": 231,
+                        "total_tokens": 1235,
+                        "prompt_tokens_details": {"cached_tokens": 768},   # ← 嵌套 dict
+                        "prompt_cache_hit_tokens": 768,
+                        "prompt_cache_miss_tokens": 236,
+                    })
+        t2 = next((x for x in tracer.recent_traces(limit=5)
+                   if x["trace_id"] == tid2), None)
+        node = next((s for s in (t2 or {}).get("spans", [])
+                     if s.get("name") == "node"), None)
+        nu = (node or {}).get("usage") or {}
+        # ★ 关键断言：缓存字段必须一起归并上来（正是被吞掉的那部分）
+        nested_ok = (nu.get("prompt_cache_hit_tokens") == 768
+                     and nu.get("prompt_cache_miss_tokens") == 236
+                     and nu.get("completion_tokens") == 231)
+        record("观测", "嵌套 usage 字段不破坏归并", nested_ok,
+               f"缓存字段归并成功（hit={nu.get('prompt_cache_hit_tokens')}）"
+               if nested_ok else f"缓存字段丢失：{nu}")
+    except Exception as e:
+        record("观测", "嵌套 usage 字段归并", False, brief(e))
+
+    # ---- 2. 异常会被记下来且原样抛出（观测绝不吞业务异常） ----
+    raised, recorded = False, False
+    try:
+        with tracer.trace("smoke-err", question=""):
+            with tracer.span(tracer.TYPE_AGENT, name="boom"):
+                raise ValueError("故意抛出")
+    except ValueError:
+        raised = True
+    if raised:
+        bad = [t for t in tracer.recent_traces(limit=5)
+               if t["name"] == "smoke-err"]
+        recorded = bool(bad) and bad[0].get("status") == "error"
+    record("观测", "异常：记录状态且原样抛出", raised and recorded,
+           "业务异常不被吞掉" if raised else "")
+
+    # ---- 3. 无 trace 上下文时静默跳过（不崩、不报错） ----
+    try:
+        with tracer.span(tracer.TYPE_TOOL, name="orphan"):
+            pass
+        record("观测", "无 trace 时 span 静默跳过", True, "_NullSpan")
+    except Exception as e:
+        record("观测", "无 trace 时的 span", False, brief(e))
+
+    # ---- 4. 成本：缓存命中折扣要算进去 ----
+    u = {"prompt_tokens": 1000, "prompt_cache_hit_tokens": 800,
+         "prompt_cache_miss_tokens": 200, "completion_tokens": 500}
+    c = costs.cost_of(u)
+    # 期望：800×0.5 + 200×2 + 500×8 = 400+400+4000 = 4800 / 1M = 0.0048
+    record("观测", "成本核算（含缓存折扣）", abs(c - 0.0048) < 1e-9,
+           f"¥{c:.6f}（缓存 80% 时比不算折扣省一半以上）")
+
+    # ---- 5. Langfuse 导出 payload 形状（离线构造，不联网） ----
+    fake = {"trace_id": "tr-x", "name": "t", "question": "q",
+            "started_at": "2026-09-26T20:00:00", "elapsed_ms": 100,
+            "status": "ok", "cost_cny": 0.001,
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+            "span_count": 1,
+            "spans": [{"span_id": "sp-1", "parent_id": None, "type": "llm",
+                       "name": "chat_step", "started_at": "2026-09-26T20:00:00",
+                       "elapsed_ms": 90, "status": "ok",
+                       "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+                       "attrs": {"model": "deepseek-chat"}}]}
+    try:
+        events = langfuse_export.build_ingestion_events(fake)
+        types = [e["type"] for e in events]
+        gen = next(e for e in events if e["type"] == "generation-create")
+        shape_ok = ("trace-create" in types
+                    and gen["body"]["traceId"] == "tr-x"
+                    and gen["body"]["usage"]["total"] == 15)
+        record("观测", "Langfuse payload 构造（离线）", shape_ok,
+               f"事件 {len(events)} 条：{','.join(types)}")
+    except Exception as e:
+        record("观测", "Langfuse payload", False, brief(e))
+
+    info = langfuse_export.describe()
+    record("观测", f"导出器 {'启用' if info['enabled'] else '未启用（本地记录模式）'}",
+           True, info["note"][:60])
+
+
+# ============================================================
+# 第七层：MCP Server（把工具暴露成标准协议）
 # ============================================================
 def check_mcp(full: bool = False):
-    print("\n[6/7] MCP Server　—— 工具的标准协议出口")
+    print("\n[7/8] MCP Server　—— 工具的标准协议出口")
 
     # ---- 1. 服务端能导入、工具注册正确 ----
     try:
@@ -477,7 +619,7 @@ def check_mcp(full: bool = False):
 # 第六层：HTTP 服务（需要服务已在运行）
 # ============================================================
 def check_http(full: bool = False):
-    print("\n[7/7] HTTP 服务　—— 13 个接口")
+    print("\n[8/8] HTTP 服务　—— 13 个接口")
 
     import httpx
 
@@ -651,7 +793,7 @@ def summarize():
     print("  自检汇总")
     print("=" * 62)
 
-    layers = ["环境", "模型", "检索", "问答", "工具", "编排", "校验", "沙箱", "审批", "MCP", "服务", "接口"]
+    layers = ["环境", "模型", "检索", "问答", "工具", "编排", "校验", "沙箱", "审批", "观测", "MCP", "服务", "接口"]
     for layer in layers:
         rows = [r for r in results if r[0] == layer]
         if not rows:
@@ -678,7 +820,7 @@ def summarize():
         print("  ✅ 已检查的项目全部通过。")
         print(f"  ⏭  有 {len(skipped)} 项被跳过（服务没在跑 / 未加 --full），可复跑。")
     else:
-        print("  ✅ 全部通过。七层技术栈都在工作。")
+        print("  ✅ 全部通过。八层技术栈都在工作。")
     print("=" * 62)
     return 1 if failed else 0
 
@@ -703,6 +845,7 @@ def main():
              lambda: check_rag(),
              lambda: check_agent(args.full),
              lambda: check_sandbox(args.full),
+             lambda: check_observability(args.full),
              lambda: check_mcp(args.full),
              lambda: check_http(args.full)]
     for step in steps:

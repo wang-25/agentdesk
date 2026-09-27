@@ -176,7 +176,34 @@ subprocess 无隔离执行**。要无隔离执行必须显式设 `SANDBOX_BACKEN
 | 再批准（已消费） | **409**，`不能再批准（只有 pending 可以批准）` |
 | 批准但不填审批人 | **422**（`by` 必填） |
 
-**七层自检**：沙箱 5/5、审批 3/3，其余层全绿。
+**★ 装上 Docker 之后的真实验证（Day 8 补做，这是最终结论）**
+
+沙箱隔离参数逐项实测：
+
+| 隔离项 | 验证方式 | 结果 |
+|---|---|---|
+| 非 root | `id -u` | `65534` ✓ |
+| 根文件系统只读 | `touch /etc/x` | `Read-only file system` ✓ |
+| tmpfs 可写 | `touch /tmp/x` | 成功 ✓ |
+| 无网络 | `ping 1.1.1.1` | `Network unreachable` ✓ |
+| 内存封顶 | 读 cgroup `memory.max` | `134217728`（128MB）✓ |
+
+完整 HITL 端到端（真实容器执行）：
+
+```
+造真实日志文件（2 行）
+  → Agent 提交 run_command truncate -s 0 /var/log/nginx/access.log
+  → 决策 needs_approval，生成审批单，**不执行**
+  → 人工批准（by=ops-drill）
+  → 指纹比对一致 → 一次性容器执行（backend=docker, isolated=True, exit=0）
+  → 验证文件：0 字节 ✓
+```
+
+**过程中被拦下一次 Permission denied**（root 属主文件 + 容器以 nobody 运行）——
+这不是故障，是"非 root 运行"在做它该做的事，也顺手演示了真实生产里
+最常见的权限问题。修好文件属主后同一条链路完整跑通。
+
+**八层自检**：沙箱 5/5、审批 3/3、观测 9/9，其余层全绿。
 
 ---
 

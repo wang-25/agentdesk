@@ -57,6 +57,7 @@ from langchain_core.messages import (AIMessage, HumanMessage, SystemMessage,
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 
+from app.observability import tracer
 from app.agents.common import (
     DEFAULT_MAX_STEPS,
     SYSTEM_PROMPT,
@@ -455,6 +456,7 @@ def mermaid(max_steps: int = DEFAULT_MAX_STEPS) -> str:
 # ============================================================
 # 六、入口
 # ============================================================
+@tracer.traced("langgraph")            # ★ Day 8：一次运行 = 一个 trace
 def run(question: str, max_steps: int = DEFAULT_MAX_STEPS,
         verbose: bool = False, tool_names: list = None,
         system_prompt: str = None) -> dict:

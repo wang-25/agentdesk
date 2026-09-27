@@ -86,6 +86,7 @@ from app.agents.specialists import (
     verify,
 )
 from app.agents.graph import _merge_usage
+from app.observability import tracer
 
 # ============================================================
 # 一、状态
@@ -405,14 +406,35 @@ def build_graph(max_retries: int = 1, config: dict = None):
 
     graph = StateGraph(MultiAgentState)
 
-    graph.add_node("supervisor", make_supervisor_node(max_retries))
-    graph.add_node("intent", intent_node)
-    graph.add_node("knowledge", knowledge_node)
-    graph.add_node("diagnose", make_diagnose_node(DIAGNOSE_TOOLS, "diagnose"))
-    graph.add_node("reason", make_diagnose_node([], "reason"))
-    graph.add_node("verify", verify_node)
-    graph.add_node("remediate", make_remediate_node())     # ★ Day 7
-    graph.add_node("finalize", make_finalize_node(config))
+    # ★ Day 8：每个 Agent 节点记一个 span。
+    #   这一步让「token 都花在哪个 Agent 上了」变成可回答的问题 ——
+    #   /metrics/summary 按 span name 聚合，直接给出各 Agent 的成本占比。
+    def _add(node_name: str, fn):
+        def wrapped(state):
+            # ★ 这里**不再**把 out["usage"] 加进 span —— 只靠子 span 归并。
+            #
+            #   这行经历过三个版本，每个版本都是一次真实的对账教训：
+            #     v1 set_usage(out.usage)   → 覆盖，把子 span 归并上来的清零
+            #     v2 add_usage(out.usage)   → 累加，但 out.usage 是引擎自报的
+            #                                  整轮汇总，和归并值重复 → 成本翻倍
+            #     v3 什么都不加             → 叶子 span（模型调用）是唯一事实源，
+            #                                  节点用量 = 子 span 归并，和对账完全一致
+            #
+            #   **同一个量只能有一个事实源。** 引擎自报的 usage 仍然保留在
+            #   返回值 / metrics 里给人看，但进 trace 的只有归并链路。
+            with tracer.span(tracer.TYPE_AGENT, name=node_name) as sp:
+                return fn(state)
+        return wrapped
+
+
+    graph.add_node("supervisor", _add("supervisor", make_supervisor_node(max_retries)))
+    graph.add_node("intent", _add("intent", intent_node))
+    graph.add_node("knowledge", _add("knowledge", knowledge_node))
+    graph.add_node("diagnose", _add("diagnose", make_diagnose_node(DIAGNOSE_TOOLS, "diagnose")))
+    graph.add_node("reason", _add("reason", make_diagnose_node([], "reason")))
+    graph.add_node("verify", _add("verify", verify_node))
+    graph.add_node("remediate", _add("remediate", make_remediate_node()))  # ★ Day 7
+    graph.add_node("finalize", _add("finalize", make_finalize_node(config)))
 
     graph.add_edge(START, "supervisor")
 
@@ -444,6 +466,7 @@ def mermaid(max_retries: int = 1) -> str:
 # ============================================================
 # 五、入口
 # ============================================================
+@tracer.traced("supervisor")           # ★ Day 8：一次运行 = 一个 trace
 def run(question: str, max_retries: int = 1, verbose: bool = False,
         config: dict = None) -> dict:
     """跑一次多 Agent 流程。

@@ -648,6 +648,11 @@ def tool_catalog() -> list:
 def execute_tool(name: str, args: dict) -> dict:
     """执行一个工具。返回值永远是可 JSON 序列化的 dict。
 
+    ★ 观测包装（Day 8）：每次工具调用都记一个 span，含参数摘要与结果状态。
+      用包装而不是改函数体 —— 这个函数里有六处早退分支，
+      每处都补 set_error 的话迟早漏一处。
+      **一层包装统一处理，比在六处分别处理可靠。**
+
     【为什么这里必须 try 住所有异常】
     工具是模型"点名"调用的，参数由模型生成 —— 也就是说，
     **输入是不可信的**。参数写错是常态，不是异常情况。
@@ -655,6 +660,26 @@ def execute_tool(name: str, args: dict) -> dict:
     当成一条「观察结果」返回给模型，让它看到自己写错了然后改。
     这是工具层和普通函数最大的区别。
     """
+    from app.observability import tracer
+
+    # 参数进 span 前先做短摘要：轨迹既要给人看也要落盘，
+    # 完整参数（可能含大段日志内容）不该进观测存储。
+    safe_args = {}
+    if isinstance(args, dict):
+        for k, v in list(args.items())[:8]:
+            safe_args[k] = v if isinstance(v, (int, float, bool)) else str(v)[:120]
+
+    with tracer.span(tracer.TYPE_TOOL, name=name, **safe_args) as sp:
+        out = _execute_tool_inner(name, args)
+        sp.set("ok", bool(out.get("ok")))
+        sp.set("risk", out.get("risk"))
+        if not out.get("ok"):
+            sp.set_error(out.get("error"))
+        return out
+
+
+def _execute_tool_inner(name: str, args: dict) -> dict:
+    """原 execute_tool 的实现体（由上面的观测包装调用）。"""
     started = time.time()
     if name not in TOOLS:
         return {"ok": False, "tool": name,

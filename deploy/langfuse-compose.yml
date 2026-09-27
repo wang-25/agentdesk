@@ -1,0 +1,60 @@
+# ============================================================
+#  Langfuse 自托管（Day 8，可选）
+# ------------------------------------------------------------
+#  用法：
+#    1. 先生成两份密钥（一次性）：
+#         openssl rand -hex 32   ← 填到 NEXTAUTH_SECRET
+#         openssl rand -hex 32   ← 填到 SALT
+#       或者让 AI 帮你生成。
+#    2. 启动：
+#         docker compose -f deploy/langfuse-compose.yml up -d
+#    3. 打开 http://localhost:3000 注册第一个账号
+#    4. Settings → API Keys → 创建，填进项目根目录 .env：
+#         LANGFUSE_HOST=http://localhost:3000
+#         LANGFUSE_PUBLIC_KEY=pk-lf-...
+#         LANGFUSE_SECRET_KEY=sk-lf-...
+#    5. 重启 AgentDesk 服务，跑一次 /agent/ask，回 Langfuse 看 trace 树
+#
+#  说明：
+#    - 用的是 Langfuse v2 镜像：单容器 + 单 Postgres，学习项目够用且轻量
+#      （v3 需要 ClickHouse/MinIO/Redis 全家桶，那是生产规模的配置）
+#    - 数据全部落在本机 Docker 卷里，不外发
+#    - 停止并保留数据：docker compose -f deploy/langfuse-compose.yml stop
+#      彻底删除：加 -v 参数（会清空所有 trace 数据）
+# ============================================================
+
+services:
+  langfuse-db:
+    image: postgres:16-alpine
+    container_name: langfuse-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: langfuse
+      POSTGRES_PASSWORD: langfuse
+      POSTGRES_DB: langfuse
+    volumes:
+      - langfuse_pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U langfuse"]
+      interval: 3s
+      timeout: 5s
+      retries: 10
+
+  langfuse:
+    image: langfuse/langfuse:2
+    container_name: langfuse-web
+    restart: unless-stopped
+    depends_on:
+      langfuse-db:
+        condition: service_healthy
+    ports:
+      - "3000:3000"
+    environment:
+      DATABASE_URL: postgresql://langfuse:langfuse@langfuse-db:5432/langfuse
+      NEXTAUTH_URL: http://localhost:3000
+      NEXTAUTH_SECRET: ${NEXTAUTH_SECRET:?请在 deploy/langfuse.env 里设置}
+      SALT: ${SALT:?请在 deploy/langfuse.env 里设置}
+      TELEMETRY_ENABLED: "false"
+
+volumes:
+  langfuse_pg:
