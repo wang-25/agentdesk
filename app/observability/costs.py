@@ -86,6 +86,7 @@ def aggregate(traces: list) -> dict:
     by_type = {}          # span 类型（llm/tool/agent）→ tokens/cost/次数
     by_name = {}          # 具体名字（check_disk / intent / diagnose）→ 同上
     errors = 0
+    batch_runs = 0
     cache_hit = 0
     cache_miss = 0
 
@@ -96,7 +97,13 @@ def aggregate(traces: list) -> dict:
                 total_usage[k] = total_usage.get(k, 0) + v
         total_cost += t.get("cost_cny") or 0.0
         if t.get("elapsed_ms") is not None:
-            elapsed.append(t["elapsed_ms"])
+            # ★ 只把"单次请求"类 trace 计入延迟统计。
+            #   批处理任务（评测跑一轮 315 秒）计入成本，但不计入延迟 ——
+            #   混在一起 P95 会变成"哪个批处理任务跑了多久"。
+            if t.get("batch"):
+                batch_runs += 1
+            else:
+                elapsed.append(t["elapsed_ms"])
         if t.get("status") != "ok":
             errors += 1
         cache_hit += u.get("prompt_cache_hit_tokens") or 0
@@ -154,11 +161,15 @@ def aggregate(traces: list) -> dict:
         "errors": errors,
         "tokens": total_usage,
         "cost_cny": round(total_cost, 4),
+        # 延迟口径：**只统计单次请求**（不含批处理任务），
+        # 并带上样本数 —— 样本少的时候 P95 约等于最大值，读者自己该知道。
         "elapsed_ms": {
             "avg": int(sum(elapsed) / len(elapsed)) if elapsed else 0,
             "p50": _pctl(elapsed, 50),
             "p95": _pctl(elapsed, 95),
+            "sample": len(elapsed),
         },
+        "batch_runs": batch_runs,
         "prompt_cache_hit_rate": round(hit_rate, 4),
         "by_span_type": _sorted(by_type),
         "by_span_name": _sorted(by_name),

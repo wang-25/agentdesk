@@ -254,11 +254,28 @@ def span(stype: str, name: str, **attrs):
 
 
 @contextmanager
-def trace(name: str, question: str = "", **attrs):
+def trace(name: str, question: str = "", batch: bool = False, **attrs):
     """打开一个 trace（一次完整运行）。
 
     结束时写一条 kind=trace 的汇总记录：总 token / 总成本 / 完整 spans
     都并进这一条 —— 查询单次详情只需要读一行。
+
+    ★ batch=True 表示**批处理任务**（比如跑一次评测：160 次模型调用、
+      几分钟），不是"一次用户请求"。
+
+      【为什么必须区分 —— 这是被一个很唬人的数字逼出来的】
+
+      某次看 /metrics/summary，P95 显示 **315675ms（315 秒）**。
+      第一反应是"有脏数据"，查下去发现：那是一个**真实**的 trace ——
+      就是那次评测运行本身，它确实跑了 315 秒。
+
+      数据没错，**是口径错了**：把一次批处理任务和一次用户请求
+      混在同一个延迟分布里，P95 就变成了"哪个批处理任务跑了多久"，
+      完全不能反映用户感受到的延迟。
+
+      **成本要合并算（钱真的花了），但延迟必须分开口径。**
+      这和"相关性只能统计库内题"是同一类错误：
+      **分母选错，指标就失去意义。**
     """
     tid = "tr-" + secrets.token_hex(6)
     started = time.time()
@@ -287,6 +304,8 @@ def trace(name: str, question: str = "", **attrs):
             cost = cost_of(usage)
             record = {
                 "kind": "trace", "trace_id": tid, "name": name,
+                # batch=True 的 trace 会计入成本，但不计入延迟统计（见上方说明）
+                "batch": bool(batch),
                 "question": str(question or "")[:200],
                 "started_at": _now(), "elapsed_ms": int((time.time() - started) * 1000),
                 "status": status, "usage": usage,

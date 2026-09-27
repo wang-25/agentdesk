@@ -38,7 +38,7 @@ from datetime import datetime
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import StreamingResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from app.llm import PROJECT_ROOT, ModelError
@@ -56,7 +56,7 @@ from app.llm import chat_json, chat_stream_async
 app = FastAPI(
     title="AgentDesk",
     description="面向运维场景的多 Agent 智能体系统",
-    version="0.3.0",
+    version="0.9.0",
 )
 
 # ============================================================
@@ -276,6 +276,99 @@ def alert_to_question(alert: dict) -> str:
 
 
 # ============================================================
+# 接口 0：首页
+# ============================================================
+@app.get("/", response_class=HTMLResponse, include_in_schema=False)
+def index():
+    """根路径给一张「这是什么 + 怎么试」的导航页。
+
+    【为什么要这个接口】
+    服务起来之后，人第一次打开 http://127.0.0.1:8000 看到的是 404 ——
+    得先知道 `/docs` 这个约定才知道去哪儿，而**面试官或同事不会知道**。
+
+    一个几十行的首页，把"这是什么、从哪开始试、有哪些能力"一次说清，
+    是演示成本最低、收益最直接的一步。
+
+    `include_in_schema=False`：它只是导航页，不是业务接口，
+    不该混进 /docs 的接口清单里干扰视线。
+    """
+    links = [
+        ("/docs", "交互式接口文档", "不用写前端，点着就能试每个接口 —— 从这里开始"),
+        ("/metrics/summary", "成本看板", "按 Agent / 动作两维看成本、缓存命中率、P95 延迟"),
+        ("/traces", "链路追踪", "每次运行发生了什么、哪一步最慢最贵"),
+        ("/agent/tools", "工具清单", "Agent 能调用的 7 个工具，含风险等级"),
+        ("/sandbox", "沙箱状态", "当前是 mock 还是真容器、白名单概览、fail-closed"),
+        ("/approvals", "审批单", "Agent 想执行但还没执行的写操作"),
+        ("/audit", "审计日志", "谁、何时、哪条告警、判成什么风险、做了什么"),
+        ("/health", "健康检查", "给容器探活和监控用"),
+    ]
+    rows = "".join(
+        f'<tr><td><a href="{u}"><code>{u}</code></a></td>'
+        f'<td><b>{n}</b></td><td>{d}</td></tr>'
+        for u, n, d in links
+    )
+    return f"""<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AgentDesk</title>
+<style>
+ body{{font-family:-apple-system,"Segoe UI","Microsoft YaHei",sans-serif;
+      max-width:860px;margin:0 auto;padding:40px 24px;color:#1f2328;
+      line-height:1.65;background:#fff}}
+ h1{{margin:0 0 4px;font-size:26px}}
+ .sub{{color:#59636e;margin-bottom:28px}}
+ h2{{font-size:16px;margin:30px 0 10px;padding-bottom:6px;
+    border-bottom:1px solid #e6e8eb}}
+ table{{width:100%;border-collapse:collapse;font-size:14px}}
+ td,th{{padding:9px 10px;border-bottom:1px solid #f0f1f3;text-align:left;
+       vertical-align:top}}
+ th{{color:#59636e;font-weight:600;font-size:13px}}
+ code{{background:#f4f5f7;padding:2px 6px;border-radius:4px;
+      font-family:ui-monospace,Consolas,monospace;font-size:13px}}
+ a{{color:#0969da;text-decoration:none}} a:hover{{text-decoration:underline}}
+ pre{{background:#f6f8fa;padding:14px 16px;border-radius:8px;overflow-x:auto;
+     font-size:13px;border:1px solid #e6e8eb}}
+ .note{{background:#fff8e6;border-left:3px solid #d4a017;padding:12px 16px;
+       border-radius:0 6px 6px 0;font-size:14px;margin:16px 0}}
+ .k{{display:inline-block;background:#eef4ff;color:#0550ae;border-radius:4px;
+    padding:1px 7px;font-size:12px;margin-right:6px}}
+</style></head><body>
+
+<h1>AgentDesk</h1>
+<div class="sub">面向运维场景的多 Agent 智能体系统 &middot;
+<span class="k">模型调用</span><span class="k">私有知识检索</span>
+<span class="k">工具执行</span><span class="k">沙箱 + 人工确认</span></div>
+
+<h2>这是什么</h2>
+<p>一个 HTTP 服务：告警或人发起请求 &rarr; 多个专业 Agent 分工诊断 &rarr;
+需要动手时提交人工审批 &rarr; 在一次性容器里执行 &rarr; 全过程留痕、可查成本。</p>
+
+<h2>从哪儿开始试</h2>
+<table>
+<tr><th>地址</th><th>是什么</th><th>说明</th></tr>
+{rows}
+</table>
+
+<h2>最快的一次体验</h2>
+<p>打开 <a href="/docs">/docs</a>，找到 <code>POST /agent/ask</code> &rarr;
+点 &quot;Try it out&quot; &rarr; 填下面的内容 &rarr; Execute：</p>
+<pre>{{"question": "web-01 上的网站访问很慢，有时报 502，帮我看下原因",
+ "engine": "supervisor"}}</pre>
+<p>返回里会有完整轨迹（它自己决定了查什么、跑几轮）和校验结论。
+换个知识库里没有的问题问它（比如「Kafka 消费组 lag 怎么排查」），
+它会明确告诉你<strong>知识库里没有</strong> &mdash; 这是刻意设计的，不是能力不足。</p>
+
+<div class="note"><b>安全边界</b>：所有写操作（重启服务、清空日志）
+都不会自动执行。它们会变成一张审批单挂在 <a href="/approvals">/approvals</a>，
+等人批准；沙箱不可用时宁可拒绝执行，也不降级。</div>
+
+<p style="margin-top:32px;color:#8b949e;font-size:13px">
+如果这是本地跑的，只有这台机器能访问。要给别人看需要部署到公网 &mdash;&mdash;
+见 <code>docs/overview.md</code>。</p>
+</body></html>"""
+
+
+# ============================================================
 # 接口 1：健康检查
 # ============================================================
 @app.get("/health")
@@ -285,7 +378,7 @@ async def health():
     别小看它 —— 后面要用 Docker + Nginx 上线，
     容器的健康检查、负载均衡的存活探测全都依赖这个接口。
     """
-    return {"status": "ok", "service": "agentdesk", "version": "0.2.0"}
+    return {"status": "ok", "service": "agentdesk", "version": "0.9.0"}
 
 
 # ============================================================

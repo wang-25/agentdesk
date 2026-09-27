@@ -709,7 +709,10 @@ def main(argv=None) -> int:
     started = time.time()
     total = len(cases) * len(results)
     done_n = 0
-    with tracer.trace("eval-rag", question=f"{len(cases)} 条") as tid:
+    # batch=True：这是一次批处理任务（160 次模型调用），
+    # 不能和"一次用户请求"混在同一个延迟统计里。
+    with tracer.trace("eval-rag", question=f"{len(cases)} 条",
+                      batch=True) as tid:
         for mode in results:
             store = partial.setdefault(mode, {})
             label = "RAG" if mode == "rag" else "裸模型（对照）"

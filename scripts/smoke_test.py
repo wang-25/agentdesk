@@ -745,7 +745,7 @@ def check_mcp(full: bool = False):
 # 第九层：HTTP 服务（需要服务已在运行）
 # ============================================================
 def check_http(full: bool = False):
-    print("\n[9/9] HTTP 服务　—— 13 个接口")
+    print("\n[9/9] HTTP 服务　—— 22 个接口")
 
     import httpx
 
