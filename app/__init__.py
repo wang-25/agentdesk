@@ -11,7 +11,9 @@
                         （Day 7 ✓）处置 Agent（唯一有写权限的 Agent）
     app/mcp_server/     （Day 5 ✓）把工具暴露成 MCP Server
     app/sandbox/        （Day 7 ✓）Docker 沙箱 + 人工确认（HITL）
-    app/observability/  （Day 8）Langfuse 接入
+    app/observability/  （Day 8 ✓）全链路 Trace + 成本归因
+    app/evaluation/     （Day 9 ✓）端到端评测：4 项规则判定 + 模型判分
+                        ★ 判定器先自证是准的，再拿来跑分
 
 【一条设计主线】
 每一层只依赖它下面那层，不反向依赖：

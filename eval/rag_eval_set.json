@@ -1,0 +1,374 @@
+{
+  "_comment": "RAG 端到端评测集。40 条 = 30 条知识库内（考察答得对不对）+ 10 条知识库外（考察会不会硬答）。",
+  "_why_out_of_scope": "★ 这 10 条是本评测集最重要的部分。检索永远会返回 top_k 条结果 —— 哪怕全都不相关。所以'知识库里没有'这件事，模型不能靠'检索为空'得知，只能靠'读到的东西答不了这个问题'来判断。绝大多数人做的 RAG 从不测这一项，结果上线后对着无关问题一本正经地编。",
+  "_fields": {
+    "id": "用例编号",
+    "scope": "in = 知识库内（应作答）／ out = 知识库外（应拒答）",
+    "category": "word 词面型（用文档原词提问）／ semantic 语义型（换一套词表达同一意思）／ out 知识库外",
+    "doc": "标准答案出自哪篇文档（out 的为空）",
+    "expect_points": "答案里应该出现的要点（关键词，宽松匹配，用于人工复核参考）",
+    "note": "出题意图"
+  },
+  "cases": [
+    {
+      "id": "r01",
+      "scope": "in",
+      "category": "word",
+      "doc": "nginx-502",
+      "question": "nginx 报 502，error.log 里是 upstream timed out，是什么原因？",
+      "expect_points": ["上游", "超时", "proxy_read_timeout"],
+      "note": "最典型的 502 场景，文档里逐字有"
+    },
+    {
+      "id": "r02",
+      "scope": "in",
+      "category": "word",
+      "doc": "nginx-502",
+      "question": "排查 Nginx 502 的第一步应该做什么？",
+      "expect_points": ["nginx", "配置", "错误日志"],
+      "note": "考排查顺序"
+    },
+    {
+      "id": "r03",
+      "scope": "in",
+      "category": "word",
+      "doc": "nginx-502",
+      "question": "error.log 里出现 no live upstreams 说明什么？",
+      "expect_points": ["upstream", "不可用", "健康检查"],
+      "note": "考关键词对照表"
+    },
+    {
+      "id": "r04",
+      "scope": "in",
+      "category": "word",
+      "doc": "nginx-502",
+      "question": "proxy_read_timeout 默认是多少？",
+      "expect_points": ["60"],
+      "note": "考具体数值，能验证数值溯源的判定"
+    },
+    {
+      "id": "r05",
+      "scope": "in",
+      "category": "semantic",
+      "doc": "nginx-502",
+      "question": "网站前面挂着反向代理，用户偶尔遇到几个请求打不开，页面提示网关错误，但刷新一下又好了，该从哪儿下手？",
+      "expect_points": ["上游", "日志", "超时"],
+      "note": "全程不提 nginx / 502，考语义检索"
+    },
+    {
+      "id": "r06",
+      "scope": "in",
+      "category": "word",
+      "doc": "disk-full",
+      "question": "磁盘写满了，怎么确认是哪个分区满了？",
+      "expect_points": ["df", "分区"],
+      "note": "最基础的一步"
+    },
+    {
+      "id": "r07",
+      "scope": "in",
+      "category": "word",
+      "doc": "disk-full",
+      "question": "df 显示还有空间，但应用报 No space left on device，可能是什么原因？",
+      "expect_points": ["inode", "已删除", "句柄"],
+      "note": "考两个非容量类成因"
+    },
+    {
+      "id": "r08",
+      "scope": "in",
+      "category": "word",
+      "doc": "disk-full",
+      "question": "清理日志文件为什么建议用 truncate 而不是 rm？",
+      "expect_points": ["句柄", "空间", "进程"],
+      "note": "考原理，不是考命令"
+    },
+    {
+      "id": "r09",
+      "scope": "in",
+      "category": "word",
+      "doc": "disk-full",
+      "question": "文件删掉了但磁盘空间没有释放，怎么办？",
+      "expect_points": ["句柄", "进程", "lsof"],
+      "note": "考 lsof +L1 定位"
+    },
+    {
+      "id": "r10",
+      "scope": "in",
+      "category": "word",
+      "doc": "disk-full",
+      "question": "Docker 把磁盘占满了，怎么清理？",
+      "expect_points": ["prune", "镜像", "日志"],
+      "note": "考专项处理"
+    },
+    {
+      "id": "r11",
+      "scope": "in",
+      "category": "semantic",
+      "doc": "disk-full",
+      "question": "机器突然写不进数据了，报错说设备上没有空间，可我看了下容量还剩不少，这是怎么回事？",
+      "expect_points": ["inode"],
+      "note": "容量够但写不进 = inode，不用'磁盘满'这个词"
+    },
+    {
+      "id": "r12",
+      "scope": "in",
+      "category": "word",
+      "doc": "docker-exit-code",
+      "question": "容器退出码 137 是什么意思？",
+      "expect_points": ["SIGKILL", "OOM", "128"],
+      "note": "高频面试题"
+    },
+    {
+      "id": "r13",
+      "scope": "in",
+      "category": "word",
+      "doc": "docker-exit-code",
+      "question": "退出码 137 和 143 有什么区别？",
+      "expect_points": ["SIGKILL", "SIGTERM", "docker stop"],
+      "note": "考区分"
+    },
+    {
+      "id": "r14",
+      "scope": "in",
+      "category": "word",
+      "doc": "docker-exit-code",
+      "question": "怎么确认容器是被 OOM 杀掉的？",
+      "expect_points": ["OOMKilled", "inspect"],
+      "note": "考具体字段"
+    },
+    {
+      "id": "r15",
+      "scope": "in",
+      "category": "word",
+      "doc": "docker-exit-code",
+      "question": "容器返回退出码 127，一般是什么问题？",
+      "expect_points": ["命令", "不存在", "PATH"],
+      "note": "考命令类退出码"
+    },
+    {
+      "id": "r16",
+      "scope": "in",
+      "category": "semantic",
+      "doc": "docker-exit-code",
+      "question": "有个容器跑着跑着就没了，日志里什么也没留下，我要怎么知道它上次死之前发生了什么？",
+      "expect_points": ["退出码", "OOM", "日志"],
+      "note": "不提 'exit code' / '137'"
+    },
+    {
+      "id": "r17",
+      "scope": "in",
+      "category": "word",
+      "doc": "linux-load-high",
+      "question": "load average 多少算高？",
+      "expect_points": ["核", "CPU"],
+      "note": "考判断标准（要看核数）"
+    },
+    {
+      "id": "r18",
+      "scope": "in",
+      "category": "word",
+      "doc": "linux-load-high",
+      "question": "load 很高但 CPU 使用率不高，是什么原因？",
+      "expect_points": ["I/O", "D 状态", "wa"],
+      "note": "经典陷阱题"
+    },
+    {
+      "id": "r19",
+      "scope": "in",
+      "category": "word",
+      "doc": "linux-load-high",
+      "question": "怎么区分负载高是 CPU 问题还是 I/O 问题？",
+      "expect_points": ["wa", "D 状态", "vmstat"],
+      "note": "考判别方法"
+    },
+    {
+      "id": "r20",
+      "scope": "in",
+      "category": "word",
+      "doc": "linux-load-high",
+      "question": "怎么找到在吃 CPU 的具体线程？",
+      "expect_points": ["top", "H", "线程"],
+      "note": "考具体操作"
+    },
+    {
+      "id": "r21",
+      "scope": "in",
+      "category": "semantic",
+      "doc": "linux-load-high",
+      "question": "服务器响应变慢，登上去看排队任务数已经二十多了，但进程列表里看不到特别占处理器时间的程序，这可能是怎么回事？",
+      "expect_points": ["I/O", "等待"],
+      "note": "用'排队任务数'代替 load，'处理器时间'代替 CPU"
+    },
+    {
+      "id": "r22",
+      "scope": "in",
+      "category": "word",
+      "doc": "mysql-too-many-connections",
+      "question": "MySQL 报 Too many connections，怎么处理？",
+      "expect_points": ["连接", "max_connections"],
+      "note": "最直接的问法"
+    },
+    {
+      "id": "r23",
+      "scope": "in",
+      "category": "word",
+      "doc": "mysql-too-many-connections",
+      "question": "max_connections 打满了，怎么还能连进去救火？",
+      "expect_points": ["socket", "保留"],
+      "note": "考应急通道"
+    },
+    {
+      "id": "r24",
+      "scope": "in",
+      "category": "word",
+      "doc": "mysql-too-many-connections",
+      "question": "连接泄漏和连接池配置过大，怎么区分？",
+      "expect_points": ["Sleep", "连接池"],
+      "note": "考三类成因的区分"
+    },
+    {
+      "id": "r25",
+      "scope": "in",
+      "category": "word",
+      "doc": "mysql-too-many-connections",
+      "question": "临时提高 max_connections 需要重启数据库吗？",
+      "expect_points": ["不需要", "动态"],
+      "note": "考可变参数"
+    },
+    {
+      "id": "r26",
+      "scope": "in",
+      "category": "semantic",
+      "doc": "mysql-too-many-connections",
+      "question": "网站时不时报数据库连不上，可数据库本身看着还活着，重启应用能好一阵子又不行了，这是什么毛病？",
+      "expect_points": ["连接", "泄漏"],
+      "note": "不提 'max_connections' / 'Too many connections'"
+    },
+    {
+      "id": "r27",
+      "scope": "in",
+      "category": "word",
+      "doc": "k8s-crashloop",
+      "question": "Pod 一直 CrashLoopBackOff 怎么排查？",
+      "expect_points": ["日志", "退出码", "describe"],
+      "note": "考排查路径"
+    },
+    {
+      "id": "r28",
+      "scope": "in",
+      "category": "word",
+      "doc": "k8s-crashloop",
+      "question": "容器反复重启，怎么看它上一次崩溃前的日志？",
+      "expect_points": ["--previous"],
+      "note": "考那个关键参数"
+    },
+    {
+      "id": "r29",
+      "scope": "in",
+      "category": "word",
+      "doc": "k8s-crashloop",
+      "question": "Pod 重启次数很多，怎么确认是不是因为内存不够？",
+      "expect_points": ["OOMKilled", "memory"],
+      "note": "考 OOM 确认方式"
+    },
+    {
+      "id": "r30",
+      "scope": "in",
+      "category": "word",
+      "doc": "k8s-crashloop",
+      "question": "Liveness probe failed 会导致什么结果？",
+      "expect_points": ["重启", "探针"],
+      "note": "考最隐蔽的一类根因"
+    },
+    {
+      "id": "r31",
+      "scope": "out",
+      "category": "out",
+      "doc": null,
+      "question": "Kafka 消费组 lag 一直涨，怎么排查？",
+      "expect_points": [],
+      "note": "知识库完全没有消息队列内容，应拒答"
+    },
+    {
+      "id": "r32",
+      "scope": "out",
+      "category": "out",
+      "doc": null,
+      "question": "Redis 主从复制延迟很高怎么办？",
+      "expect_points": [],
+      "note": "知识库无 Redis"
+    },
+    {
+      "id": "r33",
+      "scope": "out",
+      "category": "out",
+      "doc": null,
+      "question": "怎么配置 Prometheus 的告警规则？",
+      "expect_points": [],
+      "note": "知识库无监控平台内容"
+    },
+    {
+      "id": "r34",
+      "scope": "out",
+      "category": "out",
+      "doc": null,
+      "question": "Nginx 怎么配置 HTTPS 证书？",
+      "expect_points": [],
+      "note": "★ 陷阱题：知识库有 nginx-502 但只讲 502，检索会命中 nginx 文档却不含答案。考的是'检索到了不相关内容时会怎样'"
+    },
+    {
+      "id": "r35",
+      "scope": "out",
+      "category": "out",
+      "doc": null,
+      "question": "如何优化 PostgreSQL 的慢查询？",
+      "expect_points": [],
+      "note": "知识库只有 MySQL/MariaDB 连接数问题"
+    },
+    {
+      "id": "r36",
+      "scope": "out",
+      "category": "out",
+      "doc": null,
+      "question": "Kubernetes HPA 怎么配置自动扩缩容？",
+      "expect_points": [],
+      "note": "★ 陷阱题：知识库有 k8s-crashloop 但只讲崩溃重启"
+    },
+    {
+      "id": "r37",
+      "scope": "out",
+      "category": "out",
+      "doc": null,
+      "question": "Elasticsearch 集群怎么扩容？",
+      "expect_points": [],
+      "note": "知识库无 ES"
+    },
+    {
+      "id": "r38",
+      "scope": "out",
+      "category": "out",
+      "doc": null,
+      "question": "Jenkins 流水线构建失败怎么排查？",
+      "expect_points": [],
+      "note": "知识库无 CI/CD"
+    },
+    {
+      "id": "r39",
+      "scope": "out",
+      "category": "out",
+      "doc": null,
+      "question": "怎么用 Terraform 管理云上资源？",
+      "expect_points": [],
+      "note": "知识库无 IaC"
+    },
+    {
+      "id": "r40",
+      "scope": "out",
+      "category": "out",
+      "doc": null,
+      "question": "Linux 内核参数 net.core.somaxconn 应该设成多少？",
+      "expect_points": [],
+      "note": "★ 陷阱题：看起来是 Linux 运维，但知识库里没有任何内核调优内容。专治'看起来相关就硬答'"
+    }
+  ]
+}

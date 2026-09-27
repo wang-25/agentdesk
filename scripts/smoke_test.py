@@ -73,7 +73,7 @@ def brief(exc: Exception) -> str:
 # 第一层：运行环境
 # ============================================================
 def check_env():
-    print("\n[1/8] 运行环境　—— Python 与依赖包")
+    print("\n[1/9] 运行环境　—— Python 与依赖包")
 
     v = sys.version_info
     record("环境", f"Python {v.major}.{v.minor}.{v.micro}",
@@ -112,7 +112,7 @@ def check_env():
 # 第二层：模型连通
 # ============================================================
 def check_model():
-    print("\n[2/8] 模型连通　—— 真实发一次请求")
+    print("\n[2/9] 模型连通　—— 真实发一次请求")
 
     try:
         from app.llm import chat
@@ -141,7 +141,7 @@ def check_model():
 # 第三层：检索与问答（RAG）
 # ============================================================
 def check_rag():
-    print("\n[3/8] 检索与问答　—— RAG 全链路")
+    print("\n[3/9] 检索与问答　—— RAG 全链路")
 
     try:
         from app.rag.pipeline import load_store, answer
@@ -189,7 +189,7 @@ def check_rag():
 # 第四层：Agent（工具 + 编排）
 # ============================================================
 def check_agent(full: bool = False):
-    print("\n[4/8] Agent 层　—— 工具注册表与编排引擎")
+    print("\n[4/9] Agent 层　—— 工具注册表与编排引擎")
 
     # ---- 工具注册表 ----
     try:
@@ -342,7 +342,7 @@ def check_agent(full: bool = False):
 # 第五层：沙箱与人工确认（离线，不花钱，不需要服务在跑）
 # ============================================================
 def check_sandbox(full: bool = False):
-    print("\n[5/8] 沙箱与人工确认　—— 准入策略 + 审批状态机")
+    print("\n[5/9] 沙箱与人工确认　—— 准入策略 + 审批状态机")
 
     import tempfile
 
@@ -443,7 +443,7 @@ def check_sandbox(full: bool = False):
 # 第六层：可观测（离线，不花钱）
 # ============================================================
 def check_observability(full: bool = False):
-    print("\n[6/8] 可观测　—— trace 记录 + 成本核算 + 导出 payload")
+    print("\n[6/9] 可观测　—— trace 记录 + 成本核算 + 导出 payload")
 
     from app.observability import costs, langfuse_export, tracer
 
@@ -570,10 +570,136 @@ def check_observability(full: bool = False):
 
 
 # ============================================================
-# 第七层：MCP Server（把工具暴露成标准协议）
+# 第七层：评测（离线自检评测资产本身，不花钱）
+# ============================================================
+def check_evaluation(full: bool = False):
+    print("\n[7/9] 评测　—— 评测集 + 判定器（离线部分不花钱）")
+
+    # ---- 1. 评测集能载入，且标注完整 ----
+    try:
+        import json
+        from collections import Counter
+
+        data = json.loads((PROJECT_ROOT / "eval" / "rag_eval_set.json")
+                          .read_text(encoding="utf-8"))
+        cases = data["cases"]
+        scopes = Counter(c["scope"] for c in cases)
+        cats = Counter(c["category"] for c in cases)
+
+        # ★ 标注完整性：库内题必须有标准文档，库外题必须没有。
+        #   标错了会直接污染指标 —— 而这类错误**不会报错**，
+        #   只会让分数悄悄变得不可信。所以用断言守住。
+        bad = []
+        for c in cases:
+            if c["scope"] == "in" and not c.get("doc"):
+                bad.append(f"{c['id']} 库内却无标准文档")
+            if c["scope"] == "out" and c.get("doc"):
+                bad.append(f"{c['id']} 库外却有标准文档")
+
+        record("评测", f"评测集载入（{len(cases)} 条）", not bad,
+               f"库内 {scopes['in']} / 库外 {scopes['out']}"
+               f"　词面 {cats['word']} · 语义 {cats['semantic']} · 库外 {cats['out']}"
+               + ("" if not bad else f"　标注问题：{bad[:3]}"))
+    except Exception as e:
+        record("评测", "评测集载入", False, brief(e))
+
+    # ---- 2. 规则判定器：正例反例都要对 ----
+    # ★ 判定器是"尺子"。尺子不准，量出来的数字全是假的。
+    #   所以这里用**已知答案**的正反例去测它，两边都要判对。
+    try:
+        from app.evaluation import judges as J
+
+        ctx = ("[1] 来源：docker-exit-code.md\n"
+               "| 137 | 被 SIGKILL 杀掉（128+9）| 被 OOM Killer 杀 |\n"
+               "退出码 143 表示收到 SIGTERM（128+15）")
+
+        cite_cases = [
+            ("引用 [1][2] 且范围内 → 应通过", "[1][2]", 5, True),
+            ("引用 [7] 超出范围 → 应发现", "[7]", 5, False),
+            ("一个引用都不给 → 应发现", "无", 5, False),
+            ("正文里的 [137] 不是引用 → 应通过", "[1][137]", 5, True),
+        ]
+        bad_c = 0
+        for label, tail, n_hits, want in cite_cases:
+            got = J.check_citations(f"结论是 OOM。{tail}", n_hits)["ok"]
+            if got != want:
+                bad_c += 1
+                print(f"      ✗ {label}：期望 {want}，实际 {got}")
+        record("评测", f"引用判定 {len(cite_cases)} 个正反例", bad_c == 0,
+               "正反例全对" if bad_c == 0 else f"{bad_c} 个不符预期")
+
+        num_cases = [
+            ("资料里有的数字 → 应通过", "退出码 137 表示被 SIGKILL", True),
+            ("资料里没有的数字 → 应发现", "退出码 139 表示段错误", False),
+            ("主机名里的数字不算 → 应通过", "web-01 上的容器", True),
+        ]
+        bad_n = sum(1 for _, a, w in num_cases
+                    if J.check_numbers(a, ctx)["clean"] != w)
+        for label, a, w in num_cases:
+            got = J.check_numbers(a, ctx)["clean"]
+            if got != w:
+                print(f"      ✗ {label}：期望 {w}，实际 {got}")
+        record("评测", f"数值判定 {len(num_cases)} 个正反例", bad_n == 0,
+               "正反例全对" if bad_n == 0 else f"{bad_n} 个不符预期")
+
+        # 这两条长文本是**第一轮评测的真实误报原文**，固化成断言守着。
+        # 当时 40 条里有 7 条被判成"明明有资料却拒答"，翻开一看全是
+        # 正常回答末尾的「补充说明」—— 判定规则的作用范围划错了。
+        long_answer = (
+            "# Nginx 502 排查\n\n## 结论\n`upstream timed out` 表示上游处理超时，"
+            "超过 `proxy_read_timeout`（默认 60 秒）。[1][2]\n\n"
+            "## 处理方向\n- 查上游慢在哪里；必要时调大 `proxy_read_timeout`。[1]\n"
+            "- 根治思路：上游慢 → 加缓存、拆接口、加机器。[2]\n\n"
+            "## 补充说明\n\n参考资料中未出现相互冲突的内容。"
+            "需要注意的是，`upstream timed out` 也可能是上游内存不足导致的。[3]"
+        )
+        abs_cases = [
+            ("明确拒答 → 应识别",
+             "知识库中没有相关内容，无法回答该问题。", True),
+            ("正常作答 → 不应误判",
+             "先执行 df -h 看哪个分区满了。", False),
+            ("普通的「没有」→ 不应误判",
+             "如果进程没有起来，先看日志。", False),
+            # ★ 回归：正常回答**末尾**的补充说明里出现「参考资料中未」，不算拒答
+            ("有实质内容 + 末尾边界声明 → 不应误判为拒答", long_answer, False),
+            # ★ 回归：短回答里出现弱句式，没有实质内容 → 算拒答
+            ("短回答 + 资料中未提及 → 应识别为拒答",
+             "资料中没有提及这个内容，无法回答。", True),
+        ]
+        bad_a = sum(1 for _, a, w in abs_cases
+                    if J.check_abstention(a)["abstained"] != w)
+        for label, a, w in abs_cases:
+            got = J.check_abstention(a)["abstained"]
+            if got != w:
+                print(f"      ✗ {label}：期望 {w}，实际 {got}")
+        record("评测", f"拒答判定 {len(abs_cases)} 个正反例", bad_a == 0,
+               "正反例全对（含「末尾补充说明不算拒答」的回归用例）"
+               if bad_a == 0 else f"{bad_a} 个不符预期")
+    except Exception as e:
+        record("评测", "规则判定器", False, brief(e))
+
+    # ---- 3. 模型判定器：花钱项，只在 --full 下跑 ----
+    if not full:
+        record("评测", "判定器自校验（3 次模型调用）", False,
+               "加 --full 才会跑：python scripts/smoke_test.py --full",
+               skipped=True)
+        return
+
+    try:
+        from app.evaluation import judges as J
+        v = J.verify_judge(verbose=False)
+        record("评测", f"★ 判定器自校验 {v['passed']}/{v['total']}", v["ok"],
+               "好答案 / 跑题 / 编造 三类都能判对" if v["ok"]
+               else f"判定器不可信：{[c['name'] for c in v['cases'] if not c['ok']]}")
+    except Exception as e:
+        record("评测", "判定器自校验", False, brief(e))
+
+
+# ============================================================
+# 第八层：MCP Server（把工具暴露成标准协议）
 # ============================================================
 def check_mcp(full: bool = False):
-    print("\n[7/8] MCP Server　—— 工具的标准协议出口")
+    print("\n[8/9] MCP Server　—— 工具的标准协议出口")
 
     # ---- 1. 服务端能导入、工具注册正确 ----
     try:
@@ -616,10 +742,10 @@ def check_mcp(full: bool = False):
 
 
 # ============================================================
-# 第六层：HTTP 服务（需要服务已在运行）
+# 第九层：HTTP 服务（需要服务已在运行）
 # ============================================================
 def check_http(full: bool = False):
-    print("\n[8/8] HTTP 服务　—— 13 个接口")
+    print("\n[9/9] HTTP 服务　—— 13 个接口")
 
     import httpx
 
@@ -793,7 +919,7 @@ def summarize():
     print("  自检汇总")
     print("=" * 62)
 
-    layers = ["环境", "模型", "检索", "问答", "工具", "编排", "校验", "沙箱", "审批", "观测", "MCP", "服务", "接口"]
+    layers = ["环境", "模型", "检索", "问答", "工具", "编排", "校验", "沙箱", "审批", "观测", "评测", "MCP", "服务", "接口"]
     for layer in layers:
         rows = [r for r in results if r[0] == layer]
         if not rows:
@@ -820,7 +946,7 @@ def summarize():
         print("  ✅ 已检查的项目全部通过。")
         print(f"  ⏭  有 {len(skipped)} 项被跳过（服务没在跑 / 未加 --full），可复跑。")
     else:
-        print("  ✅ 全部通过。八层技术栈都在工作。")
+        print("  ✅ 全部通过。九层技术栈都在工作。")
     print("=" * 62)
     return 1 if failed else 0
 
@@ -829,7 +955,7 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="AgentDesk 全链路自检（五层：环境/模型/检索/Agent/接口）")
+        description="AgentDesk 全链路自检（九层：环境/模型/检索/Agent/沙箱/观测/评测/MCP/接口）")
     parser.add_argument("--full", action="store_true",
                         help="额外跑一次真实 Agent 调用（约 7k token，默认跳过）")
     args = parser.parse_args()
@@ -846,6 +972,7 @@ def main():
              lambda: check_agent(args.full),
              lambda: check_sandbox(args.full),
              lambda: check_observability(args.full),
+             lambda: check_evaluation(args.full),
              lambda: check_mcp(args.full),
              lambda: check_http(args.full)]
     for step in steps:
