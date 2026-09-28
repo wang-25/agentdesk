@@ -583,18 +583,38 @@ def _parse_uptime(text: str) -> dict:
 def _parse_free(text: str) -> dict:
     """解析 `free -m` 的 Mem 行，单位 MB。
 
-    ★ available 取第 7 列（内核估算的"真正可用"），而不是第 3 列 free。
-      两者差得很远：free 不含可回收的 buff/cache，
-      用它判断内存够不够会得出"内存快没了"的错误结论。
+    ★ 为什么要看 `available` 而不是 `free`：
+      两者差得很远。`free` 不含可回收的 buff/cache，
+      拿它判断内存够不够，会得出"内存快没了"的错误结论。
+
+    ★ 为什么按表头找列号，而不是写死下标（这里踩过一次）：
+      `Mem:` 这个标签本身不含数字，所以 `re.findall(r"\\d+", line)` 只返回
+      **6 个数**（下标 0–5）。曾经按"available 是第 7 列"写死成 `nums[6]`，
+      结果越界后静默回退到 `nums[2]`（也就是 free）——
+      报出来的数字看着完全正常，只是含义错了。
+      **列号写死的解析，错了不会报错，只会悄悄给错值。**
+      而且不带 available 的老版本 free 列数本来就不一样。
     """
-    for line in (text or "").splitlines():
+    lines = (text or "").splitlines()
+    idx_avail = None
+    for line in lines:
+        if "available" in line:
+            idx_avail = line.split().index("available")
+            break
+    for line in lines:
         if line.strip().startswith("Mem:"):
             nums = re.findall(r"\d+", line)
-            if len(nums) >= 3:
-                total, used = int(nums[0]), int(nums[1])
-                avail = int(nums[6]) if len(nums) >= 7 else int(nums[2])
-                return {"mem_total_mb": total, "mem_used_mb": used,
-                        "mem_avail_mb": avail}
+            if len(nums) < 3:
+                return {}
+            out = {"mem_total_mb": int(nums[0]), "mem_used_mb": int(nums[1])}
+            if idx_avail is not None and idx_avail < len(nums):
+                out["mem_avail_mb"] = int(nums[idx_avail])
+            else:
+                # 老版本 free 没有 available 列 —— 退回 free，并**标出来**，
+                # 免得下游把它当成 available 用。
+                out["mem_avail_mb"] = int(nums[2])
+                out["mem_avail_is_free_fallback"] = True
+            return out
     return {}
 
 
