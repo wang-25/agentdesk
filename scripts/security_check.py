@@ -22,6 +22,10 @@ import os
 import sys
 from pathlib import Path
 
+# Windows 控制台：输出流 + 代码页都切 UTF-8（否则中文乱码）
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _console      # noqa: F401,E402
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 

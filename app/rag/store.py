@@ -235,7 +235,15 @@ class VectorStore:
         所以「n 个块的相似度」可以一次矩阵乘法算完。
         """
         if self.matrix is None or len(self.chunks) == 0:
-            return []
+            # ★ 必须返回**二元组**，和下面正常分支的 (下标列表, 相似度数组) 对齐。
+            #   这里原先是 `return []` —— 只有一项。
+            #   调用方写的是 `idxs, sims = self._rank_vector(...)`，
+            #   于是 matrix 为 None（比如向量后端不可用、索引里没建向量）时
+            #   会抛 ValueError: not enough values to unpack。
+            #   **函数的返回形状必须在所有分支上一致** ——
+            #   "空结果"也要用和"正常结果"一样的形状表达，而不是换一种类型。
+            #   （下面的 _rank_bm25 一开始就是对的：return [], None）
+            return [], None
         q = self.embedder.encode_one(query)
         sims = self.matrix @ q                      # (n,)
         order = np.argsort(-sims)[:limit]

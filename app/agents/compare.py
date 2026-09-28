@@ -271,12 +271,11 @@ def build_report(comparisons: list) -> str:
     lg_calls = sum(c["langgraph"]["tool_calls"] for c in valid)
     hw_time = sum(c["handwritten"]["elapsed_ms"] for c in valid) / 1000
     lg_time = sum(c["langgraph"]["elapsed_ms"] for c in valid) / 1000
-    lg_tokens = sum(c["langgraph"]["usage"].get("total_tokens", 0)
-                    for c in comparisons)
-    hw_calls = sum(c["handwritten"]["tool_calls"] for c in comparisons)
-    lg_calls = sum(c["langgraph"]["tool_calls"] for c in comparisons)
-    hw_time = sum(c["handwritten"]["elapsed_ms"] for c in comparisons) / 1000
-    lg_time = sum(c["langgraph"]["elapsed_ms"] for c in comparisons) / 1000
+    # ★ 这里原先在下面又写了一遍同样六个变量，而且口径换成了 comparisons ——
+    #   同一张"合计"表里，token 用的是 valid（剔了失败用例），
+    #   调用数/耗时用的却是 comparisons（含失败用例）。两半互相打架，
+    #   而且上面那段"必须剔除失败用例"的注释当场被推翻。
+    #   删掉重复块：**同一份合计只能有一个口径。**
 
     lines += [
         "",

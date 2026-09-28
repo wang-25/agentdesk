@@ -56,6 +56,14 @@ TYPE_TOOL = "tool"        # 一次工具调用
 TYPE_AGENT = "agent"      # 一个 Agent 节点跑完（意图/诊断/校验/处置…）
 TYPE_FLOW = "flow"        # 一段流程（如告警归一化）
 
+# ★ 下面两个是为「写操作生命周期」补的（原先这一段在 trace 里完全不可见）。
+#   背景：审计日志回答了"谁在什么时候做了什么"，但它回答不了
+#   "这次运行里 Agent 想干什么、卡在哪一步"。而写操作恰恰是最需要
+#   被观察的一环 —— 之前 by_span_type 里只有 llm / tool，
+#   审批与容器执行一个 span 都没有。
+TYPE_APPROVAL = "approval"  # 审批单的生命周期（被拒 / 已提交待批）
+TYPE_SANDBOX = "sandbox"    # 一次沙箱执行（容器 / 本机 subprocess）
+
 _lock = threading.Lock()
 
 # ---- 上下文 ----
@@ -300,8 +308,17 @@ def trace(name: str, question: str = "", batch: bool = False, **attrs):
             #   全部求和会重复计数 —— "归并"和"汇总"必须配套改，漏一半就错。
             usage = sum_usage([s.get("usage") for s in spans
                                if s.get("parent_id") is None])
-            from app.observability.costs import cost_of
-            cost = cost_of(usage)
+            # ★ 但**算钱不能按顶层 span 算**：只有叶子 span（真正发起模型调用那层）
+            #   的 attrs 里才有"这次到底用了哪个模型"。顶层 agent span 的 usage 是从
+            #   子 span 归并上来的，模型信息已经丢了 —— 拿它查单价只能退回默认模型，
+            #   于是"请求 deepseek-chat、服务端实际用 deepseek-flash" 这类偏差
+            #   永远修不掉（实测确实如此，两个模型单价不同）。
+            #   叶子 = 没有任何 span 的 parent_id 指向它。
+            from app.observability.costs import cost_of, model_of_span
+            parent_ids = {s.get("parent_id") for s in spans}
+            leaves = [s for s in spans if s.get("span_id") not in parent_ids]
+            cost = sum(cost_of(s.get("usage") or {}, model_of_span(s))
+                       for s in leaves)
             record = {
                 "kind": "trace", "trace_id": tid, "name": name,
                 # batch=True 的 trace 会计入成本，但不计入延迟统计（见上方说明）
@@ -405,16 +422,34 @@ def read_recent(limit: int = 800) -> list:
 
 
 def recent_traces(limit: int = 20) -> list:
-    """最近的 trace 汇总（不含 spans，列表视图用）。新的在前。"""
-    traces = [r for r in read_recent(limit=limit * 6) if r.get("kind") == "trace"]
-    seen, out = set(), []
-    for t in reversed(traces):
-        if t["trace_id"] in seen:
-            continue
-        seen.add(t["trace_id"])
-        out.append(t)
-        if len(out) >= limit:
-            break
+    """最近的 trace 汇总（不含 spans，列表视图用）。新的在前。
+
+    ★ 不能固定按 limit×N 读原始记录再筛 —— 这一点踩过：
+
+      文件里同时有 `kind=trace` 和 `kind=span` 两种行（散装 span 是崩溃兜底，
+      见 span() 末尾的写入）。两者比例**随观测粒度变化**：每加一层观测，
+      每条 trace 的 span 就更多，trace 在文件里占比就更低。
+
+      原先写死 `limit * 6`。实测 ratio 约 5:1 时勉强够；一旦 span 变多，
+      就可能出现「接口说最近 50 次 trace，实际只返回 33 次」——
+      而且**不报错、不提示**，纯粹静默少给。
+
+      改成逐步扩读：不够就换个更大的倍数再读，直到凑够或读满上限。
+      代价是极端情况下多读一两次文件（尾部 2MB，很便宜），
+      换来的是"接口承诺多少就给多少"。
+    """
+    for factor in (6, 20, 60):
+        traces = [r for r in read_recent(limit=limit * factor)
+                  if r.get("kind") == "trace"]
+        seen, out = set(), []
+        for t in reversed(traces):
+            tid = t.get("trace_id")
+            if not tid or tid in seen:
+                continue
+            seen.add(tid)
+            out.append(t)
+            if len(out) >= limit:
+                return out
     return out
 
 

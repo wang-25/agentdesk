@@ -31,15 +31,13 @@ import time
 from pathlib import Path
 
 # ============================================================
-# 零、Windows 中文环境：把输出流强制成 UTF-8
+# 零、Windows 中文环境：输出流 + 控制台代码页，一起切 UTF-8
 # ============================================================
-# 中文 Windows 终端默认 GBK，打印 ✅❌ 这类符号可能直接抛
-# UnicodeEncodeError 把脚本打断。reconfigure 一次解决。
-for _stream in (sys.stdout, sys.stderr):
-    try:
-        _stream.reconfigure(encoding="utf-8")
-    except Exception:
-        pass
+# 中文 Windows 终端默认 GBK。**只 reconfigure 输出流是治不了本的** ——
+# 控制台自己的代码页仍是 936，会把 UTF-8 字节按 GBK 解释，中文照样乱码。
+# 两层都要切，所以这件事统一交给 scripts/_console.py（含代码页切换）。
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _console      # noqa: F401,E402
 
 # 让脚本不管从哪个目录运行，都能 import 到 app 包
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -497,23 +495,31 @@ def check_observability(full: bool = False):
     # ---- 1. trace + 嵌套 span 的记录与聚合 ----
     started_count = 0
     try:
+        # ★ 结构必须和真实运行一致：**usage 落在叶子 span 上**。
+        #   原先这里把 usage 直接挂在"有子节点的 agent span"上（intent），
+        #   而真实运行里 token 永远产生在最内层那次模型调用（llm span）上，
+        #   再向上归并。成本核算现在按叶子 span 归因（只有叶子知道用了哪个模型），
+        #   所以旧写法的成本会算成 0 —— 是**测试用例不真实**，不是代码错了。
         with tracer.trace("smoke", question="自检用例") as tid:
             with tracer.span(tracer.TYPE_AGENT, name="intent") as sp:
-                sp.set_usage({"prompt_tokens": 100, "completion_tokens": 20,
-                              "prompt_cache_hit_tokens": 60,
-                              "prompt_cache_miss_tokens": 40})
+                with tracer.span(tracer.TYPE_LLM, name="chat_step") as lsp:
+                    lsp.set_usage({"prompt_tokens": 100, "completion_tokens": 20,
+                                   "prompt_cache_hit_tokens": 60,
+                                   "prompt_cache_miss_tokens": 40})
                 with tracer.span(tracer.TYPE_TOOL, name="check_disk") as tsp:
                     tsp.set("host", "web-01")
         traces = tracer.recent_traces(limit=5)
         t = next((x for x in traces if x["trace_id"] == tid), None)
         ok_trace = t is not None
-        spans_ok = ok_trace and t.get("span_count") == 2 and len(t.get("spans") or []) == 2
+        spans_ok = ok_trace and t.get("span_count") == 3 and len(t.get("spans") or []) == 3
         # ★ 按 name 找，不按位置 —— spans 是按「结束顺序」收集的，
         #   内层 span 先结束先入列，位置断言会随嵌套方向翻反
-        by_name = {sp.get("name"): sp for sp in (t.get("spans") or []) if t}
-        parent_ok = (spans_ok
-                     and (by_name.get("check_disk", {}).get("parent_id")
-                          == by_name.get("intent", {}).get("span_id")))
+        by_name = {sp.get("name"): sp for sp in (t.get("spans") or [])} if t else {}
+        intent_id = by_name.get("intent", {}).get("span_id")
+        parent_ok = (spans_ok and intent_id
+                     and all(by_name.get(n, {}).get("parent_id") == intent_id
+                             for n in ("chat_step", "check_disk")))
+        # 叶子 llm span 的 usage 应当被归并到顶层（trace 总量）
         usage_ok = (ok_trace and t.get("usage", {}).get("prompt_tokens") == 100)
         cost_ok = ok_trace and (t.get("cost_cny") or 0) > 0
         record("观测", "trace + 嵌套 span 记录", ok_trace and spans_ok,
@@ -581,12 +587,27 @@ def check_observability(full: bool = False):
         record("观测", "无 trace 时的 span", False, brief(e))
 
     # ---- 4. 成本：缓存命中折扣要算进去 ----
+    # ★ 这里不再硬编码总价。原先断言 `abs(c - 0.0048) < 1e-9` ——
+    #   而 0.0048 是按**当时的价表**手算出来的，价格一核对（本次就把缓存命中价
+    #   从 ¥0.5 改成 ¥0.02，差 25 倍）这条自检就红，而它想验的其实是
+    #   「折扣有没有生效」，不是「总价等于多少」。
+    #   **断言要盯住"性质"，不要盯住"当时算出来的那个数"。**
+    import datetime as _dt
+    at = _dt.datetime(2026, 9, 28, 3, 0, tzinfo=costs.BEIJING)   # 固定为空闲时段
     u = {"prompt_tokens": 1000, "prompt_cache_hit_tokens": 800,
          "prompt_cache_miss_tokens": 200, "completion_tokens": 500}
-    c = costs.cost_of(u)
-    # 期望：800×0.5 + 200×2 + 500×8 = 400+400+4000 = 4800 / 1M = 0.0048
-    record("观测", "成本核算（含缓存折扣）", abs(c - 0.0048) < 1e-9,
-           f"¥{c:.6f}（缓存 80% 时比不算折扣省一半以上）")
+    c = costs.cost_of(u, "deepseek-flash", at)
+    c_flat = costs.cost_of({**u, "prompt_cache_hit_tokens": 0,
+                            "prompt_cache_miss_tokens": 1000},
+                           "deepseek-flash", at)
+    saved = (1 - c / c_flat) if c_flat else 0.0
+    record("观测", "成本核算（缓存命中折扣生效）", c > 0 and saved > 0.2,
+           f"¥{c:.6f}，比全部按未命中算省 {saved:.0%}")
+
+    # 别名归一：请求名与实际服务的模型必须落到同一笔账上
+    alias_ok = abs(costs.cost_of(u, "deepseek-chat", at) - c) < 1e-12
+    record("观测", "成本按返回的模型计价（别名归一）", alias_ok,
+           "deepseek-chat → deepseek-flash，同一笔账")
 
     # ---- 5. Langfuse 导出 payload 形状（离线构造，不联网） ----
     fake = {"trace_id": "tr-x", "name": "t", "question": "q",
@@ -792,7 +813,10 @@ def check_mcp(full: bool = False):
 # 第九层：HTTP 服务（需要服务已在运行）
 # ============================================================
 def check_http(full: bool = False):
-    print("\n[9/9] HTTP 服务　—— 22 个接口")
+    # ★ 标题里不再写死接口数量。
+    #   原先写「22 个接口」，实际只探了 12 个 —— 典型的"标题比内容好看"，
+    #   而且会让人以为 22 个都验证过了。真实条数在末尾按实际记录算出来。
+    print("\n[9/9] HTTP 服务　—— 22 个接口里抽测（末尾给出实际条数）")
 
     import httpx
 
@@ -939,6 +963,101 @@ def check_http(full: bool = False):
     except Exception as e:
         record("接口", "GET  /agent/graph", False, brief(e))
 
+    # ---- 下面六个都是只读的观测/状态接口，免费，没理由不测 ----
+    # ★ 补这一段的起因：本层原先标题写着「22 个接口」，实际只探了 12 个，
+    #   而 /sandbox、/approvals、/traces、/metrics/summary 这些**一个都没测**。
+    #   它们恰恰是最容易写坏又最不容易被发现的（聚合口径、状态字段）。
+    #   **自检覆盖不到的地方，就是下次出问题的地方。**
+
+    # GET /sandbox —— 顺便验 fail-closed 三件事都如实报出来
+    try:
+        r = httpx.get(f"{BASE_URL}/sandbox", timeout=15)
+        ok = r.status_code == 200
+        d = r.json() if ok else {}
+        record("接口", "GET  /sandbox（沙箱状态）", ok,
+               f"后端 {d.get('backend')}／隔离 {d.get('isolated')}"
+               f"／docker 可用 {d.get('docker_available')}" if ok
+               else f"HTTP {r.status_code}")
+    except Exception as e:
+        record("接口", "GET  /sandbox", False, brief(e))
+
+    # GET /metrics/summary —— 顺便验成本对账（这两个维度不能相加）
+    try:
+        r = httpx.get(f"{BASE_URL}/metrics/summary", params={"limit": 20},
+                      timeout=30)
+        ok = r.status_code == 200
+        d = r.json() if ok else {}
+        rec = d.get("reconcile") or {}
+        gap = max(abs(rec.get("by_type_gap") or 0),
+                  abs(rec.get("by_name_gap") or 0))
+        note = (f"{d.get('runs')} 次运行 · ¥{d.get('cost_cny')}"
+                f" · 对账偏差 {gap:.1%}")
+        if d.get("unpriced_models"):
+            note += f" · ⚠ 未定价模型 {d['unpriced_models']}"
+        record("接口", "GET  /metrics/summary（成本看板）", ok, note)
+    except Exception as e:
+        record("接口", "GET  /metrics/summary", False, brief(e))
+
+    # GET /traces + GET /traces/{id}
+    trace_id = None
+    try:
+        r = httpx.get(f"{BASE_URL}/traces", params={"limit": 3}, timeout=20)
+        ok = r.status_code == 200
+        d = r.json() if ok else {}
+        items = d.get("items") or []
+        trace_id = items[0].get("trace_id") if items else None
+        # 列表视图不该带 spans（几十个 span 会把列表页撑爆）
+        leaked = any("spans" in it for it in items)
+        record("接口", "GET  /traces（运行列表）", ok and not leaked,
+               f"{d.get('count')} 条，列表不含 spans" if ok
+               else f"HTTP {r.status_code}")
+    except Exception as e:
+        record("接口", "GET  /traces", False, brief(e))
+
+    if trace_id:
+        try:
+            r = httpx.get(f"{BASE_URL}/traces/{trace_id}", timeout=20)
+            ok = r.status_code == 200
+            d = r.json() if ok else {}
+            record("接口", "GET  /traces/{id}（单次详情）", ok,
+                   f"{d.get('span_count')} 个 span · 用时 {d.get('elapsed_ms')}ms"
+                   if ok else f"HTTP {r.status_code}")
+        except Exception as e:
+            record("接口", "GET  /traces/{id}", False, brief(e))
+    else:
+        record("接口", "GET  /traces/{id}（无 trace 可查）", False,
+               "还没有任何 trace，先跑一次 /chat 或 /agent/ask",
+               skipped=True)
+
+    # GET /approvals + GET /approvals/{id}
+    approval_id = None
+    try:
+        r = httpx.get(f"{BASE_URL}/approvals", params={"limit": 3}, timeout=20)
+        ok = r.status_code == 200
+        d = r.json() if ok else {}
+        items = d.get("items") or []
+        approval_id = items[0].get("id") if items else None
+        counts = d.get("counts") or {}
+        record("接口", "GET  /approvals（审批单）", ok,
+               f"返回 {len(items)} 张 · 状态分布 {counts}" if ok
+               else f"HTTP {r.status_code}")
+    except Exception as e:
+        record("接口", "GET  /approvals", False, brief(e))
+
+    if approval_id:
+        try:
+            r = httpx.get(f"{BASE_URL}/approvals/{approval_id}", timeout=20)
+            ok = r.status_code == 200
+            d = r.json() if ok else {}
+            record("接口", "GET  /approvals/{id}（单张详情）", ok,
+                   f"状态 {d.get('status')} · 风险 {d.get('risk')}" if ok
+                   else f"HTTP {r.status_code}")
+        except Exception as e:
+            record("接口", "GET  /approvals/{id}", False, brief(e))
+    else:
+        record("接口", "GET  /approvals/{id}（无审批单可查）", False,
+               "还没有审批单，先让 Agent 提一次写操作", skipped=True)
+
     # POST /agent/ask —— 真跑一轮 Agent，比较贵，只在 --full 时跑
     if full:
         try:
@@ -956,6 +1075,18 @@ def check_http(full: bool = False):
     else:
         record("接口", "POST /agent/ask（默认跳过）", False,
                "加 --full 参数才会跑（一次约 7k token）", skipped=True)
+
+    # ---- 如实报出本层实际探测了多少 ----
+    # 这段是有意加的：标题曾写「22 个接口」而实际只探 12 个，
+    # 于是"自检全绿"给人一种"22 个接口都验证过了"的错觉。
+    # **让脚本自己数、自己说**，就不会再出现标题和事实对不上。
+    probed = [r for r in results if r[0] == "接口"]
+    ok_n = len([r for r in probed if r[2] and not r[4]])
+    skip_n = len([r for r in probed if r[4]])
+    print(f"      → 本层实际探测 {len(probed)} 个：通过 {ok_n}，跳过 {skip_n}")
+    print("        OpenAPI 共 22 个，未覆盖的是**需要副作用的写操作**"
+          "（/rag/index 与 approvals 的 approve / reject / execute）——")
+    print("        它们在 security_check.py 的 23 项用例里单独验证，不在本层重复跑。")
 
 
 # ============================================================

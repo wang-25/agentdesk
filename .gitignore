@@ -62,3 +62,12 @@ deploy/langfuse.env
 docs/knowledge-points.md
 docs/python-reference.md
 practice/
+
+# ★ 这个仓库是**作品集**，不是学习档案。面试/备考材料一律不进仓库 ——
+#   文件本身保留在 E:/Workbuddy/ai agent/个人备考笔记/，只是不发布。
+#   加这几条的直接原因：曾有一批「面试准备」文档被放进仓库目录，
+#   而 .gitignore 没覆盖，一条 `git add -A` 就会把它们一起推上公开仓库。
+#   **"我没打算提交"和"提交不上去"是两件事，后者才是可靠的。**
+面试/
+INTERVIEW_*.md
+TESTING_REPORT.md

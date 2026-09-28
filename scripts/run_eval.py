@@ -54,6 +54,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+# Windows 控制台：输出流 + 代码页都切 UTF-8（否则中文乱码）
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _console      # noqa: F401,E402
+
 from app.evaluation import judges                      # noqa: E402
 from app.llm import ModelError, chat                    # noqa: E402
 from app.observability import tracer                    # noqa: E402

@@ -161,6 +161,11 @@ def chat(messages, temperature=0.7, timeout=60) -> str:
 
         data = resp.json()
         sp.set_usage(data.get("usage") or {})
+        # ★ 记下**服务端实际返回的模型名**，它可能和我们请求的不是同一个
+        #   （实例：请求 deepseek-chat，返回 deepseek-flash）。
+        #   成本必须按返回的这个算 —— 单价表是按真实模型定价的。
+        #   没有活跃 trace 时 _NullSpan 会静默吞掉，无副作用。
+        sp.set("model_served", data.get("model") or cfg["model"])
         return data["choices"][0]["message"]["content"]
 
 
@@ -234,6 +239,8 @@ def chat_step(messages, tools=None, temperature=0, timeout=90) -> dict:
         sp.set_usage(out["usage"])
         # 这个分支有没有产生工具调用，是 Agent 行为分析最有用的一个维度
         sp.set("made_tool_calls", bool(choice["message"].get("tool_calls")))
+        # ★ 同上：服务端返回的模型名要落进 span，成本按它算。
+        sp.set("model_served", out["model"])
         return out
 
 

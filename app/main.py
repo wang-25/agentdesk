@@ -7,28 +7,53 @@ AgentDesk 服务入口
 【运行方式】在 agentdesk 目录下执行：
     .venv\\Scripts\\python.exe -m uvicorn app.main:app --reload --port 8000
 
-【接口一览】
-    GET  /health          健康检查，供容器探活与监控使用
-    GET  /audit           读取审计日志（每次操作都留痕）
-    POST /chat            问答，一次性返回
-    POST /chat/stream     问答，SSE 流式返回（异步版）
-    POST /parse           意图解析，把一句人话转成结构化 JSON
-    POST /webhook/alert   告警驱动的入口 —— 无人值守自动诊断
-    GET  /rag/stats       知识库索引统计
-    POST /rag/index       重建索引
-    POST /rag/search      只检索不生成（排查检索质量用）
-    POST /rag/ask         RAG 问答，带引用溯源
-    GET  /agent/tools     Agent 能调用的工具清单（含风险等级）
-    GET  /agent/graph     导出状态图的 mermaid 定义
-    POST /agent/ask       ★ Agent 自主诊断（engine 可选三档）
-                          handwritten  手写 ReAct 循环
-                          langgraph    状态图（默认）
-                          supervisor   ★ 多 Agent 编排（意图/知识/诊断/校验/处置）
-    GET  /sandbox         沙箱状态 + 命令白名单（准入规则一览）
-    GET  /approvals       ★ 待人工确认的审批单列表
-    POST /approvals/{id}/approve   批准（必须填审批人）
-    POST /approvals/{id}/reject    驳回
-    POST /approvals/{id}/execute   执行已批准的命令（一次性）
+【接口一览】共 24 个业务路由，其中 22 个进 OpenAPI 文档。
+  为什么是 24 而不是 22：`GET /`（导航页）和 `GET /try`（在线试用页）是给人看的
+  页面，标了 `include_in_schema=False`，不进 OpenAPI 的路径表 ——
+  它们真实存在、能访问，只是不该混进接口清单里干扰视线。
+
+  健康与审计
+    GET  /health                    健康检查，供容器探活与监控使用
+    GET  /audit                     读取审计日志（每次操作都留痕）
+
+  基础模型能力
+    POST /chat                      问答，一次性返回
+    POST /chat/stream               问答，SSE 流式返回（异步版）
+    POST /parse                     意图解析，把一句人话转成结构化 JSON
+
+  告警驱动
+    POST /webhook/alert             告警驱动的入口 —— 无人值守自动诊断
+
+  知识库（RAG）
+    GET  /rag/stats                 索引统计
+    POST /rag/index                 重建索引
+    POST /rag/search                只检索不生成（排查检索质量用）
+    POST /rag/ask                   RAG 问答，带引用溯源
+
+  Agent
+    GET  /agent/tools               工具清单（含风险等级）
+    GET  /agent/graph               导出状态图的 mermaid 定义
+    POST /agent/ask                 ★ Agent 自主诊断（engine 可选三档）
+                                      handwritten  手写 ReAct 循环
+                                      langgraph    状态图（默认）
+                                      supervisor   ★ 多 Agent 编排
+
+  沙箱与人工确认（HITL）
+    GET  /sandbox                   沙箱状态 + 命令白名单（准入规则一览）
+    GET  /approvals                 待人工确认的审批单列表
+    GET  /approvals/{id}            单张审批单详情
+    POST /approvals/{id}/approve    批准（必须填审批人）
+    POST /approvals/{id}/reject     驳回
+    POST /approvals/{id}/execute    执行已批准的命令（一次性）
+
+  可观测
+    GET  /metrics/summary           成本与延迟聚合看板
+    GET  /traces                    最近运行列表
+    GET  /traces/{id}               单次运行的完整轨迹
+
+  页面（不进 OpenAPI）
+    GET  /                          导航页：这是什么、从哪开始试
+    GET  /try                       在线试用页：填问题、点按钮
 
 服务起来后打开 http://127.0.0.1:8000/docs 有自动生成的交互式文档。
 """
@@ -1361,19 +1386,23 @@ def approve(approval_id: str, req: ApprovalAction):
     """
     from app.sandbox import approvals
 
-    try:
-        rec = approvals.store().approve(approval_id, by=req.by, note=req.note)
-    except approvals.ApprovalError as e:
-        # 409 = 状态冲突（比如已经批过了）。用 409 不用 400，
-        # 因为"你这个请求本身没问题，是对象当前状态不允许"——
-        # 调用方看到 409 就知道该刷新一下状态，看到 400 会去改参数。
-        raise HTTPException(status_code=409, detail=str(e))
+    # ★ 观测：审批动作是一次**独立的人机交互**，单独成一条 trace。
+    #   理由和下面的 execute 接口一样：它不在 Agent 那次运行的上下文里。
+    with obs.trace("approval.approve", question=approval_id,
+                   approval_id=approval_id, by=req.by):
+        try:
+            rec = approvals.store().approve(approval_id, by=req.by, note=req.note)
+        except approvals.ApprovalError as e:
+            # 409 = 状态冲突（比如已经批过了）。用 409 不用 400，
+            # 因为"你这个请求本身没问题，是对象当前状态不允许"——
+            # 调用方看到 409 就知道该刷新一下状态，看到 400 会去改参数。
+            raise HTTPException(status_code=409, detail=str(e))
 
-    write_audit("approval.approved", {
-        "approval_id": approval_id, "by": req.by, "note": req.note,
-        "command": rec.get("command"), "fingerprint": rec.get("fingerprint"),
-    })
-    return rec
+        write_audit("approval.approved", {
+            "approval_id": approval_id, "by": req.by, "note": req.note,
+            "command": rec.get("command"), "fingerprint": rec.get("fingerprint"),
+        })
+        return rec
 
 
 @app.post("/approvals/{approval_id}/reject")
@@ -1381,20 +1410,43 @@ def reject(approval_id: str, req: ApprovalAction):
     """驳回一张审批单。驳回理由会被记录 —— 它是改进 Prompt 的素材。"""
     from app.sandbox import approvals
 
-    try:
-        rec = approvals.store().reject(approval_id, by=req.by, note=req.note)
-    except approvals.ApprovalError as e:
-        raise HTTPException(status_code=409, detail=str(e))
+    # 观测：和 approve 一样，单独成 trace（驳回也是写操作生命周期的一步）
+    with obs.trace("approval.reject", question=approval_id,
+                   approval_id=approval_id, by=req.by):
+        try:
+            rec = approvals.store().reject(approval_id, by=req.by, note=req.note)
+        except approvals.ApprovalError as e:
+            raise HTTPException(status_code=409, detail=str(e))
 
-    write_audit("approval.rejected", {
-        "approval_id": approval_id, "by": req.by, "note": req.note,
-        "command": rec.get("command"),
-    })
-    return rec
+        write_audit("approval.rejected", {
+            "approval_id": approval_id, "by": req.by, "note": req.note,
+            "command": rec.get("command"),
+        })
+        return rec
 
 
+# ★ 观测：把「执行一次写操作」包成一条独立的 trace。
+#
+#   为什么必须单独包：这个接口是**独立的 HTTP 请求** ——
+#   审批发生在 Agent 那次运行之后（可能过了几分钟，甚至是另一个人点的），
+#   所以它天然不在那次 Agent trace 的上下文里。
+#   不包的话，「容器真的执行了」这件事在 trace 里完全不存在（只有审计日志记了），
+#   而这恰恰是最该被追溯的一步：**真正改动系统的那一下**。
+#
+#   包上之后，被拒绝、指纹不匹配这类「没执行成功的尝试」也会留痕 ——
+#   trace() 会把异常记成 status=error。写操作的生命周期因此是完整的。
+#
+#   外层只负责开 trace，真正逻辑在 _execute_approved 里（不重新缩进整段代码，
+#   免得动到那几十行本来正确的校验逻辑）。
 @app.post("/approvals/{approval_id}/execute")
 def execute_approval(approval_id: str, req: ApprovalAction):
+    """执行一张**已批准**的审批单（外层只负责开 trace）。"""
+    with obs.trace("approval.execute", question=approval_id,
+                   approval_id=approval_id, by=req.by):
+        return _execute_approved(approval_id, req)
+
+
+def _execute_approved(approval_id: str, req: ApprovalAction):
     """执行一张**已批准**的审批单。
 
     【这里做三道校验，缺一道都不行】
@@ -1476,7 +1528,22 @@ def execute_approval(approval_id: str, req: ApprovalAction):
         raise HTTPException(status_code=409, detail=str(e))
 
     try:
-        result = executor.run(decision)
+        # ★ 观测：真正动手执行的那一下，单独一个 sandbox span。
+        #   里面记 backend / isolated / exit_code —— 这三个字段回答
+        #   "它到底是在真容器里跑的，还是退回了本机/仿真"。
+        #   沙箱不可用时 SandboxUnavailable 会被 span() 自动记成 status=error
+        #   然后原样抛出（观测层不吞业务异常），外面的 except 照常处理。
+        with obs.span(obs.TYPE_SANDBOX, name="sandbox.execute",
+                      command=rec["command"],
+                      isolation=decision.isolation) as sp:
+            result = executor.run(decision)
+            sp.set("backend", result.backend)
+            sp.set("isolated", bool(result.isolated))
+            sp.set("ok", bool(result.ok))
+            sp.set("exit_code", result.exit_code)
+            sp.set("elapsed_ms", result.elapsed_ms)
+            if not result.ok:
+                sp.set_error(result.error or f"退出码 {result.exit_code}")
     except executor.SandboxUnavailable as e:
         # 沙箱不可用 → **不降级执行**。记审计，如实返回失败。
         write_audit("approval.execute_failed", {

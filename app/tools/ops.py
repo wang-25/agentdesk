@@ -132,11 +132,23 @@ _DEFAULT_HOSTS = ["web-01", "db-01", "cache-01"]
 def _resolve_hosts() -> list:
     """决定"已知主机"是哪几台。
 
+    ★ 先分清两件**不是一回事**的东西：
+        ① 逻辑主机清单 —— 这支队里**存在哪几台**（Agent 能说出口的名字）
+        ② 可连接目标   —— 从这台机器**能连到哪几台**（真实地址与凭据）
+      "存在的"不一定"连得上"：真实运维里 db-01 摆在那儿，但你这台跳板机
+      未必有它的凭据。混为一谈会带来一个很隐蔽的后果 ——
+
+      踩过的坑：只配了 OPS_SSH_TARGETS(web-01)，于是 ① 被自动推导成
+      "已配目标的名字"，只剩 web-01。意图路由的提示词里就只列了 web-01，
+      模型于是把问题里的 db-01 / cache-01 当成**不存在的名字直接丢掉**
+      （评测里表现为 hosts 字段大面积为空）。
+      这不是模型变笨了，是**我们没告诉它这支队里有几台机器**。
+
     优先级：
-      1. OPS_HOSTS —— 显式清单（逗号分隔）
-      2. ssh 后端下已经配了 SSH 目标的名字 —— 配置即清单，不用两处维护，
-         而且能天然避免"配了却没生效"这种错
-      3. 默认三台 —— mock 用的仿真主机，也是没配任何东西时的兜底
+      1. OPS_HOSTS —— 显式清单（逗号分隔）。这是 ① 的正确答案，推荐写法。
+      2. ssh 后端下已配 SSH 目标的名字 —— 配置即清单的便捷写法。
+         注意它会把 ① 收窄成 ②，只在"确实只有这几台"时才对。
+      3. 默认三台 —— mock 用的仿真主机，也是没配任何东西时的兜底。
 
     默认仍然是原来那三台：**不配任何环境变量时，行为与之前完全一致。**
     """
@@ -873,9 +885,22 @@ def run_command(command: str, purpose: str = "") -> dict:
         return base
 
     # ---- 情况一：策略拒绝 ----
+    # ★ 观测：三条分支各开一个 span。
+    #   原先这里一个 span 都没有 —— 结果是 by_span_type 里只有 llm / tool，
+    #   「Agent 提议了一次写操作、被策略拒绝 / 转成审批单 / 真的执行了」
+    #   这条最该被看见的链路，在 trace 里完全看不见。
+    #   注意审计日志并不能替代它：审计回答"谁在何时做了什么"，
+    #   trace 回答"这次运行里它想干什么、走到哪一步"—— 两者是不同的问题。
+    from app.observability import tracer
+
     if decision.decision == policy.DENY:
         # 「拒绝」也是一种结果，要原样返回给模型 —— 它需要知道为什么、
         # 以及可以改用什么。抛异常就丢掉这些信息了。
+        with tracer.span(tracer.TYPE_APPROVAL, name="approval.denied",
+                         command=decision.command, rule=decision.rule_key,
+                         risk=decision.risk) as sp:
+            sp.set("decision", "deny")
+            sp.set_error(decision.reason)
         base["error"] = decision.reason
         base["hint"] = "这条命令不允许执行。请改用白名单里的等价做法，或优先使用专用工具。"
         return base
@@ -891,6 +916,13 @@ def run_command(command: str, purpose: str = "") -> dict:
             reason=decision.reason,
             tool="run_command",
         )
+        with tracer.span(tracer.TYPE_APPROVAL, name="approval.created",
+                         command=decision.command, rule=decision.rule_key,
+                         risk=decision.risk, isolation=decision.isolation) as sp:
+            sp.set("decision", "needs_approval")
+            sp.set("approval_id", rec["id"])
+            sp.set("expires_at", rec["expires_at"])
+            sp.set("executed", False)     # 这一条最容易被误读，显式记下来
         base["approval_id"] = rec["id"]
         base["expires_at"] = rec["expires_at"]
         base["hint"] = ("已提交人工审批，尚未执行。请在结果里告诉用户："
@@ -899,7 +931,15 @@ def run_command(command: str, purpose: str = "") -> dict:
         return base
 
     # ---- 情况三：只读命令，直接执行 ----
-    result = executor.run(decision)
+    with tracer.span(tracer.TYPE_SANDBOX, name="sandbox.run",
+                     command=decision.command, isolation=decision.isolation) as sp:
+        result = executor.run(decision)
+        sp.set("backend", result.backend)
+        sp.set("isolated", bool(result.isolated))
+        sp.set("ok", bool(result.ok))
+        sp.set("exit_code", result.exit_code)
+        if not result.ok:
+            sp.set_error(result.error or f"退出码 {result.exit_code}")
     base["executed"] = True
     base["result"] = result.to_dict()
     if not result.ok:

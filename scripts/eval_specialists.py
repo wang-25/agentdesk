@@ -38,6 +38,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+# Windows 控制台：输出流 + 代码页都切 UTF-8（否则中文乱码）
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _console      # noqa: F401,E402
+
 from app.agents.specialists import route_intent    # noqa: E402
 
 SET_PATH = PROJECT_ROOT / "eval" / "intent_set.json"
@@ -46,6 +50,21 @@ REPORT_DIR = PROJECT_ROOT / "eval" / "reports"
 # 参与评分的字段。顺序就是报告里的列顺序。
 FIELDS = ["task_type", "hosts", "services", "needs_live_data",
           "needs_knowledge"]
+
+
+def _fmt_value(v) -> str:
+    """把期望值/实际值渲染成报告里好读的样子。
+
+    json.dumps 会把字符串也带上引号（`"query"`），
+    在表格里读起来噪音大；这里只在需要消歧时才加结构符号。
+    """
+    if v is None:
+        return "null"
+    if isinstance(v, (list, tuple)):
+        return "[" + ", ".join(_fmt_value(x) for x in v) + "]"
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    return str(v)
 
 
 def compare(case: dict, got: dict) -> dict:
@@ -87,12 +106,6 @@ def compare(case: dict, got: dict) -> dict:
 
 
 def main(argv=None):
-    for stream in (sys.stdout, sys.stderr):
-        try:
-            stream.reconfigure(encoding="utf-8")
-        except Exception:
-            pass
-
     parser = argparse.ArgumentParser(description="意图路由 Agent 准确率评测")
     parser.add_argument("--limit", type=int, default=0, help="只跑前 N 条")
     parser.add_argument("--difficulty", default="",
@@ -140,6 +153,9 @@ def main(argv=None):
             "id": case["id"], "question": case["question"],
             "difficulty": diff, "all_ok": all_ok, "wrong": wrong,
             "marks": marks, "got": got,
+            # ★ 报告要打印"期望"，所以这里必须把期望值一起带上。
+            #   原先没带，报告只能用 marks（布尔判定）凑第二列 —— 于是列就错了。
+            "expect": case["expect"], "accept": case.get("accept") or {},
             "attempts": result["attempts"], "problems": result["problems"],
             "elapsed_ms": elapsed,
         })
@@ -233,6 +249,9 @@ def build_report(rows, field_hits, field_total, per_difficulty) -> str:
                      f"{'、'.join(r['wrong']) or '—'} |")
 
     lines += ["", "## 三、错例详情", ""]
+    lines += ["> 「期望」列里出现 `[a, b]` 表示该字段**声明了多个合理答案**"
+              "（用例里的 `accept`），落在这个范围内的都算对 ——"
+              "这类用例硬钉单一标准答案会制造假指标。", ""]
     bad = [r for r in rows if not r["all_ok"]]
     if not bad:
         lines.append("全部通过。")
@@ -244,8 +263,16 @@ def build_report(rows, field_hits, field_total, per_difficulty) -> str:
         lines.append("| 字段 | 期望 | 实际 |")
         lines.append("|---|---|---|")
         for f in r["wrong"]:
-            lines.append(f"| {f} | `{r['got'].get(f)}` | "
-                         f"`{r['marks'].get(f)}` |")
+            # ★ 两列原先写反了：第一列填的是 got（实际值），第二列填的是
+            #   marks[f]（布尔判定）。读者看到的是「期望 False」这种毫无意义的表，
+            #   而真正该看的"模型答成了什么"被塞进了标题写着「期望」的那一列。
+            #   现在按表头顺序填：期望 = 用例声明的答案，实际 = 模型给出的值。
+            if f in r["accept"]:
+                exp = r["accept"][f]          # 该字段声明了多个合理答案
+            else:
+                exp = r["expect"].get(f)
+            lines.append(f"| `{f}` | `{_fmt_value(exp)}` | "
+                         f"`{_fmt_value(r['got'].get(f))}` |")
         lines.append("")
         lines.append(f"模型给出的实际标签：`{json.dumps(r['got'], ensure_ascii=False)}`")
         lines.append("")

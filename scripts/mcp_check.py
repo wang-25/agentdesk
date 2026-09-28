@@ -32,15 +32,13 @@ MCP 协议层自检 —— 用官方客户端连自己
 
 import asyncio
 import json
+import os
 import sys
 from pathlib import Path
 
-# Windows 中文环境：输出流强制 UTF-8（否则打印 ✅❌ 可能直接抛异常）
-for _stream in (sys.stdout, sys.stderr):
-    try:
-        _stream.reconfigure(encoding="utf-8")
-    except Exception:
-        pass
+# Windows 控制台：输出流 + 代码页都切 UTF-8（否则中文乱码）
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _console      # noqa: F401,E402
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -101,10 +99,17 @@ async def run_check() -> int:
     print("  MCP 协议层自检　—— 用官方客户端连自己")
     print("=" * 62)
 
+    # ★ env 必须显式下发，否则这个自检测不了别的后端。
+    #   MCP 官方客户端的 stdio_client 在 env=None 时**不会继承父进程环境**，
+    #   它只传一小撮基础变量（HOME/PATH/SHELL/TERM…）。
+    #   所以 `OPS_BACKEND=mock python scripts/mcp_check.py` 里的 mock
+    #   会被静默丢掉 —— 子进程读 .env 拿到 ssh，你以为在测 mock，其实在测真机。
+    #   （同理，PYTHONIOENCODING 也靠这里传，见脚本开头对 Windows 乱码的处理。）
     params = StdioServerParameters(
         command=sys.executable,                 # 用当前 venv 的 python
         args=["-m", "app.mcp_server.server"],
         cwd=str(PROJECT_ROOT),                  # 保证能 import app 包
+        env={**os.environ, "PYTHONIOENCODING": "utf-8"},
     )
 
     print(f"\n[1/4] 启动子进程并握手")
@@ -167,17 +172,42 @@ async def run_check() -> int:
         record("call check_disk", False, brief(e))
 
     # 3.2 带多个参数 + 有默认值的
+    # ★ 这里原先写死 service="nginx" —— 那是 **mock 仿真数据里才有** 的服务名。
+    #   后果：自检在默认 mock 后端下永远是绿的，一接真实后端（ssh）立刻红：
+    #   真机上压根没有 nginx 这个 systemd 服务（nginx 跑在容器里，叫 wp-npm）。
+    #   这正是"测试用例与真实环境脱节"的典型样子 —— 绿灯是假的。
+    #
+    #   **测试用例不能依赖"只有某个后端才存在"的数据。**
+    #   改成先问一句"这台机器上跑着什么"，再从里面挑一个来 tail。
     try:
+        r = await session.call_tool("list_containers", {"host": "web-01"})
+        names = [c.get("name") for c in (unwrap(r).get("containers") or [])]
+        names = [n for n in names if n]
+    except Exception:
+        names = []
+
+    # 候选顺序：真实存在的容器 → 常见 systemd 服务。
+    # 容器排第一，是因为"日志在容器里"是眼下真实负载的常态 ——
+    # 宿主机 /var/log 往往是空的（nginx/mysql 全在容器内）。
+    candidates = names[:1] + ["docker", "sshd", "nginx"]
+    picked, data = None, {}
+    for cand in candidates:
         r = await session.call_tool("tail_log",
-                                    {"host": "web-01", "service": "nginx",
+                                    {"host": "web-01", "service": cand,
                                      "lines": 5})
         data = unwrap(r)
+        if not is_error(r) and (data.get("count") or 0) > 0:
+            picked = cand
+            break
+    if picked:
         matched = data.get("matched_patterns") or []
-        record("call tail_log(web-01, nginx, 5)", not is_error(r),
-               f"返回 {data.get('count')} 行，命中模式 "
-               f"{[m.get('meaning') for m in matched]}")
-    except Exception as e:
-        record("call tail_log", False, brief(e))
+        record(f"call tail_log(web-01, {picked}, 5)", True,
+               f"返回 {data.get('count')} 行（来源 {data.get('source')}）"
+               f"　命中模式 {[m.get('meaning') for m in matched]}")
+    else:
+        record("call tail_log(web-01, <自动发现>, 5)", False,
+               f"试过 {'、'.join(candidates)} 都没取到日志"
+               f"（最后一条提示：{data.get('hint')}）")
 
     # 3.3 走知识库（会加载 RAG 索引）
     try:

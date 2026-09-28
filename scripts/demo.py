@@ -2,10 +2,14 @@
 """现场演示：证明服务真的能用（真实调用模型）。"""
 import sys
 import time
+from pathlib import Path
 
 import httpx
 
-sys.stdout.reconfigure(encoding="utf-8")
+# Windows 控制台：输出流 + 代码页都切 UTF-8（否则中文乱码）
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _console      # noqa: F401,E402
+
 B = "http://127.0.0.1:8000"
 
 
