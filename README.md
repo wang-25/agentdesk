@@ -293,9 +293,10 @@ agentdesk/
 ├── data/
 │   ├── knowledge/          运维知识库语料（6 篇）
 │   └── index/              构建产物（可重建，不进仓库）
-├── docs/                   11 份专题文档（见下）
+├── docs/                   12 份专题文档（见下）
 ├── eval/                   评测集与报告
 ├── scripts/                自检 / 评测 / 演示脚本
+├── practice/               Day 1 的 Python 练习（学习痕迹，非项目功能）
 ├── Dockerfile              生产镜像（非 root + 健康检查 + workers=1）
 ├── docker-compose.yml      生产编排（内存硬上限 + 端口只绑回环）
 └── requirements.txt        直接依赖仅 9 个

@@ -1,0 +1,40 @@
+# ============================================================
+#  行尾统一
+# ------------------------------------------------------------
+#  Windows 上的 Git 默认开启 core.autocrlf，会把文件换行从 LF 转成 CRLF。
+#  如果不同的人在不同系统 clone，同一个文件的行尾会不一致 ——
+#  表现是 diff 里出现"整个文件都改了"但其实什么都没改，
+#  或者 shell 脚本在 Linux 上跑不起来（多出来的 \r 会被当成命令的一部分）。
+#
+#  `text=auto eol=lf` 的意思是：仓库里永远存 LF，
+#  检出时按这个规则来。一次配好，以后不用管。
+# ============================================================
+* text=auto eol=lf
+
+# --- 二进制文件：不要做任何行尾转换 ---
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary
+*.npz  binary
+*.pyc  binary
+*.zip  binary
+
+# --- Windows 专用脚本必须保持 CRLF，否则双击执行会出错 ---
+*.bat  text eol=crlf
+*.cmd  text eol=crlf
+
+# --- Windows 路径 \ 与 shell 脚本里 heredoc 的兼容 ---
+*.ps1  text eol=crlf
+
+# ============================================================
+#  GitHub 语言统计
+# ============================================================
+# 让 GitHub 把 .py 正确计入 Python 而不是被误判。
+*.py linguist-language=Python
+
+# 文档与数据不计入语言统计，避免干扰仓库首页的语言占比条
+docs/*.md      linguist-documentation
+eval/*.json    linguist-documentation
+data/**/*.json linguist-documentation
