@@ -166,6 +166,18 @@ Agent 只知道 `web-01` 这样的**逻辑名**，它不知道、也不该知道
 所以 `run_command` 在 `ssh` 后端下会直接拒绝：不提交审批，也不执行。
 需要在真机上做处置时，请在目标主机上以 `OPS_BACKEND=local` 运行。
 
+### 想直接看真机原始数据？
+
+问 Agent「磁盘还剩多少」，拿到的是**模型转述后**的答案。
+要确认"它到底从机器上读到了什么"，把模型摘掉：
+
+```bash
+.venv\Scripts\python.exe scripts\show_live.py
+.venv\Scripts\python.exe scripts\show_live.py --only tail_log --service wp-app
+```
+
+原样打印工具层的 JSON，不花 token、也没有任何转述。
+
 > [!NOTE]
 > 切换后端只影响工具层，**Agent 编排层一行都不用改** ——
 > 它只负责"调哪个工具"，不关心这个工具的数据从哪来。
