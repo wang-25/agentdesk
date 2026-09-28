@@ -1,0 +1,82 @@
+# ============================================================
+#  AgentDesk 生产部署配置
+# ------------------------------------------------------------
+#  在项目根目录执行：
+#      docker compose up -d --build
+#      docker compose logs -f
+#      docker compose down
+#
+#  架构位置：
+#      互联网 → NPM(80/443, 已有证书) → agentdesk:8000 (本容器)
+#                                       └ 同一 docker 网络内，按容器名互访
+#
+#  【为什么端口绑 127.0.0.1 而不是 0.0.0.0】
+#  这里写 "127.0.0.1:8088:8000" 而不是 "8088:8000"，是本次部署最关键的一行。
+#  绑 127.0.0.1 意味着这个端口只在服务器本机可达，公网扫不到它。
+#  流量只能走 NPM 那一条路（有 HTTPS、有限流、有日志）。
+#  如果绑 0.0.0.0，就等于开了一个绕过 NPM 的旁路：
+#  别人可以用 http://IP:8088 直接打进来，前端加的防护全部失效。
+#  留着它只是为了在服务器上 curl localhost:8088 排查问题。
+#
+#  【为什么要手动设内存上限】
+#  这台机器只有 1.8G 内存，还要跑 WordPress + Zabbix 共 7 个容器。
+#  不设上限时，一旦 AgentDesk 内存失控，Linux 的 OOM killer 会从
+#  整机里挑一个"最值钱"的进程杀掉 —— 很可能是 zabbix-mysql 或 wp-db，
+#  表现就是博客突然 502，而且日志里看不出是谁干的。
+#  设了上限，超了只杀它自己，爆炸范围被限制在一个容器里。
+# ============================================================
+
+services:
+  agentdesk:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: agentdesk:1.0.0
+    container_name: agentdesk
+    restart: unless-stopped
+
+    # 密钥全部来自 .env（不进镜像、不进 git）
+    env_file:
+      - .env
+
+    ports:
+      # 只监听回环，公网必须经 NPM 进来
+      - "127.0.0.1:8088:8000"
+
+    volumes:
+      # 索引和日志挂出来，重建容器不丢
+      - ./data:/app/data
+      - ./logs:/app/logs
+
+    # 内存硬上限：稳态实测约 153MB，这里是 2.5 倍余量
+    mem_limit: 400m
+    # CPU 上限：留一核给 WordPress 和 Zabbix，避免分词把机器吃满
+    cpus: 1.0
+
+    # 演示用的内存保护，避免被子进程意外放大
+    pids_limit: 256
+
+    networks:
+      - wpnet
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health',timeout=4).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 40s
+      retries: 3
+
+networks:
+  # 复用 WordPress 那套已有的 docker 网络，
+  # 这样 Nginx Proxy Manager 能直接用容器名 "agentdesk" 访问到我们，
+  # 不需要在任何地方写死 IP。
+  wpnet:
+    external: true
+    name: wordpress-blog_wpnet

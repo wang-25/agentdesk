@@ -47,6 +47,7 @@ from app.observability import langfuse_export, tracer as obs
 
 # 配了 LANGFUSE_* 环境变量才生效；没配就是本地记录模式，功能不受影响
 langfuse_export.install()
+from app import security
 from app.llm import chat as llm_chat
 from app.llm import chat_json, chat_stream_async
 
@@ -56,8 +57,12 @@ from app.llm import chat_json, chat_stream_async
 app = FastAPI(
     title="AgentDesk",
     description="面向运维场景的多 Agent 智能体系统",
-    version="0.9.0",
+    version="1.0.0",
 )
+
+# 公网安全层：token 鉴权 + 限流 + 每日额度。
+# AUTH_ENABLED=0（默认）时完全放行，本地开发行为不变。
+security.install_security(app)
 
 # ============================================================
 # 审计日志
@@ -377,8 +382,16 @@ async def health():
 
     别小看它 —— 后面要用 Docker + Nginx 上线，
     容器的健康检查、负载均衡的存活探测全都依赖这个接口。
+
+    这里额外返回安全层状态（鉴权开没开、额度用了多少、拦了多少请求），
+    现场排查时一眼就能看出「是服务挂了还是 token 不对」。
     """
-    return {"status": "ok", "service": "agentdesk", "version": "0.9.0"}
+    return {
+        "status": "ok",
+        "service": "agentdesk",
+        "version": "1.0.0",
+        "security": security.security_status(),
+    }
 
 
 # ============================================================

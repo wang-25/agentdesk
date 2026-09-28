@@ -105,7 +105,11 @@ AgentDesk 想做到的是：输入「nginx 报 502 了，帮我看下」，由 A
 
 - **Python 3.12**（不要用 3.13，参考项目依赖按 3.10-3.12 验证过）
 - Git
-- Docker Desktop（Day 10 才需要，现在不用装）
+- Docker（本地跑沙箱、或按 Day 10 部署到服务器时需要）
+
+> **部署到公网**的完整过程、安全设计和运维手册见 [`docs/deployment.md`](docs/deployment.md)。
+> 那台机器上还跑着 WordPress + Zabbix（可用内存仅 359MB、swap=0），
+> 所以里面有一节专门讲「怎么证明新服务不会把邻居挤死」。
 
 ---
 
@@ -172,6 +176,21 @@ python -m venv .venv
 | GET  | `/agent/tools`   | Agent 能调用的工具清单（含风险等级）                                                |
 | GET  | `/agent/graph`   | 导出状态图的 mermaid（`engine=react\|supervisor`）                           |
 | POST | `/agent/ask`     | **Agent 自主诊断**（`engine` 三档：handwritten / langgraph / **supervisor**） |
+
+> **公网部署时接口要带 token**：设了 `AUTH_ENABLED=1` 之后，
+> 除 `/`、`/health`、`/docs` 之外的所有接口都要求请求头带凭据。
+> 本地开发默认关闭，行为与之前完全一致。
+>
+> ```bash
+> curl -H "X-API-Key: <你的 AGENT_TOKEN>" \
+>      -H "Content-Type: application/json" \
+>      -d '{"question":"web-01 磁盘快满了怎么处理"}' \
+>      https://agent.simosheng.fun/rag/ask
+> ```
+>
+> 安全设计（白名单为什么比黑名单可靠、单 IP 限流为什么能被绕过、
+> 取 `X-Forwarded-For` 该取第一个还是最后一个）见
+> [`docs/deployment.md`](docs/deployment.md)。
 
 RAG 也可以用命令行：
 
@@ -443,7 +462,7 @@ curl -sN -X POST http://127.0.0.1:8000/chat/stream -H "Content-Type: application
 - [x] **Day 7** Docker 沙箱执行 + Human-in-the-Loop（命令白名单 + 一次性容器 + 审批单 + 指纹防重放）
 - [x] **Day 8** 全链路 Trace + 成本看板（自研记录层 + 可选 Langfuse 自托管导出）
 - [x] **Day 9** 端到端评测：40 条评测集（含 10 条库外拒答题） + 4 项规则判定 + 模型判分 + 裸模型对照 + 判定器自证
-- [ ] **Day 10** 部署到公网（Docker Compose + Nginx + HTTPS）
+- [x] **Day 10** 部署到公网：公网安全层（白名单鉴权 + 三层限流 + 每日额度）+ Dockerfile + Docker Compose + 复用已有 Nginx Proxy Manager
 - [ ] **Day 11-15** 仓库整理 + 简历 + 面试演练 + 第一批投递
 
 ---
@@ -456,6 +475,7 @@ agentdesk/
 │   ├── __init__.py      包说明与目录规划
 │   ├── llm.py           模型调用统一入口（含 chat_step：带工具调用的一步）
 │   ├── main.py          FastAPI 服务入口（22 个接口）
+│   ├── security.py      公网安全层：白名单鉴权 + 三层限流 + 每日额度
 │   ├── agents/          Agent 编排层
 │   │   ├── common.py    两个引擎共用的 Prompt、消息处理、工具执行
 │   │   ├── react.py     手写 ReAct 循环（零依赖，原理在这里）
@@ -496,6 +516,7 @@ agentdesk/
 │   ├── observability.md      可观测：三层架构 + 三个坑 + 面试三问
 │   ├── evaluation.md         评测：六维度设计 + 判定器自证 + 误报排查
 │   ├── python-reference.md   Python 速查手册（含笔试四件套 + 报错速查表）
+│   ├── deployment.md         公网部署：安全层设计 + 内存判断 + 运维手册
 │   └── knowledge-points.md   知识点清单（面试复习用）
 ├── eval/
 │   ├── qa_set.json      检索召回率评测集（32 个问题，测检索层）
@@ -509,8 +530,11 @@ agentdesk/
 │   │                    → 观测 → 评测 → MCP → 22 个接口
 │   ├── mcp_check.py     MCP 协议层自检（官方客户端连自己，9 项）
 │   ├── eval_specialists.py  意图路由 Agent 逐字段准确率评测
+│   ├── security_check.py 公网安全层自检（23 项，含"换假 IP 绕限流"用例）
 │   └── run_eval.py      端到端评测 + 报告（RAG vs 裸模型对照）
 ├── check_env.py        Day 0 验收脚本
+├── Dockerfile           生产镜像（非 root + 健康检查 + workers=1）
+├── docker-compose.yml   生产编排（内存硬上限 + 端口只绑回环 + 复用 NPM 网络）
 ├── requirements.txt
 ├── .env                 本地密钥（不进仓库）
 ├── .env.example         模板

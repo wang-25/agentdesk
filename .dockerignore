@@ -1,0 +1,18 @@
+# 构建镜像时不要把本机环境和密钥打进去
+.venv/
+.git/
+.gitignore
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+logs/
+.env
+.env.local
+practice/
+deploy/
+docs/screenshots/
+*.docx
+*.doc
+draft_*/
+.DS_Store
