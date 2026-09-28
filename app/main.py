@@ -506,12 +506,12 @@ def try_page():
 <div class="sub">多 Agent 智能体系统 &middot; 面向运维场景 &middot;
 填问题、点按钮，看它自己决定查什么</div>
 
-<div class="note"><b>需要访问令牌。</b>这个实例部署在公网，除首页外的接口
+<div class="note" id="authnote"><b>需要访问令牌。</b>这个实例部署在公网，除首页外的接口
 都要求 token。令牌在服务器 <code>/opt/agentdesk/.env</code> 的
 <code>AGENT_TOKEN</code> 那一行。填一次即可，浏览器会记住。
 <br><b>别在公共电脑上填。</b>令牌存在本机浏览器里，等于一把钥匙。</div>
 
-<div class="card">
+<div class="card" id="tokcard">
   <label for="token">访问令牌</label>
   <div class="row">
     <div style="flex:3"><input id="token" type="password"
@@ -563,6 +563,26 @@ $('forget').onclick = function () {
   $('tokstate').textContent = '已清除。';
 };
 
+// ---- 先问服务端：这个实例到底要不要令牌 ----
+// ★ 这里踩过一次。页面原先**无条件**要求令牌，因为它默认自己一定部署在公网。
+//   结果本地关着鉴权（AUTH_ENABLED=0）也照样被前端拦住，页面根本用不了 ——
+//   而服务端其实压根没检查。**前端不该假设后端的部署形态，能问一次就问一次。**
+//
+// 探测失败时按"需要令牌"处理：宁可多填一次，也不要漏掉保护。
+var NEEDS_TOKEN = true;
+(function probeAuth() {
+  fetch('/health').then(function (r) { return r.json(); }).then(function (h) {
+    NEEDS_TOKEN = !!(h && h.security && h.security.auth_enabled);
+    if (!NEEDS_TOKEN) {
+      $('tokcard').style.display = 'none';
+      $('authnote').innerHTML =
+        '<b>本地实例，不需要令牌。</b>这个实例没有开启鉴权' +
+        '（<code>AUTH_ENABLED=0</code>），直接提问即可。' +
+        '<br>部署到公网时必须打开鉴权，见 README 的「公网安全层」。';
+    }
+  }).catch(function () { NEEDS_TOKEN = true; });
+})();
+
 function esc(s) {
   return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;')
                   .replace(/>/g, '&gt;');
@@ -588,7 +608,8 @@ $('go').onclick = async function () {
   var question = $('q').value.trim();
   var mode = $('mode').value;
 
-  if (!token) {
+  // 只有服务端确实开了鉴权时才要求令牌 —— 见上面 probeAuth 的说明
+  if (NEEDS_TOKEN && !token) {
     $('out').innerHTML = '<div class="err">请先填写访问令牌。它在服务器的 ' +
       '<code>/opt/agentdesk/.env</code> 里。</div>';
     return;
@@ -598,8 +619,10 @@ $('go').onclick = async function () {
     return;
   }
 
-  localStorage.setItem(KEY, token);
-  $('tokstate').textContent = '已保存令牌（本机浏览器），直接点「开始」即可。';
+  if (token) {
+    localStorage.setItem(KEY, token);
+    $('tokstate').textContent = '已保存令牌（本机浏览器），直接点「开始」即可。';
+  }
   $('go').disabled = true;
   t0 = Date.now();
   tick();
@@ -614,10 +637,14 @@ $('go').onclick = async function () {
     body = { question: question, engine: mode, include_trace: true };
   }
 
+  // 没有令牌就不带这个头 —— 服务端没开鉴权时，多带一个空令牌只会让人困惑
+  var headers = { 'Content-Type': 'application/json' };
+  if (token) { headers['X-API-Key'] = token; }
+
   try {
     var r = await fetch(path, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-API-Key': token },
+      headers: headers,
       body: JSON.stringify(body)
     });
     clearInterval(timer);
