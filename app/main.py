@@ -37,7 +37,7 @@ import json
 from datetime import datetime
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Response
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
@@ -328,7 +328,7 @@ def alert_to_question(alert: dict) -> str:
 # 接口 0：首页
 # ============================================================
 @app.get("/", response_class=HTMLResponse, include_in_schema=False)
-def index():
+def index(response: Response):
     """根路径给一张「这是什么 + 怎么试」的导航页。
 
     【为什么要这个接口】
@@ -341,9 +341,52 @@ def index():
     `include_in_schema=False`：它只是导航页，不是业务接口，
     不该混进 /docs 的接口清单里干扰视线。
     """
+    # ---- 和 /try 页同一个道理：要不要令牌，服务端定死，别让页面去猜 ----
+    # 首页原先无条件写「除几个路径外都要求令牌」，这在本地（AUTH_ENABLED=0）
+    # 是**错的**：第一次打开的人会以为必须先搞到一个令牌才能用。
+    needs_token = security.AUTH_ENABLED
+    if needs_token:
+        docs_hint = "交互式文档。要先点右上角 Authorize 填 token，否则一律 401"
+        auth_block = (
+            '<p style="font-size:13px;color:#59636e">'
+            '除 <code>/</code>、<code>/health</code>、<code>/docs</code>、<code>/try</code> '
+            '之外，所有接口都要求请求头带令牌（<code>X-API-Key</code>）。'
+            '所以直接点上面表格里的链接会看到 401 &mdash; 那是安全层在正常工作，不是服务坏了。</p>'
+        )
+        try_step = "填令牌、填问题、点「开始」"
+        curl_demo = (
+            '<pre>curl -H "X-API-Key: &lt;你的令牌&gt;" \\\n'
+            '     -H "Content-Type: application/json" \\\n'
+            '     -d \'{"question":"web-01 磁盘快满了怎么处理"}\' \\\n'
+            '     https://agent.simosheng.fun/rag/ask   # 或 /agent/ask</pre>\n'
+            '<p style="font-size:13px;color:#59636e">令牌在服务器的 '
+            '<code>/opt/agentdesk/.env</code> 里，<code>AGENT_TOKEN</code> 那一行。</p>'
+        )
+        acl_block = (
+            "鉴权采用白名单：默认拒绝，只放行上面标注的那几个路径。"
+        )
+    else:
+        docs_hint = "交互式文档。未开鉴权时直接点 Try it out 即可"
+        auth_block = (
+            '<p style="font-size:13px;color:#59636e">'
+            '这个实例<b>没有开启鉴权</b>（<code>AUTH_ENABLED=0</code>），'
+            '上面表格里的链接点开就能用，不需要任何令牌。</p>'
+        )
+        try_step = "填问题、点「开始」"
+        curl_demo = (
+            '<pre>curl -H "Content-Type: application/json" \\\n'
+            '     -d \'{"question":"web-01 磁盘快满了怎么处理"}\' \\\n'
+            '     http://127.0.0.1:8000/rag/ask   # 或 /agent/ask</pre>\n'
+            '<p style="font-size:13px;color:#59636e">本地实例不需要令牌；'
+            '部署到公网时必须打开鉴权并带上 <code>X-API-Key</code>。</p>'
+        )
+        acl_block = (
+            "本地未开鉴权；部署到公网时会打开白名单鉴权，默认拒绝、只放行标注的路径。"
+        )
+
     links = [
         ("/try", "★ 在线试用", "填问题、点按钮，看它自己决定查什么。不用懂 API，从这里开始"),
-        ("/docs", "22 个接口的调试台", "交互式文档。要先点右上角 Authorize 填 token，否则一律 401"),
+        ("/docs", "22 个接口的调试台", docs_hint),
         ("/metrics/summary", "成本看板", "按 Agent / 动作两维看成本、缓存命中率、P95 延迟"),
         ("/traces", "链路追踪", "每次运行发生了什么、哪一步最慢最贵"),
         ("/agent/tools", "工具清单", "Agent 能调用的 7 个工具，含风险等级"),
@@ -357,7 +400,7 @@ def index():
         f'<td><b>{n}</b></td><td>{d}</td></tr>'
         for u, n, d in links
     )
-    return f"""<!DOCTYPE html>
+    page = f"""<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>AgentDesk</title>
@@ -398,24 +441,16 @@ def index():
 <tr><th>地址</th><th>是什么</th><th>说明</th></tr>
 {rows}
 </table>
-<p style="font-size:13px;color:#59636e">
-除 <code>/</code>、<code>/health</code>、<code>/docs</code>、<code>/try</code>
-之外，所有接口都要求请求头带令牌（<code>X-API-Key</code>）。
-所以直接点上面表格里的链接会看到 401 &mdash; 那是安全层在正常工作，不是服务坏了。</p>
+{auth_block}
 
 <h2>最快的一次体验</h2>
-<p>打开 <a href="/try"><b>/try</b></a>：填令牌、填问题、点「开始」。
+<p>打开 <a href="/try"><b>/try</b></a>：{try_step}。
 它会自己决定查什么、查几轮，返回里带完整的执行轨迹和校验结论。</p>
 <p>换个知识库里没有的问题问它（比如「Kafka 消费组 lag 怎么排查」），
 它会明确告诉你<strong>知识库里没有</strong> &mdash; 这是刻意设计的，不是能力不足。</p>
 
 <h2>用命令行调</h2>
-<pre>curl -H "X-API-Key: &lt;你的令牌&gt;" \\
-     -H "Content-Type: application/json" \\
-     -d '{{"question":"web-01 磁盘快满了怎么处理"}}' \\
-     https://agent.simosheng.fun/rag/ask   # 或 /agent/ask</pre>
-<p style="font-size:13px;color:#59636e">令牌在服务器的
-<code>/opt/agentdesk/.env</code> 里，<code>AGENT_TOKEN</code> 那一行。</p>
+{curl_demo}
 
 <div class="note"><b>安全边界</b>：所有写操作（重启服务、清空日志）
 都不会自动执行。它们会变成一张审批单挂在 <a href="/approvals">/approvals</a>，
@@ -424,16 +459,21 @@ def index():
 <p style="margin-top:32px;color:#8b949e;font-size:13px">
 这个实例跑在阿里云一台 2 核 2G 的机器上，与 WordPress、Zabbix 共 8 个容器共存，
 经 Nginx Proxy Manager 提供 HTTPS。<br>
-鉴权采用白名单：默认拒绝，只放行上面标注的那几个路径。
+{acl_block}
 部署过程与安全设计见仓库的 <code>docs/deployment.md</code>。</p>
 </body></html>"""
+
+    # HTML 一律不缓存 —— 和 /try 页同一个理由（服务端渲染、内容随配置变）。
+    response.headers["Cache-Control"] = "no-store, must-revalidate"
+    response.headers["Pragma"] = "no-cache"
+    return page
 
 
 # ============================================================
 # 在线试用页
 # ============================================================
 @app.get("/try", response_class=HTMLResponse, include_in_schema=False)
-def try_page():
+def try_page(response: Response):
     """一个不用懂 API 就能试的页面。
 
     【为什么要有它】
@@ -441,10 +481,10 @@ def try_page():
     但演示的观众是第一次接触它的人 —— 他们不会为了看你一个项目去学怎么发 curl。
     一个「填问题 → 点按钮 → 看结果」的页面，把试用的门槛降到了零。
 
-    页面本身是静态的，所有逻辑都在浏览器里：token 存在 localStorage，
-    点击后直接 fetch 后端的 /agent/ask 或 /rag/ask。
+    页面逻辑在浏览器里（token 存 localStorage，点击后 fetch /agent/ask），
+    但**「要不要令牌」这个决定是服务端做的**：见函数末尾的替换逻辑。
     """
-    return """<!DOCTYPE html>
+    html = """<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>AgentDesk · 在线试用</title>
@@ -506,12 +546,9 @@ def try_page():
 <div class="sub">多 Agent 智能体系统 &middot; 面向运维场景 &middot;
 填问题、点按钮，看它自己决定查什么</div>
 
-<div class="note" id="authnote"><b>需要访问令牌。</b>这个实例部署在公网，除首页外的接口
-都要求 token。令牌在服务器 <code>/opt/agentdesk/.env</code> 的
-<code>AGENT_TOKEN</code> 那一行。填一次即可，浏览器会记住。
-<br><b>别在公共电脑上填。</b>令牌存在本机浏览器里，等于一把钥匙。</div>
+<div class="note" id="authnote">__AUTH_NOTE__</div>
 
-<div class="card" id="tokcard">
+<div class="card" id="tokcard"__TOKCARD_STYLE__>
   <label for="token">访问令牌</label>
   <div class="row">
     <div style="flex:3"><input id="token" type="password"
@@ -563,25 +600,18 @@ $('forget').onclick = function () {
   $('tokstate').textContent = '已清除。';
 };
 
-// ---- 先问服务端：这个实例到底要不要令牌 ----
-// ★ 这里踩过一次。页面原先**无条件**要求令牌，因为它默认自己一定部署在公网。
-//   结果本地关着鉴权（AUTH_ENABLED=0）也照样被前端拦住，页面根本用不了 ——
-//   而服务端其实压根没检查。**前端不该假设后端的部署形态，能问一次就问一次。**
-//
-// 探测失败时按"需要令牌"处理：宁可多填一次，也不要漏掉保护。
-var NEEDS_TOKEN = true;
-(function probeAuth() {
-  fetch('/health').then(function (r) { return r.json(); }).then(function (h) {
-    NEEDS_TOKEN = !!(h && h.security && h.security.auth_enabled);
-    if (!NEEDS_TOKEN) {
-      $('tokcard').style.display = 'none';
-      $('authnote').innerHTML =
-        '<b>本地实例，不需要令牌。</b>这个实例没有开启鉴权' +
-        '（<code>AUTH_ENABLED=0</code>），直接提问即可。' +
-        '<br>部署到公网时必须打开鉴权，见 README 的「公网安全层」。';
-    }
-  }).catch(function () { NEEDS_TOKEN = true; });
-})();
+// ---- 要不要令牌：由**服务端渲染时**写进来，前端不探测 ----
+// ★ 这里连续踩过两次，值得记住：
+//   第一版：页面**无条件**要求令牌 —— 它假设自己一定部署在公网。
+//           结果本地关着鉴权（AUTH_ENABLED=0）也照样被前端拦住，而服务端
+//           其实压根没检查。**前端不该假设后端的部署形态。**
+//   第二版：改成前端 fetch /health 探测。看起来对，但有三个失败面：
+//           ① 浏览器缓存旧页面 → 探测代码根本没跑；
+//           ② 相对路径 /health 在某些加载方式（预览面板、代理、file://）下取不到；
+//           ③ 探测是异步的 —— 手快在它返回前点「开始」，NEEDS_TOKEN 还是初值 true。
+//   第三版（当前）：服务端**本来就知道**答案，直接写进页面，前端只读不算。
+//           把决定权放在知道答案的那一侧，就不会有这三类问题。
+var NEEDS_TOKEN = __NEEDS_TOKEN__;
 
 function esc(s) {
   return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;')
@@ -730,6 +760,41 @@ function render(d, mode) {
 }
 </script>
 </body></html>"""
+
+    # ---- 把「要不要令牌」在服务端定死，再交给浏览器 ----
+    # 服务端在启动时就知道 AUTH_ENABLED，没有任何理由让前端去探测（原因见上面 JS 的注释）。
+    # 顺带把顶部提示和令牌框的初始状态也一起渲染好 —— 页面一打开就是最终形态，
+    # 不再有「先显示令牌框、几百毫秒后消失」的闪动。
+    needs_token = security.AUTH_ENABLED
+    if needs_token:
+        auth_note = (
+            "<b>需要访问令牌。</b>这个实例部署在公网，除首页外的接口都要求 token。"
+            "令牌在服务器 <code>/opt/agentdesk/.env</code> 的 "
+            "<code>AGENT_TOKEN</code> 那一行。填一次即可，浏览器会记住。"
+            "<br><b>别在公共电脑上填。</b>令牌存在本机浏览器里，等于一把钥匙。"
+        )
+        tokcard_style = ""
+    else:
+        auth_note = (
+            "<b>本地实例，不需要令牌。</b>这个实例没有开启鉴权"
+            "（<code>AUTH_ENABLED=0</code>），直接提问即可。"
+            "<br>部署到公网时必须打开鉴权，见 README 的「公网安全层」。"
+        )
+        tokcard_style = ' style="display:none"'
+
+    html = (
+        html.replace("__AUTH_NOTE__", auth_note)
+        .replace("__TOKCARD_STYLE__", tokcard_style)
+        .replace("__NEEDS_TOKEN__", "true" if needs_token else "false")
+    )
+
+    # HTML 一律不缓存。
+    # ★ 这次就是从「浏览器一直给旧页面」开始的 —— 服务端已经改好了，
+    #   用户看到的还是老界面，而且刷新键都不一定管用（普通刷新会走缓存）。
+    #   页面本身就是服务端渲染的、内容随时可能变，没有任何缓存的理由。
+    response.headers["Cache-Control"] = "no-store, must-revalidate"
+    response.headers["Pragma"] = "no-cache"
+    return html
 
 
 # ============================================================
