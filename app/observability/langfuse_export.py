@@ -6,7 +6,7 @@ Langfuse 导出层（可选）
 
 【为什么用原生 HTTP 而不是 langfuse SDK】
 
-和 Day 0 手写模型调用是同一个理由：SDK 是黑盒。
+和手写模型调用是同一个理由：SDK 是黑盒。
 Langfuse 的 ingestion 协议就是一个 POST + Basic Auth + 一组
 约定好的 event 结构 —— 手写一遍，trace 怎么映射成 Langfuse 的
 trace/span/generation 你就亲眼见过，出问题时知道查哪里。

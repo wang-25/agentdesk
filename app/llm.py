@@ -131,7 +131,7 @@ def chat(messages, temperature=0.7, timeout=60) -> str:
     """
     _, cfg, api_key = _pick()
 
-    # ★ 观测从这里开始（Day 8）。span 挂在统一入口 = 所有调用方自动被记录，
+    # ★ 观测从这里开始。span 挂在统一入口 = 所有调用方自动被记录，
     #   而不是每个业务函数自己记 —— 和"统一入口"是同一个原则。
     #   没有活跃 trace 时 span 内部静默跳过（见 tracer.py 的 _NullSpan）。
     from app.observability import tracer
@@ -202,7 +202,7 @@ def chat_step(messages, tools=None, temperature=0, timeout=90) -> dict:
         # 评测时经常用 required 来测"它到底会不会选工具"。
         payload["tool_choice"] = "auto"
 
-    # ★ 观测（Day 8）：Agent 循环里**每一次**模型调用都是一个 span。
+    # ★ 观测：Agent 循环里**每一次**模型调用都是一个 span。
     #   没有活跃 trace 时静默跳过。
     from app.observability import tracer
     with tracer.span(tracer.TYPE_LLM, name="chat_step",

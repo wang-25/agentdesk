@@ -148,7 +148,7 @@ OPS_BACKEND=local   # 切到真机模式
 > 要查**远程**机器需要新增 SSH 数据源 —— 目前尚未实现。
 > 切换后端只影响工具层，**Agent 编排层一行都不用改**。
 
-这样设计的原因是**可复现**：Day 9 那 40 条评测集依赖固定输出。
+这样设计的原因是**可复现**：那 40 条评测集依赖固定输出。
 如果工具一开始就依赖"真的连上一台机器"，那这个项目在别人电脑上就完全跑不起来。
 
 ---
@@ -293,10 +293,9 @@ agentdesk/
 ├── data/
 │   ├── knowledge/          运维知识库语料（6 篇）
 │   └── index/              构建产物（可重建，不进仓库）
-├── docs/                   12 份专题文档（见下）
+├── docs/                   10 份专题文档（见下）
 ├── eval/                   评测集与报告
 ├── scripts/                自检 / 评测 / 演示脚本
-├── practice/               Day 1 的 Python 练习（学习痕迹，非项目功能）
 ├── Dockerfile              生产镜像（非 root + 健康检查 + workers=1）
 ├── docker-compose.yml      生产编排（内存硬上限 + 端口只绑回环）
 └── requirements.txt        直接依赖仅 9 个
@@ -341,8 +340,6 @@ agentdesk/
 | [MCP Server](docs/mcp-server.md) | 协议原理、四个真实坑、客户端配置 |
 | [ReAct 与 LangGraph](docs/react-langgraph.md) | 两个实现的对比与取舍 |
 | [公网部署](docs/deployment.md) | 安全层设计、内存判断、运维手册 |
-| [知识点清单](docs/knowledge-points.md) | 面试复习 |
-| [Python 速查](docs/python-reference.md) | 常用写法与报错速查 |
 
 ---
 

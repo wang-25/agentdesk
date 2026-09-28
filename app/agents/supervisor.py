@@ -114,7 +114,7 @@ class MultiAgentState(TypedDict):
     knowledge: dict
     diagnosis: dict
     verdict: dict
-    remediation: dict      # ★ Day 7：处置结果（提交了哪些审批 / 执行了什么）
+    remediation: dict      # ★ 处置结果（提交了哪些审批 / 执行了什么）
     next_step: str
     supervisor_reason: str
     visited: Annotated[list, operator.add]
@@ -204,7 +204,7 @@ def make_supervisor_node(max_retries: int):
             out["retries"] = 1
             return out
 
-        # 6. ★ 需要处置，且校验已通过 → 派给处置 Agent（Day 7 新增）
+        # 6. ★ 需要处置，且校验已通过 → 派给处置 Agent
         #
         #    ★★ 这里有一道安全规则，是本项目刻意加的：
         #
@@ -406,7 +406,7 @@ def build_graph(max_retries: int = 1, config: dict = None):
 
     graph = StateGraph(MultiAgentState)
 
-    # ★ Day 8：每个 Agent 节点记一个 span。
+    # ★ 每个 Agent 节点记一个 span。
     #   这一步让「token 都花在哪个 Agent 上了」变成可回答的问题 ——
     #   /metrics/summary 按 span name 聚合，直接给出各 Agent 的成本占比。
     def _add(node_name: str, fn):
@@ -433,7 +433,7 @@ def build_graph(max_retries: int = 1, config: dict = None):
     graph.add_node("diagnose", _add("diagnose", make_diagnose_node(DIAGNOSE_TOOLS, "diagnose")))
     graph.add_node("reason", _add("reason", make_diagnose_node([], "reason")))
     graph.add_node("verify", _add("verify", verify_node))
-    graph.add_node("remediate", _add("remediate", make_remediate_node()))  # ★ Day 7
+    graph.add_node("remediate", _add("remediate", make_remediate_node()))  # ★ 处置节点
     graph.add_node("finalize", _add("finalize", make_finalize_node(config)))
 
     graph.add_edge(START, "supervisor")
@@ -466,7 +466,7 @@ def mermaid(max_retries: int = 1) -> str:
 # ============================================================
 # 五、入口
 # ============================================================
-@tracer.traced("supervisor")           # ★ Day 8：一次运行 = 一个 trace
+@tracer.traced("supervisor")           # ★ 一次运行 = 一个 trace
 def run(question: str, max_retries: int = 1, verbose: bool = False,
         config: dict = None) -> dict:
     """跑一次多 Agent 流程。

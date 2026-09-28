@@ -66,7 +66,7 @@ REPORT_DIR = PROJECT_ROOT / "eval" / "reports"
 # 中途网络抖一下、进程被杀一次，全部结果就没了，得从头再来一遍。
 # 所以每跑完一条就把结果落盘，`--resume` 可以接着跑。
 #
-# ★ 这和 Day 7 处置 Agent 的教训是同一条：
+# ★ 这和处置 Agent 的教训是同一条：
 #   **重试要带上上一轮的状态，否则不叫重试，叫重来一遍。**
 CRASH_LOG = REPORT_DIR / ".partial.json"
 # 上下文片段很大且只在跑的那一瞬间有用，落盘时丢掉
@@ -767,7 +767,7 @@ def main(argv=None) -> int:
         # ★ trace 的汇总记录是在 with 块**退出时**才写的。
         #   第一版把读成本这段写在了 with 块里面，
         #   于是永远读到空记录 → 报告上"本次评测成本 ¥0.0000"。
-        #   数字不报错、不异常，就是不对 —— 和 Day 8 那批静默 bug 同类。
+        #   数字不报错、不异常，就是不对 —— 和那批静默 bug 同类。
     elapsed = time.time() - started
     detail = tracer.trace_detail(tid) or {}
     cost = float(detail.get("cost_cny") or 0.0)

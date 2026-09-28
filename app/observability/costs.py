@@ -13,7 +13,7 @@ token → 钱。以及"钱都花在哪了"的聚合口径。
 
 ★ 单价需要人工核实。写代码时的依据是 DeepSeek 公开价格
   （deepseek-chat：输入 ¥2/M、缓存命中 ¥0.5/M、输出 ¥8/M），
-  但模型在变（Day 0 就见过请求 chat、返回 flash 的情况）。
+  但模型在变（曾见过请求 chat、返回 flash 的情况）。
   **所以这里的每个数字都标了"上次核对时间"，换模型时先来改这里。**
 """
 
@@ -40,7 +40,7 @@ def cost_of(usage: dict, model: str = "deepseek-chat") -> float:
     """按 usage 算一次调用的人民币成本。
 
     ★ 这里特意区分了**缓存命中**和**未命中**的输入 ——
-      Day 0 就发现 DeepSeek 的 usage 里有 prompt_cache_hit_tokens /
+      早就发现 DeepSeek 的 usage 里有 prompt_cache_hit_tokens /
       prompt_cache_miss_tokens 两个字段，命中部分是打折的。
 
       大多数人算成本只会 prompt_tokens × 单价，
@@ -72,7 +72,7 @@ def cost_of(usage: dict, model: str = "deepseek-chat") -> float:
 def aggregate(traces: list) -> dict:
     """把一组 trace 聚合成"这份钱花在哪了"的报告。
 
-    ★ 这里的维度选择是刻意设计的。面试讲可观测时，最能打的是这句：
+    ★ 这里的维度选择是刻意设计的。讲可观测时最有力的是这句：
       「我不只知道花了多少钱，我知道**每个环节**花了多少、
        哪一步最慢、哪一步在白花钱」—— 所以按 span 拆维度。
     """

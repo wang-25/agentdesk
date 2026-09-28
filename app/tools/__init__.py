@@ -13,7 +13,7 @@
 
 【双后端】
     mock  仿真数据，任何机器都能跑（默认）
-    local 真执行只读命令，Linux 上可用（Day 10 换成 Docker 沙箱）
+    local 真执行只读命令，Linux 上可用（沙箱模式下改为容器内执行）
 """
 
 from app.tools.ops import (        # noqa: F401

@@ -20,7 +20,7 @@ Trace 记录层
        **调用方完全无感知。**
 
 ② 的代价是要理解 contextvar，但收益是"加观测不用改函数签名"——
-这跟 Day 4 llm.py 统一入口是同一个思路：**让横切能力长在它该在的地方，
+这跟 llm.py 统一入口是同一个思路：**让横切能力长在它该在的地方，
 而不是散进每一个业务函数。**
 
 【为什么是"结束时写完整记录"而不是"事件日志 + 折叠"】
@@ -140,7 +140,7 @@ class _Span:
     def add_usage(self, usage: dict) -> None:
         """累加语义。用于「把别人的用量并进来」（父 span 汇总子 span）。
 
-        ★ set_usage 和 add_usage 必须分清 —— Day 8 的归因 bug 就是
+        ★ set_usage 和 add_usage 必须分清 —— 归因踩过的坑就是
           用覆盖把子 span 归并上来的用量清零了：
           chat 的 449 token 先归并进 intent 的 span，
           随后节点返回时 set_usage({}) 又把它覆盖成空。
@@ -184,7 +184,7 @@ def span(stype: str, name: str, **attrs):
         return
 
     stack = list(_span_stack.get() or [])
-    # ★ 这里是 Day 8 调试最久的一行 bug，值得写下来：
+    # ★ 这里是调试最久的一行 bug，值得写下来：
     #   第一版写的是 `parent_id = stack[-1]` —— 塞进去的是 **_Span 对象本身**。
     #   顶层 span 的 parent_id 是 None（能序列化），所以单层 trace 一切正常；
     #   一旦嵌套，parent_id 变成不可序列化的对象，trace 记录 json.dumps 失败，
@@ -225,7 +225,7 @@ def span(stype: str, name: str, **attrs):
             if parent is not None:
                 # ★ 用 add_usage（内部会过滤非数值字段）而不是手写累加。
                 #
-                #   手写那版的教训 —— **和 Day 4 的 _merge_usage 是同一个坑，
+                #   手写那版的教训 —— **和 _merge_usage 是同一个坑，
                 #   本项目第二次踩**：
                 #
                 #       parent.usage[k] = parent.usage.get(k, 0) + v
@@ -367,7 +367,7 @@ def sum_usage(usages) -> dict:
     """把一组 usage 字典累加。
 
     ★ 只累加**确定是数字**的字段。DeepSeek 的 usage 带嵌套字段
-      （prompt_tokens_details），无脑累加会撞上 Day 4 那个
+      （prompt_tokens_details），无脑累加会撞上前面那个
       `int + dict` 的 TypeError —— 看着最不可能出错的代码最容易挂。
     """
     out = {}

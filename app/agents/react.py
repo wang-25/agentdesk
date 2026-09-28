@@ -17,7 +17,7 @@ ReAct = Reasoning + Acting。名字听着玄，实现起来就是一个 while �
 再加上状态管理、检查点、可视化。循环本身只有几十行。
 
 【为什么先手写一遍】
-因为面试官会问"LangGraph 底层在做什么"。如果只会用框架，
+因为"LangGraph 底层在做什么"是个绕不开的问题。如果只会用框架，
 这个问题就答不上来 —— 你不知道它替你做了哪些决策。
 手写一遍之后你才知道：它管的是状态怎么存、循环怎么走、
 失败怎么重试、人在哪一步介入。这些概念手写版里都有，只是没有名字。
@@ -57,7 +57,7 @@ from app.agents.common import (
 from app.llm import ModelError, chat_step
 
 
-@tracer.traced("handwritten")          # ★ Day 8：一次运行 = 一个 trace
+@tracer.traced("handwritten")          # ★ 一次运行 = 一个 trace
 def run(question: str, max_steps: int = DEFAULT_MAX_STEPS,
         verbose: bool = False) -> dict:
     """跑一次完整的 ReAct 循环。

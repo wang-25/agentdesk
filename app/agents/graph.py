@@ -34,7 +34,7 @@ LangGraph 把它显式化成节点和边：
     4. 流式事件：`stream(stream_mode="updates")` 能按节点吐进度
        —— 前端可以显示"正在查磁盘…正在读日志…"，这是手写要自己造的
 
-【代价是什么】—— 面试官更想听这个
+【代价是什么】—— 这部分更值得关注
     1. 多一层抽象：出错时的报错栈里全是框架内部帧，比手写难查
     2. 消息对象要转换：`_payload_messages` 那一段就是代价本身 ——
        LangChain 有自己的消息类，而我们直接调 API 要的是 dict，
@@ -185,7 +185,7 @@ def payload_messages(messages: list) -> list:
       两种消息格式的字段名、嵌套结构都不一样，少写一个字段不会报错，
       只会在某次工具调用时莫名其妙地失败。
 
-      对照表（值得背下来，面试问"LangChain 消息和原生 API 怎么对应"时能答）：
+      对照表（值得记住，覆盖了"LangChain 消息和原生 API 怎么对应"这个问题）：
         SystemMessage  → {"role":"system",  "content": str}
         HumanMessage   → {"role":"user",    "content": str}
         AIMessage      → {"role":"assistant","content": str,
@@ -448,7 +448,7 @@ def mermaid(max_steps: int = DEFAULT_MAX_STEPS) -> str:
     """把图导出成 mermaid 文本（LangGraph 白送的能力）。
 
     这就是框架版多出来的东西之一：**结构可视化不用手画**。
-    面试让你画架构图时，直接把这个贴出去。
+    需要画架构图时，直接把这个贴出去。
     """
     return build_graph(max_steps).get_graph().draw_mermaid()
 
@@ -456,7 +456,7 @@ def mermaid(max_steps: int = DEFAULT_MAX_STEPS) -> str:
 # ============================================================
 # 六、入口
 # ============================================================
-@tracer.traced("langgraph")            # ★ Day 8：一次运行 = 一个 trace
+@tracer.traced("langgraph")            # ★ 一次运行 = 一个 trace
 def run(question: str, max_steps: int = DEFAULT_MAX_STEPS,
         verbose: bool = False, tool_names: list = None,
         system_prompt: str = None) -> dict:

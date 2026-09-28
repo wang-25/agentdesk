@@ -9,13 +9,13 @@
 #  character here will crash the install.
 # ============================================================
 
-# ---------- Day 0 ----------
+# ---------- Environment ----------
 # HTTP client. Used to call the model API.
 httpx>=0.27
 # Read variables from .env so secrets stay out of the code.
 python-dotenv>=1.0
 
-# ---------- Day 2 ----------
+# ---------- Service ----------
 # Web framework. Turns our code into an HTTP service.
 fastapi>=0.115
 # The server that actually runs FastAPI.
@@ -23,7 +23,7 @@ uvicorn[standard]>=0.32
 # Data validation. FastAPI relies on it for request bodies.
 pydantic>=2.9
 
-# ---------- Day 3 (RAG) ----------
+# ---------- RAG ----------
 # Vector math. Embeddings are stored as matrices, so similarity search
 # becomes a single matrix multiplication.
 numpy>=1.26
@@ -31,14 +31,14 @@ numpy>=1.26
 # Pure Python, no model download required.
 jieba>=0.42
 
-# ---------- Day 4 (Agent orchestration) ----------
+# ---------- Agent orchestration ----------
 # Agent orchestration as a state graph. Optional in the sense that
 # app/agents/react.py implements the same loop by hand with zero
 # dependencies -- but installed so the two can be compared side by side.
 # Pulls in langchain-core, langgraph-checkpoint, langsmith, etc.
 langgraph>=0.2
 
-# ---------- Day 5 (MCP) ----------
+# ---------- MCP ----------
 # Official Model Context Protocol SDK. Exposes the 6 tools in
 # app/tools/ops.py to any MCP client (Cursor, Claude Desktop, ...).
 # NOTE: v2 renamed FastMCP to MCPServer --

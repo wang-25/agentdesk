@@ -4,15 +4,15 @@
 目录规划（随进度逐步补齐）：
     app/llm.py          模型调用的统一入口
     app/main.py         FastAPI 服务入口
-    app/rag/            （Day 3 ✓）检索增强
-    app/tools/          （Day 4 ✓）7 个运维工具 + 安全边界
-    app/agents/         （Day 4 ✓）ReAct 编排：手写 + LangGraph 双版本
-                        （Day 6 ✓）Supervisor + 4 个专业 Agent
-                        （Day 7 ✓）处置 Agent（唯一有写权限的 Agent）
-    app/mcp_server/     （Day 5 ✓）把工具暴露成 MCP Server
-    app/sandbox/        （Day 7 ✓）Docker 沙箱 + 人工确认（HITL）
-    app/observability/  （Day 8 ✓）全链路 Trace + 成本归因
-    app/evaluation/     （Day 9 ✓）端到端评测：4 项规则判定 + 模型判分
+    app/rag/            检索增强
+    app/tools/          7 个运维工具 + 安全边界
+    app/agents/         ReAct 编排：手写 + LangGraph 双版本
+                        Supervisor + 4 个专业 Agent
+                        处置 Agent（唯一有写权限的 Agent）
+    app/mcp_server/     把工具暴露成 MCP Server
+    app/sandbox/        Docker 沙箱 + 人工确认（HITL）
+    app/observability/  全链路 Trace + 成本归因
+    app/evaluation/     端到端评测：4 项规则判定 + 模型判分
                         ★ 判定器先自证是准的，再拿来跑分
 
 【一条设计主线】

@@ -200,7 +200,7 @@ def evaluate(top_k: int = 3, modes=("vector", "bm25", "hybrid"),
     两类分开统计，才能看出「向量检索到底有没有在干活」——
     混在一起算平均，会被词面型问题掩盖掉全部差距。
 
-    ★ 这张对比表就是面试时「你 RAG 效果怎么测」的答案。
+    ★ 这张对比表回答了「RAG 效果怎么测」这个问题。
     """
     store = load_store()
     qa_set = load_qa_set(qa_set_path)
@@ -268,7 +268,7 @@ def evaluate(top_k: int = 3, modes=("vector", "bm25", "hybrid"),
                 row += f"{(bt['recall'] * 100):>8.1f}%" if bt else f"{'—':>9}"
             print(row)
 
-        # 混合检索相比纯向量的提升 —— 这句话可以直接写进简历
+        # 混合检索相比纯向量的提升 —— 这个结论可以直接写进项目说明
         if "vector" in report["modes"] and "hybrid" in report["modes"]:
             vec = report["modes"]["vector"]
             hyb = report["modes"]["hybrid"]

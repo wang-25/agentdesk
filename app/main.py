@@ -208,7 +208,7 @@ def parse_intent(question: str):
     结构化输出失败的原因通常很具体 —— 少个字段、取值不在范围内、
     多包了一层 markdown。把「你的输出有什么问题」直接告诉模型，
     它第二次基本能改对。实测一次重试能把成功率从七成提到九成以上。
-    这是生产环境做结构化输出的标准做法，也是面试常问的点。
+    这是生产环境做结构化输出的标准做法，也是常见的关注点。
 
     【为什么把失败也做成异常抛出去，而不是返回 None】
     调用方需要区分"解析失败"和"解析成功但字段恰好是空的"。
@@ -333,7 +333,7 @@ def index():
 
     【为什么要这个接口】
     服务起来之后，人第一次打开 http://127.0.0.1:8000 看到的是 404 ——
-    得先知道 `/docs` 这个约定才知道去哪儿，而**面试官或同事不会知道**。
+    得先知道 `/docs` 这个约定才知道去哪儿，而**访客或同事不会知道**。
 
     一个几十行的首页，把"这是什么、从哪开始试、有哪些能力"一次说清，
     是演示成本最低、收益最直接的一步。
@@ -438,7 +438,7 @@ def try_page():
 
     【为什么要有它】
     /docs 是给开发者的，它要求你懂 HTTP 方法、请求体格式、鉴权头。
-    但演示的观众是面试官 —— 他不会为了看你一个项目去学怎么发 curl。
+    但演示的观众是第一次接触它的人 —— 他们不会为了看你一个项目去学怎么发 curl。
     一个「填问题 → 点按钮 → 看结果」的页面，把试用的门槛降到了零。
 
     页面本身是静态的，所有逻辑都在浏览器里：token 存在 localStorage，
@@ -734,7 +734,7 @@ def read_audit(limit: int = Query(20, ge=1, le=200, description="返回最近多
     """读取最近的审计记录。
 
     【这个接口的价值】
-    它是「可追溯」的证据。面试时你可以说：
+    它是「可追溯」的证据。可以这样描述：
     「每一次告警触发的判断和决策都落库了，我能查出来三小时前那次为什么没自动处理。」
     这句话是通用 AI 助手给不了的 —— 它有聊天记录，但没有结构化审计。
     """
@@ -757,7 +757,7 @@ def read_audit(limit: int = Query(20, ge=1, le=200, description="返回最近多
 @app.post("/chat", response_model=ChatResponse)
 async def chat_endpoint(req: ChatRequest):
     """一次性返回完整回答。实现最简单，但用户要等。"""
-    # ★ Day 8：一次 HTTP 请求 = 一个 trace。
+    # ★ 一次 HTTP 请求 = 一个 trace。
     #   /chat 也会被记录 —— 因为"成本看板"需要覆盖所有调用方，
     #   只看 Agent 的成本会低估真实开销。
     with obs.trace("chat", question=req.question):
@@ -809,7 +809,7 @@ async def chat_stream_endpoint(req: ChatRequest):
                 yield f"data: {payload}\n\n"
         except ModelError as e:
             # 流已经开始了就没法改状态码了，只能把错误当成一条数据推给客户端。
-            # 这是流式接口的固有难点，也是面试会被问到的点。
+            # 这是流式接口的固有难点。
             yield f"data: {json.dumps({'error': str(e)}, ensure_ascii=False)}\n\n"
 
         yield "data: [DONE]\n\n"        # 约定俗成的结束标记
@@ -852,7 +852,7 @@ def parse_endpoint(req: ChatRequest):
 # ============================================================
 @app.post("/webhook/alert")
 def webhook_alert(payload: dict):
-    # ★ Day 8：无人值守链路也必须有 trace —— 这恰恰是"凌晨三点谁在干活"
+    # ★ 无人值守链路也必须有 trace —— 这恰恰是"凌晨三点谁在干活"
     #   唯一的答案来源。里面每个 Agent 节点的 span 由 supervisor 自动挂。
     """接收告警系统推送的事件，自动完成判断并给出处置方案。
 
@@ -865,7 +865,7 @@ def webhook_alert(payload: dict):
 
     【当前的执行边界】
     risk 为 low / medium 时生成诊断预案；risk 为 high 时拒绝执行、转人工。
-    命令的真实执行需要沙箱层（Day 5 接入），在此之前只产出计划不落地。
+    命令的真实执行需要沙箱层，在此之前只产出计划不落地。
     这个边界是刻意的：宁可少做，不可做错。
     """
     alerts = normalize_alerts(payload)
@@ -907,7 +907,7 @@ def webhook_alert(payload: dict):
                       "reason": "只读诊断，已生成处置预案",
                       "playbook": playbook,
                       "executed": False,
-                      "note": "命令执行需接入沙箱层，计划在 Day 5 落地"}
+                      "note": "命令执行需接入沙箱层，尚未落地"}
 
         write_audit("alert.handled", report)
         reports.append(report)
@@ -1025,7 +1025,7 @@ def rag_ask(req: SearchRequest):
 # ============================================================
 # Agent：ReAct 循环（自己决定调哪个工具）
 # ============================================================
-# 这一组接口是项目的分水岭：前三天的接口都是"你说一句，它答一句"，
+# 这一组接口是项目的分水岭：前面的接口都是"你说一句，它答一句"，
 # 从这里开始，服务会**自己决定要做几件事、按什么顺序做**。
 class AgentRequest(BaseModel):
     question: str = Field(..., min_length=1, max_length=2000,
@@ -1046,7 +1046,7 @@ def agent_tools():
 
     【为什么要把这个暴露成接口】
     1. 调试时能一眼看到"模型到底有哪些牌可打"
-    2. 演示时可以直接给面试官看 —— 工具清单就是能力的边界
+    2. 演示时可以直接展示 —— 工具清单就是能力的边界
     3. 风险等级在这里是公开的：调用方能看到哪些操作需要人工确认
     """
     from app.tools import tool_catalog
@@ -1065,7 +1065,7 @@ def agent_graph(max_steps: int = Query(6, ge=1, le=12),
     把这段文本贴进任何支持 mermaid 的地方（GitHub README、飞书文档、
     VS Code 预览）就会渲染成流程图。
 
-    面试时这张图比任何口头描述都直观：**一眼能看出哪里是循环**。
+    这张图比任何口头描述都直观：**一眼能看出哪里是循环**。
     """
     from app.agents.graph import mermaid
     if engine == "supervisor":
@@ -1087,7 +1087,7 @@ def agent_ask(req: AgentRequest):
     一次要跑好几秒。写成 def，FastAPI 会把它丢进线程池执行；
     写成 async def 反而会卡住事件循环 —— 一个请求就把所有人都堵住。
 
-    这是新手最容易搞反的一处：**不是所有接口都该写成 async。**
+    这是最容易搞反的一处：**不是所有接口都该写成 async。**
     只有内部真的用了异步 IO（比如 httpx.AsyncClient）时，
     async def 才有意义。
     """
@@ -1177,7 +1177,7 @@ def agent_ask(req: AgentRequest):
 
 
 # ============================================================
-# 十二、沙箱与人工确认（Day 7）
+# 十二、沙箱与人工确认
 # ============================================================
 # 这一组接口是**给人用的**，不是给 Agent 用的。
 #
@@ -1210,7 +1210,7 @@ class ApprovalAction(BaseModel):
 def sandbox_status():
     """沙箱状态 + 命令白名单。
 
-    面试演示时这个接口很有用：它一次回答了"你能执行什么、哪些要人批、
+    演示时这个接口很有用：它一次回答了"你能执行什么、哪些要人批、
     **哪些真的有隔离**"三个问题。
     """
     from app.sandbox import executor, policy
@@ -1404,9 +1404,9 @@ def execute_approval(approval_id: str, req: ApprovalAction):
 
 
 # ============================================================
-# 十三、可观测查询接口（Day 8）
+# 十三、可观测查询接口
 # ============================================================
-# 这三个接口回答运维/面试中最值钱的三类问题：
+# 这三个接口回答运维中最值得关注的三类问题：
 #     GET /traces           "刚才那次运行到底发生了什么？"（逐步轨迹）
 #     GET /traces/{id}      "这一步为什么慢/为什么错？"（单次详情）
 #     GET /metrics/summary  "钱花在哪了？哪一步最慢？"（聚合看板）

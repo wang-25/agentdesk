@@ -116,7 +116,7 @@
       "doc": "docker-exit-code",
       "question": "容器退出码 137 是什么意思？",
       "expect_points": ["SIGKILL", "OOM", "128"],
-      "note": "高频面试题"
+      "note": "高频问题"
     },
     {
       "id": "r13",

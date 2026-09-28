@@ -229,7 +229,7 @@ def compare_one(case: dict, max_steps: int = 6) -> dict:
 # 汇总与报告
 # ============================================================
 def build_report(comparisons: list) -> str:
-    """生成 markdown 报告 —— 可以粘进简历附带的文档里。"""
+    """生成 markdown 报告 —— 可以粘进项目说明文档里。"""
     lines = [
         "# 手写 ReAct vs LangGraph 对比报告",
         "",

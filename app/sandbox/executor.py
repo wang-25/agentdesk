@@ -143,7 +143,7 @@ def _clip(text: str) -> tuple:
 
     命令的输出是**不可预知长度**的。一条 `journalctl` 可能吐几百 MB，
     直接塞进模型上下文会爆掉窗口，而且花的全是冤枉钱。
-    所以在这里兜住 —— 这跟 Day 4 给工具输出做 limit 是同一个思路：
+    所以在这里兜住 —— 这跟给工具输出做 limit 是同一个思路：
     **凡是外部来的、长度不可控的东西，都要有上限。**
     """
     raw = (text or "").encode("utf-8", errors="replace")
