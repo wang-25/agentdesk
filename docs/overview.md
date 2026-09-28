@@ -179,7 +179,7 @@ https://agent.simosheng.fun/docs   # 线上（先点右上角 Authorize 填令�
 | **1** | 环境搭建、密钥隔离、第一次模型调用 | `check_env.py` | 成本公式跑通；能打印 token 用量 |
 | **2** | 服务化 | `app/llm.py` `app/main.py` | **22 个接口**；SSE 流式；自动重试把结构化输出成功率从 ~70% 提到 90%+ |
 | **3** | RAG 全链路 | `app/rag/` | 6 篇语料 / 50 块；混合检索召回 **100%**（纯向量 93.8% / BM25 96.9%） |
-| **4** | 工具层 + 双引擎 | `app/tools/` `app/agents/react.py` `graph.py` | 7 个只读运维工具；手写 vs LangGraph 对比（工具选择 3/3 一致） |
+| **4** | 工具层 + 双引擎 | `app/tools/` `app/agents/react.py` `graph.py` | 7 个运维工具（6 只读 + 1 执行）；手写 vs LangGraph 对比（工具选择 3/3 一致） |
 | **5** | MCP Server | `app/mcp_server/` | 7 tools + 2 resources；协议层自检 **9/9**；schema 漂移校验 |
 | **6** | 多 Agent 编排 | `app/agents/supervisor.py` `specialists.py` | 意图路由逐字段准确率 **90%**（task_type/hosts 100%） |
 | **7** | 沙箱 + 人工确认 | `app/sandbox/` | 白名单 13 条 / 拦截 42 个高危二进制；**真 Docker 验证**：非 root、根只读、无网络、内存封顶 |

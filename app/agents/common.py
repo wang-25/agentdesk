@@ -23,7 +23,7 @@ ReAct 两个实现的公共部分
 import json
 
 from app.llm import chat_step
-from app.tools import execute_tool, tool_result_text, tool_schemas
+from app.tools import execute_tool, host_list_text, tool_result_text, tool_schemas
 
 # ============================================================
 # 系统提示
@@ -58,7 +58,11 @@ SYSTEM_PROMPT = """你是一个 Linux 运维诊断助手。你可以调用工具
    - **根因**：你的判断，并说明置信度（确定 / 可能 / 需要更多信息）
    - **建议**：具体的处置步骤，按优先级排
 
-已知主机：web-01（Web 服务器）、db-01（数据库）、cache-01（缓存）"""
+已知主机："""
+
+# 已知主机清单从配置里取（见 app/tools/ops.py 的 KNOWN_HOSTS）。
+# 不写死在 prompt 里 —— 否则换机器时得同时改代码、prompt、文档三处，迟早对不上。
+SYSTEM_PROMPT += host_list_text()
 
 DEFAULT_MAX_STEPS = 6
 

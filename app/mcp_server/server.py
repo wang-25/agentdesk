@@ -2,10 +2,10 @@
 """
 AgentDesk MCP Server
 ============================================================
-把 `app/tools/` 里那 6 个运维工具暴露成 **MCP 标准协议**。
+把 `app/tools/` 里那 7 个运维工具暴露成 **MCP 标准协议**。
 
 【为什么值得单独做这一层】
-在这之前，6 个工具只有本项目自己能调用。做完 MCP 之后，
+在这之前，7 个工具只有本项目自己能调用。做完 MCP 之后，
 **任何支持 MCP 的客户端**（Cursor / Claude Desktop / 其他 Agent 平台）
 都能直接调用它们。
 
@@ -23,7 +23,7 @@ MCP（Model Context Protocol）= **AI 应用和外部能力之间的 USB-C 接�
                M + N 份
 
 【MCP 的三种原语】
-    tools      可调用的动作（会改变状态或消耗资源）—— 本项目 6 个
+    tools      可调用的动作（会改变状态或消耗资源）—— 本项目 7 个
     resources  可读取的数据（只读，像"文件"）        —— 本项目 2 个
     prompts    可复用的提示词模板                     —— 本项目暂时没用
 
@@ -67,7 +67,7 @@ from pydantic import Field
 
 from app.llm import PROJECT_ROOT
 from app.tools import TOOLS, execute_tool
-from app.tools.ops import BACKEND
+from app.tools.ops import BACKEND, host_list_text
 
 # ============================================================
 # 一、风险提示 —— 用协议自带的字段，而不是自己发明
@@ -78,7 +78,8 @@ from app.tools.ops import BACKEND
 #     idempotent_hint  重复调用结果一样
 #     open_world_hint  会跟外部系统交互（而不是纯本地计算）
 #
-# 本项目的 6 个工具全都是只读诊断，所以四个值固定。
+# 本项目的 6 个只读工具都属诊断型，所以四个值固定。
+# （唯一例外是 run_command —— 它能提交写操作，单独标成 MUTATING。）
 # **重点不是这四个值，而是"用协议规定的字段表达风险"这件事** ——
 # 客户端（Cursor 等）能读懂这些字段，进而在 UI 上提示用户、
 # 或者在自动模式下决定要不要弹确认框。
@@ -131,7 +132,7 @@ server = MCPServer(
         "写操作（重启服务、清理日志）会提交人工审批，批准后才执行。"
         "典型用法：先用 check_disk / check_load / list_containers 看整体，"
         "再用 tail_log 定位具体原因，需要经验时用 search_knowledge 查知识库。"
-        "已知主机：web-01（Web）、db-01（数据库）、cache-01（缓存）。"
+        "已知主机：" + host_list_text() + "。"
     ),
 )
 
@@ -183,7 +184,7 @@ def _call(name: str, **kwargs):
 
 
 # ============================================================
-# 三、6 个工具
+# 三、7 个工具
 # ============================================================
 # 参数描述必须用 Annotated + Field —— docstring 里的 Args 段不会被解析。
 # 类型注解决定 schema 里的 type，有没有默认值决定它是否进 required。
@@ -433,7 +434,7 @@ def main(argv=None):
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="AgentDesk MCP Server —— 把 6 个运维工具暴露成 MCP 协议")
+        description="AgentDesk MCP Server —— 把 7 个运维工具暴露成 MCP 协议")
     parser.add_argument("--transport", choices=["stdio", "streamable-http", "sse"],
                         default="stdio",
                         help="传输方式：stdio（本地，给 Cursor 用）/"

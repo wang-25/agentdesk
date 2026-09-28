@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """MCP Server —— 把 Agent 的工具暴露成标准协议
 
-    server.py   用官方 mcp SDK 的 FastMCP 暴露 6 个工具 + 1 个资源
+    server.py   用官方 mcp SDK 的 FastMCP 暴露 7 个工具 + 2 个资源
 
 【为什么要有这一层】
-在这之前，6 个工具只有本项目自己能调用。MCP 是一层标准协议，
+在这之前，7 个工具只有本项目自己能调用。MCP 是一层标准协议，
 做好之后**任何支持 MCP 的客户端**（Cursor、Claude Desktop、其他 Agent）
 都能直接调用它们 —— 项目从"自用工具"变成"生态里的一个能力提供方"。
 

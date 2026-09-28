@@ -19,7 +19,7 @@
 |---|---|---|
 | **大模型** | `app/llm.py` 统一调用 DeepSeek | 没有"理解人话"的能力 |
 | **私有知识** | `app/rag/` 检索你自己的排障文档 | 只能答通用问题，答不了"你们这台机器" |
-| **能执行** | `app/tools/` 6 个运维工具 | 只能"说"，不能"查"，结论无法验证 |
+| **能执行** | `app/tools/` 7 个运维工具 | 只能"说"，不能"查"，结论无法验证 |
 
 而"服务"这两个字的意思是：**它不是一个聊天框，是一个可以被别的系统调用的地址。**
 
@@ -52,9 +52,9 @@
  │                      app/tools/  （唯一的实现）                 │
  │  check_disk · check_load · check_service ·                     │
  │  list_containers · tail_log · search_knowledge ────────────────┘
- │  参数白名单 + 只读 + 风险分级 + mock/local 双后端                │
+ │  参数白名单 + 只读 + 风险分级 + mock/local/ssh                   │
  └────────────────────────────┬───────────────────────────────────┘
-                              │ 查真实系统（mock 仿真 / local 只读命令）
+                              │ 查真实系统（mock 仿真 / local 本机 / ssh 远程）
                  ┌────────────▼────────────────┐
                  │        DeepSeek API         │  ← 外部
                  └─────────────────────────────┘
@@ -188,7 +188,7 @@ Agent 的「手」：能去查真实的磁盘、日志、服务状态、容器
 
 | 文件 | 干什么的 |
 |---|---|
-| `ops.py` | 6 个工具 + 参数白名单 + 风险分级 + 双后端 + 注册表 |
+| `ops.py` | 7 个工具 + 参数白名单 + 风险分级 + 三后端（mock/local/ssh）+ 注册表 |
 
 六个工具，**全部只读**：
 
@@ -275,7 +275,7 @@ server.py   6 tools + 2 resources + schema 一致性校验
 
 | 用了 MCP 的哪部分 | 内容 |
 |---|---|
-| **tools** | 6 个运维工具（"做一件事"） |
+| **tools** | 7 个运维工具（"做一件事"） |
 | **resources** | `agentdesk://tools/catalog`（工具清单）、`agentdesk://audit/recent`（审计记录） |
 | **annotations** | 协议级的风险提示：`readOnlyHint=True` / `destructiveHint=False` / `idempotentHint=True` / `openWorldHint=True` |
 | **prompts** | 没用（暂时没有要固化的提示词模板） |
@@ -446,7 +446,7 @@ pipeline.py   串起来 + 评测    （编排 + 问答 + 算分）
 用户提问「web-01 上的网站很慢，有时报 502」
   → ① 组装 messages（system prompt + 问题）
   → 循环开始（最多 max_steps 轮）：
-      ② 调模型，带上 6 个工具的 schema      chat_step(messages, tools=...)
+      ② 调模型，带上 7 个工具的 schema      chat_step(messages, tools=...)
       ③ 模型返回 tool_calls？── 没有 ──→ 它要回答了，跳出循环
       ④ 有 → 逐个执行工具                    execute_tool()
               参数校验 → 执行 → 结果转成文本
@@ -485,7 +485,7 @@ pipeline.py   串起来 + 评测    （编排 + 问答 + 算分）
 外部 MCP 客户端（Cursor / Claude Desktop）
   → ① 客户端把 server 当子进程启动          command + args + cwd
   → ② initialize 握手                       拿到 serverInfo 与会话 ID
-  → ③ tools/list                            拉到 6 个工具的 schema + 风险提示
+  → ③ tools/list                            拉到 7 个工具的 schema + 风险提示
   → ④ 用户在 Cursor 里问「web-01 磁盘满了吗」
        Cursor 自己的模型决定调用 check_disk
   → ⑤ tools/call {"name":"check_disk","arguments":{"host":"web-01"}}

@@ -107,6 +107,53 @@ def check_env():
            "dashscope（真语义）" if os.getenv("DASHSCOPE_API_KEY")
            else "local 兜底（词面匹配，能跑通但不是真语义）")
 
+    # ---- 工具层数据源 ----
+    # ★ 这一项必须报出来。工具层接的是仿真数据还是真机，
+    #   决定了后面所有诊断结论的性质 —— 不写清楚，
+    #   读报告的人会默认"它查的是真机器"。
+    report_tool_backend()
+
+
+def report_tool_backend():
+    """报出工具层后端；ssh 后端下**顺手验一次连通性**。
+
+    ★ 为什么要真连一次：配置写错（密钥路径不对、IP 写错、目标机器没开）
+      是个很容易发生、又不会在启动时报错的错误 ——
+      它会一直潜伏到某次工具调用才暴露，而那时你正在演示。
+      在自检里花一次只读查询把它揪出来，成本几乎为零。
+    """
+    try:
+        from app.tools.ops import BACKEND, KNOWN_HOSTS, SSH_TARGETS, execute_tool
+    except Exception as e:
+        record("环境", "工具层后端", False,
+               str(e).replace("\n", " ")[:90])
+        return
+
+    if BACKEND != "ssh":
+        record("环境", f"工具层后端 {BACKEND}", True,
+               "内置仿真数据，不连任何真实机器" if BACKEND == "mock"
+               else "在本机执行只读命令")
+        return
+
+    if not SSH_TARGETS:
+        record("环境", "工具层后端 ssh", False,
+               "OPS_SSH_TARGETS 是空的 —— ssh 后端必须配映射表")
+        return
+
+    desc = ", ".join(f"{k}={v['user']}@{v['host']}:{v['port']}"
+                     for k, v in SSH_TARGETS.items())
+    failures = []
+    for name in SSH_TARGETS:
+        # 用 check_load 探活：它是最轻的只读查询之一，
+        # 而且会顺带证明"整条链路（ssh → 解析 → 返回）通"，
+        # 不只是"端口能连上"。
+        out = execute_tool("check_load", {"host": name})
+        if not out.get("ok"):
+            failures.append(f"{name}: {str(out.get('error'))[:70]}")
+    record("环境", f"工具层后端 ssh（{KNOWN_HOSTS}）", not failures,
+           f"{desc}　{len(SSH_TARGETS)} 个目标连通" if not failures
+           else "连不上 → " + "；".join(failures))
+
 
 # ============================================================
 # 第二层：模型连通

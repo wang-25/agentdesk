@@ -72,7 +72,7 @@ import re
 from app.agents.common import new_usage
 from app.agents.graph import run as _react_run
 from app.llm import ModelError, chat_json
-from app.tools.ops import KNOWN_HOSTS
+from app.tools.ops import KNOWN_HOSTS, host_list_text
 
 # ============================================================
 # 一、意图路由 Agent
@@ -103,7 +103,7 @@ INTENT_SYSTEM = """你是一个运维请求的意图分类器。你的唯一任�
               （例：为什么清理日志要用 truncate、怎么做滚动重启）
     other     以上都不是
 
-- hosts：问题涉及的主机名数组。只能从这几个里选：web-01、db-01、cache-01。
+- hosts：问题涉及的主机名数组。只能从下方「已知主机」清单里选。
           **没提到具体主机就返回空数组**，不要猜、不要默认填。
 
 - services：涉及的软件或服务名数组（如 nginx、mysql、redis、docker）。
@@ -121,6 +121,10 @@ INTENT_SYSTEM = """你是一个运维请求的意图分类器。你的唯一任�
 - reason：一句话说明你的判断依据（不超过 40 字）。**必须写**，它是给人看的审计依据。
 
 只输出 JSON 对象，不要任何解释文字。"""
+
+# 已知主机清单从配置里取（见 app/tools/ops.py 的 KNOWN_HOSTS）。
+# 写死在 prompt 里的话，换机器时得同时改代码、prompt、文档，漏一处就自相矛盾。
+INTENT_SYSTEM += "\n\n已知主机：" + host_list_text() + "。"
 
 
 # task_type 的合法取值。**定义一次，两处引用。**

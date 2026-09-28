@@ -1,6 +1,6 @@
 # MCP Server —— 把工具暴露成标准协议
 
-> **这一步做了什么**：把 `app/tools/` 里那 6 个运维工具，从"本项目自己能用"
+> **这一步做了什么**：把 `app/tools/` 里那 7 个运维工具，从"本项目自己能用"
 > 变成"**任何支持 MCP 的客户端都能调用**"。
 >
 > 更新日期：2026-09-26
@@ -57,7 +57,7 @@
 
 | 原语 | 是什么 | 判断标准 | 本项目 |
 |---|---|---|---|
-| **tools** | 可调用的**动作**（会消耗资源或改变状态） | "做一件事" | 6 个 |
+| **tools** | 可调用的**动作**（会消耗资源或改变状态） | "做一件事" | 7 个 |
 | **resources** | 可读取的**数据**（只读，像"文件"） | "读一份数据" | 2 个 |
 | **prompts** | 可复用的**提示词模板** | "固化一段话术" | 暂时没用 |
 
@@ -75,7 +75,7 @@
 
 | URI | 内容 |
 |---|---|
-| `agentdesk://tools/catalog` | 6 个工具的元数据（名称、风险等级、参数、说明） |
+| `agentdesk://tools/catalog` | 7 个工具的元数据（名称、风险等级、参数、说明） |
 | `agentdesk://audit/recent` | 最近 20 条审计记录（谁在什么时候做了什么） |
 
 ### 1.2 ★ 风险提示：用协议自带的字段，不要自己发明
@@ -307,7 +307,7 @@ def x() -> dict:        # ❌ InvalidSignature:
   名称     agentdesk-ops
   版本     0.1.0
   工具后端 mock（mock = 仿真数据 / local = 真机只读命令）
-  工具数   6
+  工具数   7
   资源数   2（agentdesk://tools/catalog / agentdesk://audit/recent）
 
   · check_disk         risk=low    host
@@ -316,6 +316,7 @@ def x() -> dict:        # ❌ InvalidSignature:
   · list_containers    risk=low    host
   · tail_log           risk=low    host*  service*  lines
   · search_knowledge   risk=low    query*  top_k
+  · run_command        risk=high   command*  purpose
   （参数名后带 * 表示必填）
 
   ✅ MCP schema 与 ops.py 定义一致，无漂移
@@ -335,7 +336,7 @@ def x() -> dict:        # ❌ InvalidSignature:
   ✅ initialize 握手成功   server = agentdesk-ops v0.1.0
 
 [2/4] 列出工具
-  ✅ list_tools   收到 6 个工具
+  ✅ list_tools   收到 7 个工具
       · check_disk         参数 ['host']　必填 []　只读提示 True
       · tail_log           参数 ['host', 'lines', 'service']　必填 ['host', 'service']　只读提示 True
       · search_knowledge   参数 ['query', 'top_k']　必填 ['query']　只读提示 True
@@ -349,7 +350,7 @@ def x() -> dict:        # ❌ InvalidSignature:
   ✅ 调用不存在的工具会报错   返回 isError（进程没有崩）
 
 [4/4] 读取资源
-  ✅ read agentdesk://tools/catalog   工具数 6　后端 mock
+  ✅ read agentdesk://tools/catalog   工具数 7　后端 mock
   ✅ read agentdesk://audit/recent   8 条审计记录
 ```
 
@@ -376,7 +377,7 @@ POST /mcp  initialize
 POST /mcp  tools/list
   → check_disk  {'readOnlyHint': True, 'destructiveHint': False,
                  'idempotentHint': True, 'openWorldHint': True}
-    （6 个工具都是这组值）
+    （前 6 个只读工具都是这组值；run_command 是 MUTATING）
 
 POST /mcp  tools/call  {"name":"check_disk","arguments":{"host":"web-01"}}
   → {"content":[{"type":"text","text":"{\"host\":\"web-01\",\"max_use_percent\":96,
@@ -423,8 +424,8 @@ MCP 已经是 `scripts\smoke_test.py` 的**第 5 层**（加 `--full` 会跑协�
 
 ```
 [5/6] MCP Server　—— 工具的标准协议出口
-  ✅ 服务端载入：agentdesk-ops   工具 6 个 · 资源 2 个
-  ✅ schema 与 ops.py 一致（无漂移）   6 个工具全部对齐
+  ✅ 服务端载入：agentdesk-ops   工具 7 个 · 资源 2 个
+  ✅ schema 与 ops.py 一致（无漂移）   7 个工具全部对齐
   ✅ 协议层自检（真客户端连真 server）   9/9 项通过
 ```
 
@@ -443,7 +444,7 @@ MCP 已经是 `scripts\smoke_test.py` 的**第 5 层**（加 `--full` 会跑协�
 
 ### 5.2 用到了哪些 MCP 原语
 
-> 三种原语用了两种：**6 个 tools + 2 个 resources**。
+> 三种原语用了两种：**7 个 tools + 2 个 resources**。
 >
 > prompts 没用 —— 我暂时没有需要固化的提示词模板。
 >
@@ -456,8 +457,10 @@ MCP 已经是 `scripts\smoke_test.py` 的**第 5 层**（加 `--full` 会跑协�
 
 > 用协议**自带的** `annotations` 字段，不自己发明。
 > MCP 定义了四个 hint：`readOnlyHint`、`destructiveHint`、
-> `idempotentHint`、`openWorldHint`。我那 6 个工具全是只读诊断，
-> 所以是 `readOnly=True / destructive=False / idempotent=True / openWorld=True`。
+> `idempotentHint`、`openWorldHint`。那 6 个只读工具全是诊断型，
+> 所以是 `readOnly=True / destructive=False / idempotent=True / openWorld=True`；
+> 只有 `run_command` 单独标成 MUTATING —— 因为它能提交写操作，
+> **风险标注按最坏情况标，不按典型情况标**。
 >
 > **重点不是我填了什么值，而是客户端认识这些字段** ——
 > Cursor 能据此在 UI 上提示用户，或者在自动模式下决定要不要弹确认框。

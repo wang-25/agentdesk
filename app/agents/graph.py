@@ -235,7 +235,7 @@ def make_agent_node(tool_names: list = None):
     【为什么要工厂，而不是直接写个 agent_node】
     多 Agent 拆分之后，同一个 ReAct 图标会被复用多次，但**每次要用不同的工具子集**：
         工具执行 Agent   只给 5 个运维工具（不给 search_knowledge）
-        单 Agent 模式    给全部 6 个
+        单 Agent 模式    给全部 7 个
 
     LangGraph 的节点是普通可调用对象，所以"用闭包带上配置"是最直接的做法。
     另一种做法是把配置塞进 state —— 但那是"运行时数据"，

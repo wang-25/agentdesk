@@ -364,8 +364,8 @@ curl -s -X POST http://127.0.0.1:8000/agent/ask \
 Agent 层会检查四件事：
 
 ```
-✅ 注册表载入 6 个工具   后端 mock
-✅ schema 转换 6 条      模型看到的就是这些 schema
+✅ 注册表载入 7 个工具   后端 mock
+✅ schema 转换 7 条      模型看到的就是这些 schema
 ✅ 执行 check_disk(web-01)   最高使用率 96% / level=critical
 ✅ 拒绝非法参数（防注入）   主机名不合法：'web-01; rm -rf /'
 ✅ 手写 ReAct 引擎可导入
@@ -443,7 +443,7 @@ Agent 层会检查四件事：
 
 | 文件 | 作用 |
 |---|---|
-| `app/tools/ops.py` | 6 个运维工具 + 参数白名单 + 风险分级 + mock/local 双后端 |
+| `app/tools/ops.py` | 7 个运维工具 + 参数白名单 + 风险分级 + mock/local/ssh 三后端 |
 | `app/agents/common.py` | 两个引擎共用的 Prompt、消息处理、工具执行（保证对比公平） |
 | `app/agents/react.py` | 手写 ReAct 循环（零依赖） |
 | `app/agents/graph.py` | LangGraph 状态图版本 |

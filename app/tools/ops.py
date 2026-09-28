@@ -5,14 +5,21 @@
 只做问答的 Agent 只会「说」。RAG 让它「知道」，但输出的仍然只是文字。
 这一层给它手：能去查真实的磁盘、日志、服务状态、容器。
 
-【两个可切换的后端】
-    mock  —— 仿真数据。Windows 上也能跑，演示和评测用（默认）
-    local —— 真的执行只读命令。Linux 上可用（会换成 Docker 沙箱）
+【三个可切换的后端】
+    mock  —— 仿真数据。任何机器上 clone 下来都能跑通整条链路（默认）
+    local —— 在本机执行只读命令（Linux）
+    ssh   —— 通过 SSH 到真实远程主机执行只读命令
 
-为什么必须做双后端：
+为什么必须做 mock：
     工具层如果一开始就依赖"真的连上一台机器"，那这个项目在别人电脑上
     就完全跑不起来 —— 别人 clone 下来什么都看不到。
     而 mock 数据让整条链路可复现：同样的输入，永远得到同样的输出。
+
+为什么 local 和 ssh 共用同一套解析器：
+    远端命令的输出格式和本机一样（都是 `df -h` / `docker ps` / `systemctl`）。
+    所以「命令在哪执行」和「输出怎么解析」必须拆开：
+    只有运输层不同，解析层共用一份代码 ——
+    否则两种后端各写一套解析，迟早跑出不一致的结论，而且很难发现。
 
 【安全三原则】—— 这是最容易被追问的地方
     1. 全部只读：没有任何写操作。不重启、不删除、不修改配置。
@@ -32,13 +39,82 @@ import os
 import re
 import subprocess
 import time
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+# 自己加载 .env —— 不依赖别的模块"恰好先加载过"。
+#
+# ★ 这里踩过一次，值得记下来：
+#   下面那些配置（BACKEND / SSH_TARGETS）都是**模块导入时**读一次，
+#   而 .env 原先只由 llm.py / security.py / embedder.py 加载。
+#   于是任何"先 import app.tools"的入口 —— 自检脚本、直接跑工具、
+#   单独写的小测试 —— 都会读到空环境，静默退回 mock。
+#   表现出来是「明明配了 OPS_BACKEND=ssh，却还在看仿真数据」，
+#   而且**一个错都不报**，因为 mock 本来就是合法默认值。
+#
+#   教训：**配置的读取必须和使用它的代码绑在一起，不能靠 import 顺序。**
+#   顺序这种东西没有任何东西在保证它。
+#
+# load_dotenv 默认不覆盖已存在的环境变量（override=False），
+# 所以命令行上临时指定 `OPS_BACKEND=mock python ...` 仍然能盖过 .env ——
+# 这正是回归测试需要的。
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+load_dotenv(PROJECT_ROOT / ".env")
 
 # ============================================================
 # 零、后端选择
 # ============================================================
 # 默认 mock：保证在任何机器上都能跑通。
-# 要跑真机就把环境变量 OPS_BACKEND 设成 local。
+# 要查真机就把 OPS_BACKEND 设成 local（本机）或 ssh（远程）。
 BACKEND = (os.getenv("OPS_BACKEND") or "mock").strip().lower()
+
+# ---- ssh 后端配置 ----
+# 设计要点：**逻辑主机名与真实地址解耦**。
+# Agent 的"资产清单"里叫 web-01，它并不该知道 web-01 到底在哪 ——
+# 那张映射表放在环境变量里，Agent 只能看到逻辑名。
+# 这样做的两个好处：
+#   1. 换机器只改配置，prompt / 评测集 / 文档一行都不用动
+#   2. 模型无法"自己编一个 IP 去连"，它能选的只有清单里的名字
+SSH_KEY = (os.getenv("OPS_SSH_KEY") or "").strip()
+SSH_DEFAULT_USER = (os.getenv("OPS_SSH_USER") or "root").strip()
+# 单条命令的执行超时 / 建连超时。分开设：建连慢和命令慢是两回事，
+# 混在一起会让"连不上"和"命令卡死"报出同一个错，根本没法排查。
+SSH_TIMEOUT = int(os.getenv("OPS_SSH_TIMEOUT") or "15")
+SSH_CONNECT_TIMEOUT = int(os.getenv("OPS_SSH_CONNECT_TIMEOUT") or "8")
+
+
+def _parse_ssh_targets(raw: str) -> dict:
+    """解析 `名称=user@host[:port]`，逗号分隔。
+
+    例：`OPS_SSH_TARGETS=web-01=root@1.2.3.4:22,db-01=ops@10.0.0.9`
+    写成解析函数而不是直接 eval，是因为这份配置来自环境变量 ——
+    和工具参数一样属于"外部输入"，不该有任何被解释执行的机会。
+    """
+    out = {}
+    for item in (raw or "").split(","):
+        item = item.strip()
+        if not item or "=" not in item:
+            continue
+        name, spec = item.split("=", 1)
+        name, spec = name.strip(), spec.strip()
+        user = SSH_DEFAULT_USER
+        if "@" in spec:
+            user, spec = spec.split("@", 1)
+        host, _, port = spec.partition(":")
+        if name and host:
+            try:
+                out[name] = {"user": user.strip() or SSH_DEFAULT_USER,
+                             "host": host.strip(),
+                             "port": int(port or 22)}
+            except ValueError:
+                # 这里抛 ValueError 而不是 ToolError：ToolError 定义在后面，
+                # 而且配置写错属于"启动就该失败"，不该等到某次工具调用才暴露。
+                raise ValueError(f"OPS_SSH_TARGETS 里的端口不是数字：{item!r}")
+    return out
+
+
+SSH_TARGETS = _parse_ssh_targets(os.getenv("OPS_SSH_TARGETS"))
 
 
 # ============================================================
@@ -50,7 +126,47 @@ _SERVICE_RE = re.compile(r"^[a-zA-Z0-9_.@-]{1,32}$")
 _HOST_RE = re.compile(r"^[a-zA-Z0-9.-]{1,64}$")
 
 # 已知主机清单。只允许查这几台 —— 模型不能自己编一个主机名去连。
-KNOWN_HOSTS = ["web-01", "db-01", "cache-01"]
+_DEFAULT_HOSTS = ["web-01", "db-01", "cache-01"]
+
+
+def _resolve_hosts() -> list:
+    """决定"已知主机"是哪几台。
+
+    优先级：
+      1. OPS_HOSTS —— 显式清单（逗号分隔）
+      2. ssh 后端下已经配了 SSH 目标的名字 —— 配置即清单，不用两处维护，
+         而且能天然避免"配了却没生效"这种错
+      3. 默认三台 —— mock 用的仿真主机，也是没配任何东西时的兜底
+
+    默认仍然是原来那三台：**不配任何环境变量时，行为与之前完全一致。**
+    """
+    env = (os.getenv("OPS_HOSTS") or "").strip()
+    if env:
+        return [h.strip() for h in env.split(",") if h.strip()]
+    if BACKEND == "ssh" and SSH_TARGETS:
+        return list(SSH_TARGETS)
+    return list(_DEFAULT_HOSTS)
+
+
+KNOWN_HOSTS = _resolve_hosts()
+
+# 主机角色说明。只是给模型的语义提示，让它能把「网站访问慢」对上某台主机。
+# 是可选的：清单里换成别的名字照样工作，只是少一点语义线索。
+_HOST_ROLES = {"web-01": "Web 服务器", "db-01": "数据库", "cache-01": "缓存"}
+
+
+def host_list_text() -> str:
+    """把已知主机清单渲染成给模型看的一句话。
+
+    ★ 从 KNOWN_HOSTS 生成，而不是写死在 prompt 里。
+      写死的话，换机器时得同时改代码、prompt、MCP 工具描述、文档四处 ——
+      漏掉任意一处，就会出现「prompt 说只有三台、配置里却是别的」这种矛盾，
+      而模型会照着 prompt 里的错清单去猜主机名。
+    """
+    return "、".join(
+        f"{h}（{_HOST_ROLES[h]}）" if h in _HOST_ROLES else h
+        for h in KNOWN_HOSTS
+    )
 
 
 class ToolError(Exception):
@@ -214,28 +330,137 @@ def _mock(host: str) -> dict:
 
 
 # ============================================================
-# 三、local 后端：真的执行只读命令
+# 三、真机执行通道：local（本机）/ ssh（远程）
 # ============================================================
-# 只允许这几个固定的命令模板。注意没有一处是把参数拼进 shell 字符串 ——
+# 只允许固定的命令模板。注意没有一处是把参数拼进 shell 字符串 ——
 # subprocess 传的是"列表"，等于告诉内核"这是参数列表，不是一段命令"，
 # shell 根本没机会解释其中的分号、管道、反引号。
 #
 # shell=False 是关键：如果写成 shell=True，白名单就形同虚设。
-def _run(cmd: list, timeout: int = 10) -> str:
-    proc = subprocess.run(
-        cmd, shell=False, timeout=timeout,
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, encoding="utf-8", errors="replace",
-    )
-    return proc.stdout.strip()
+#
+# ★ SSH 有一个细节必须写清楚，否则容易误判安全性：
+#   `ssh 主机 命令 参数` 里的"命令 + 参数"最终会被**远端的 shell** 解释。
+#   也就是说远端那一层 shell 是客观存在的，约束不在本地。
+#   两道防线，缺一不可：
+#     1. 参数来源受限：能进这里的东西只允许来自固定模板或已过正则校验
+#        （`service` 过 _SERVICE_RE、`lines` 转 int、日志路径从固定候选表里挑）
+#     2. 参数逐项加引号（见 _remote_quote）—— 把参数边界重新画出来
+def _remote_quote(arg) -> str:
+    """把一个参数包成"远端 shell 不会动它"的形式。
+
+    ★ 为什么必须做这一步（实测踩过，不是理论担忧）：
+      subprocess 传列表时，本地没有 shell，参数边界天然安全。
+      但一旦跨过 SSH，**远端那个 shell 又回来了**：
+        `ssh 主机 docker ps --format {{.Names}}\\t{{.Status}}`
+      远端 shell 会把未加引号的 `\\t` 解释掉，只剩一个字母 `t` ——
+      docker 拿到的格式串就废了，实测输出变成
+      `agentdesktagentdesk:1.0.0tUp 4 hours`（分隔符只剩 t）。
+      所以过了 SSH 这一跳，必须**重新把参数边界画出来**。
+      顺带也堵住了分号、管道、通配符被远端解释的可能。
+    """
+    return "'" + str(arg).replace("'", "'\\''") + "'"
 
 
-def _local_disk(host: str) -> list:
-    out = _run(["df", "-h"])
+def _remote_command(cmd: list) -> str:
+    """把参数列表拼成一条"逐参数已加引号"的远端命令。"""
+    return " ".join(_remote_quote(a) for a in cmd)
+
+
+def _exec(cmd: list, host: str = None, timeout: int = None) -> tuple:
+    """把一条命令送到"它该去的地方"执行。返回 (rc, 输出文本)。
+
+    这是唯一的运输层出口。上面的解析器只调用它，
+    不关心命令究竟跑在本机还是远端 —— 这就是两种后端能共用解析器的原因。
+    """
+    if BACKEND == "ssh":
+        target = SSH_TARGETS.get(host or "")
+        if not target:
+            raise ToolError(
+                f"主机 {host!r} 没有配置 SSH 目标。请在 OPS_SSH_TARGETS 里补上"
+                f"（当前已配置：{list(SSH_TARGETS) or '空'}）"
+            )
+        argv = [
+            "ssh",
+            # BatchMode=yes：绝不弹密码提示。自动化里一旦弹提示就是永久挂起，
+            # 比直接报错难查得多 —— 宁可立刻失败。
+            "-o", "BatchMode=yes",
+            "-o", f"ConnectTimeout={SSH_CONNECT_TIMEOUT}",
+            # 首次连接自动记录指纹，之后严格校验。
+            # 这样既有首次的便利，又保留了"主机指纹变了必须报警"的能力。
+            "-o", "StrictHostKeyChecking=accept-new",
+            # ssh 客户端自己的提示（例如服务端不支持抗量子密钥交换的告警）
+            # 对"这台机器怎么了"这个判断毫无价值，全是噪音。压到 ERROR。
+            "-o", "LogLevel=ERROR",
+            "-p", str(target["port"]),
+        ]
+        if SSH_KEY:
+            argv += ["-i", SSH_KEY]
+        argv.append(f"{target['user']}@{target['host']}")
+        # ★ 远端命令作为**单个参数**传入，且已逐参数加引号 —— 见 _remote_quote
+        argv.append(_remote_command(cmd))
+        limit = timeout or SSH_TIMEOUT
+    else:
+        argv = cmd
+        limit = timeout or 10
+
+    try:
+        proc = subprocess.run(
+            argv, shell=False, timeout=limit,
+            stdout=subprocess.PIPE,
+            # ★ stderr 绝不与 stdout 合并。
+            #   ssh 客户端自己的诊断也走 stderr，一旦合并它就成了"输出的一部分"：
+            #   实测 `df` 的解析器把告警句里的 "may be vulnerable"
+            #   当成了 Use% 列，直接崩在 `int('be')`；
+            #   `nproc` 则是 int() 失败后静默降级成 1 核。
+            #   这两个错误的共同点是：**看起来像数据异常，其实是运输层污染了数据。**
+            stderr=subprocess.PIPE,
+            text=True, encoding="utf-8", errors="replace",
+        )
+    except FileNotFoundError:
+        raise ToolError("找不到 ssh 命令 —— 请确认已安装 OpenSSH 客户端")
+    except subprocess.TimeoutExpired:
+        raise ToolError(f"命令超时（{limit}s）：{' '.join(cmd)}")
+
+    out = (proc.stdout or "").strip()
+    err = (proc.stderr or "").strip()
+    if proc.returncode != 0 and err:
+        # 命令失败时才把 stderr 附上 —— 这时它多半是真正的错误信息
+        # （command not found / permission denied），对排查有用。
+        # 成功时丢弃：成功了还吐 stderr 的，基本只剩客户端告警。
+        out = (out + "\n" + err).strip() if out else err
+    return proc.returncode, out
+
+
+def _exists(host: str, path: str) -> bool:
+    """判断某个文件是否存在。
+
+    ★ 这是切换到远端时最容易漏掉的一类操作：
+      local 用 os.path.exists 一次系统调用就够，
+      ssh 必须真的去远端问一次 `test -f`。
+      如果这里偷懒还调本地的 os.path.exists，
+      远端日志会永久报"找不到文件"，而且看起来毫无问题 ——
+      因为本机确实没有那个路径。
+    """
+    if BACKEND == "ssh":
+        rc, _ = _exec(["test", "-f", path], host=host)
+        return rc == 0
+    return os.path.exists(path)
+
+
+def _run_df(host: str) -> list:
+    # -P 是 POSIX 输出格式：**保证一行一个文件系统**。
+    # 不加 -P 时，超长的挂载点会被折到下一行，解析器把续行当成新记录，
+    # 列就整体串位了 —— 这类问题只在挂载点特别长的机器上才出现，
+    # 本地测永远碰不到。
+    _, out = _exec(["df", "-hP"], host=host)
     rows = []
     for line in out.splitlines()[1:]:
         parts = line.split()
-        if len(parts) >= 6:
+        # 只认「第 5 列长得像百分比」的行。
+        # 防御性检查：不同发行版、不同挂载命名都可能让列数变化，
+        # 与其让 int() 抛异常把整个工具打挂，不如跳过这一行 ——
+        # **一个工具不该因为一条解析不了的行就整个失效。**
+        if len(parts) >= 6 and re.fullmatch(r"\d+%", parts[4]):
             rows.append({
                 "filesystem": parts[0], "size": parts[1], "used": parts[2],
                 "avail": parts[3],
@@ -245,15 +470,32 @@ def _local_disk(host: str) -> list:
     return rows
 
 
-def _local_service(host: str, service: str) -> dict:
-    active = _run(["systemctl", "is-active", service])
-    detail = _run(["systemctl", "status", "--no-pager", "-l", service])
+# 伪文件系统：不是真实磁盘。
+# 实测在一台跑 Docker 的机器上，`df -h` 有 12 行，其中 9 行是容器的
+# overlay 挂载和 tmpfs —— 它们全部指向同一块物理盘。
+# 把它们的"使用率"算进结论，只会让判断落到与用户无关的分区上。
+_PSEUDO_FS = ("tmpfs", "devtmpfs", "overlay", "squashfs", "ramfs", "nsfs", "shm")
+
+
+def _is_pseudo(fs) -> bool:
+    name = str(fs or "").strip()
+    if not name or name == "none":
+        return True
+    return name.startswith(_PSEUDO_FS)
+
+
+def _run_service(host: str, service: str) -> dict:
+    _, active = _exec(["systemctl", "is-active", service], host=host)
+    _, detail = _exec(["systemctl", "status", "--no-pager", "-l", service],
+                      host=host)
     return {"active": active, "detail": detail[:2000]}
 
 
-def _local_containers(host: str) -> list:
-    out = _run(["docker", "ps", "-a",
-                "--format", "{{.Names}}\t{{.Image}}\t{{.Status}}"])
+def _run_containers(host: str) -> list:
+    _, out = _exec(
+        ["docker", "ps", "-a", "--format", "{{.Names}}\t{{.Image}}\t{{.Status}}"],
+        host=host,
+    )
     rows = []
     for line in out.splitlines():
         parts = line.split("\t")
@@ -262,19 +504,116 @@ def _local_containers(host: str) -> list:
     return rows
 
 
-def _local_logs(host: str, service: str, lines: int) -> list:
-    # 日志路径不交给调用方指定 —— 只在这张表里查。
+# 日志来源，按这个顺序试（顺序有理由，不是随便排的）：
+#   1. systemd 日志 —— 现代 Linux 上最通用：服务日志不一定落盘到文件，
+#      但 systemd 一定有记录，而且不用事先知道路径
+#   2. 常见日志文件 —— 覆盖不接 journal 的服务和传统部署方式
+#   3. 容器日志 —— 这台机器上真正干活的服务器全跑在容器里，
+#      journalctl 里只有 docker daemon 自己的日志，
+#      看不到容器内部发生了什么
+#
+# 每条来源都把 `source` 一起返回：同一批日志可能来自三个不同的地方，
+# 不写清来源，读的人（和模型）就没法判断这条证据的覆盖范围有多大。
+_LOG_FILE_CANDIDATES = [
+    "/var/log/{service}/error.log",
+    "/var/log/{service}.log",
+    "/var/log/{service}/current",
+]
+
+
+def _run_logs(host: str, service: str, lines: int) -> dict:
+    """取某个服务的日志。返回 {"source": 来源描述, "lines": [...]}。"""
+    # ---- 1. systemd ----
+    # `--no-pager` 必须加：不加会去调分页器，
+    # 在非交互的 SSH 会话里分页器读不到终端，表现是"命令卡住"。
+    rc, out = _exec(
+        ["journalctl", "-u", service, "-n", str(lines), "--no-pager"], host=host)
+    if rc == 0 and out and "No entries" not in out:
+        # journalctl 会在开头插一行 `-- Logs begin at ...`，
+        # 那是它自己的表头，不是日志内容，去掉。
+        kept = [ln for ln in out.splitlines() if not ln.startswith("-- ")]
+        if kept:
+            return {"source": f"journalctl -u {service}", "lines": kept}
+
+    # ---- 2. 日志文件 ----
+    # 路径不交给调用方指定 —— 只在这张表里查。
     # 让外部传路径，就等于给了它读任意文件的权限。
-    candidates = [
-        f"/var/log/{service}/error.log",
-        f"/var/log/{service}.log",
-        f"/var/log/{service}/current",
-    ]
-    for path in candidates:
-        if os.path.exists(path):
-            out = _run(["tail", "-n", str(lines), path])
-            return out.splitlines()
-    raise ToolError(f"找不到 {service} 的日志文件（已尝试 {candidates}）")
+    for tpl in _LOG_FILE_CANDIDATES:
+        path = tpl.format(service=service)
+        if _exists(host, path):
+            _, out = _exec(["tail", "-n", str(lines), path], host=host)
+            return {"source": path, "lines": out.splitlines()}
+
+    # ---- 3. 容器日志 ----
+    # ★ 这里用 `sh -c` 是有原因的：`docker logs` 把容器的 stderr
+    #   写到自己的 stderr 上，而我们的运输层**刻意不合并 stderr**
+    #   （原因见 _exec 的注释）。所以必须显式 `2>&1` 把两股流合起来，
+    #   否则容器里真正有用的报错会全部丢掉。
+    #   参数用的是 _exec 里的同一套引号规则，没有引入新的注入面。
+    rc, out = _exec(
+        ["sh", "-c",
+         "docker logs --tail {} {} 2>&1".format(int(lines), _remote_quote(service))],
+        host=host)
+    if rc == 0 and out:
+        return {"source": f"docker logs {service}", "lines": out.splitlines()}
+
+    raise ToolError(
+        f"取不到 {service} 的日志。已试过：systemd 单元、"
+        f"常见日志文件（{[t.format(service=service) for t in _LOG_FILE_CANDIDATES]}）、"
+        f"同名容器。若它是容器，请直接用容器名（例如 wp-app、zabbix-server）。")
+
+
+# ---- 负载与内存：远端拿回来的是原文，必须在这里解析 ----
+# ★ 之前 local 分支只把 `uptime` / `free` 的原文原样塞回给模型让它自己读。
+#   那是偷懒：解析是确定性工作，交给模型做只会多一个出错点，
+#   而且 `load_per_core` 算不出来，告警等级会永远是 unknown ——
+#   等于"接了真机却给不出结论"。
+_UPTIME_RE = re.compile(r"load average:\s*([\d.]+)[,\s]+([\d.]+)[,\s]+([\d.]+)")
+
+
+def _parse_uptime(text: str) -> dict:
+    """从 `uptime` 输出里取 1/5/15 分钟负载。"""
+    m = _UPTIME_RE.search(text or "")
+    if not m:
+        return {}
+    return {"load1": float(m.group(1)), "load5": float(m.group(2)),
+            "load15": float(m.group(3))}
+
+
+def _parse_free(text: str) -> dict:
+    """解析 `free -m` 的 Mem 行，单位 MB。
+
+    ★ available 取第 7 列（内核估算的"真正可用"），而不是第 3 列 free。
+      两者差得很远：free 不含可回收的 buff/cache，
+      用它判断内存够不够会得出"内存快没了"的错误结论。
+    """
+    for line in (text or "").splitlines():
+        if line.strip().startswith("Mem:"):
+            nums = re.findall(r"\d+", line)
+            if len(nums) >= 3:
+                total, used = int(nums[0]), int(nums[1])
+                avail = int(nums[6]) if len(nums) >= 7 else int(nums[2])
+                return {"mem_total_mb": total, "mem_used_mb": used,
+                        "mem_avail_mb": avail}
+    return {}
+
+
+def _run_load(host: str) -> dict:
+    _, cores = _exec(["nproc"], host=host)
+    _, uptime_out = _exec(["uptime"], host=host)
+    _, free_out = _exec(["free", "-m"], host=host)
+    try:
+        cores_n = int(str(cores).strip() or 1)
+    except ValueError:
+        cores_n = 1
+    out = {"cpu_cores": cores_n or 1}
+    out.update(_parse_uptime(uptime_out))
+    out.update(_parse_free(free_out))
+    # 原文一起返回：解析可能失败（不同发行版格式有差异），
+    # 留着原文至少能让人看出"是格式没匹配上"，而不是当成"机器没有负载"。
+    out["raw_uptime"] = uptime_out
+    out["raw_free"] = free_out
+    return out
 
 
 # ============================================================
@@ -283,18 +622,28 @@ def _local_logs(host: str, service: str, lines: int) -> list:
 def check_disk(host: str = "web-01") -> dict:
     """查看磁盘使用率。磁盘满是运维故障里出现频率最高的一类。"""
     host = _check_host(host)
-    if BACKEND == "local":
-        partitions = _local_disk(host)
+    if BACKEND in ("local", "ssh"):
+        partitions = _run_df(host)
     else:
         partitions = _mock(host)["disk"]
 
+    # 只对「真实磁盘」下结论：tmpfs / overlay / devtmpfs 不是磁盘，
+    # 而且在一台跑 Docker 的机器上它们会占掉大半行数 ——
+    # 交给模型既浪费 token，也容易把它的注意力带偏。
+    # 过滤掉多少条如实报出来，不藏着（**过滤要透明，不能让调用方以为那就是全部**）。
+    real = [p for p in partitions if not _is_pseudo(p["filesystem"])]
+    # 兜底：万一全是伪文件系统（比如容器内跑 local 后端），
+    # 不能给出"没有磁盘"这种结论，退回全量。
+    judged = real or partitions
+
     # 顺手算出最高使用率 —— 让模型不用自己在脑子里比大小。
     # 这是"工具该做的事"：把原始数据加工成结论，减少模型的推理负担和出错机会。
-    worst = max(partitions, key=lambda p: p["use_percent"]) if partitions else None
+    worst = max(judged, key=lambda p: p["use_percent"]) if judged else None
     return {
         "host": host,
         "backend": BACKEND,
-        "partitions": partitions,
+        "partitions": judged,
+        "partitions_filtered": len(partitions) - len(judged),
         "max_use_percent": worst["use_percent"] if worst else None,
         "max_mount": worst["mount"] if worst else None,
         # 阈值判断放在工具里而不是 Prompt 里：阈值是运维标准（行业知识），
@@ -308,11 +657,8 @@ def check_disk(host: str = "web-01") -> dict:
 def check_load(host: str = "web-01") -> dict:
     """查看负载、CPU 核数、内存占用。用来判断"是不是被压垮了"。"""
     host = _check_host(host)
-    if BACKEND == "local":
-        cores = int(_run(["nproc"]) or 1)
-        uptime_out = _run(["uptime"])
-        free_out = _run(["free", "-m"])
-        load = {"cpu_cores": cores, "raw_uptime": uptime_out, "raw_free": free_out}
+    if BACKEND in ("local", "ssh"):
+        load = _run_load(host)
     else:
         load = dict(_mock(host)["load"])
 
@@ -336,9 +682,9 @@ def check_service(host: str, service: str) -> dict:
     """查看 systemd 服务是否在运行。"""
     host = _check_host(host)
     service = _check_service(service)
-    if BACKEND == "local":
+    if BACKEND in ("local", "ssh"):
         return {"host": host, "service": service, "backend": BACKEND,
-                **_local_service(host, service)}
+                **_run_service(host, service)}
 
     svc = _mock(host)["services"].get(service)
     if svc is None:
@@ -351,8 +697,8 @@ def check_service(host: str, service: str) -> dict:
 def list_containers(host: str = "web-01") -> dict:
     """列出容器及其状态。能看出反复重启（Restarting + 重启次数高）。"""
     host = _check_host(host)
-    if BACKEND == "local":
-        items = _local_containers(host)
+    if BACKEND in ("local", "ssh"):
+        items = _run_containers(host)
     else:
         items = _mock(host)["containers"]
 
@@ -370,8 +716,10 @@ def tail_log(host: str, service: str, lines: int = 20) -> dict:
     # lines 必须转成 int 再限范围。如果直接用它拼命令，传个 "20; rm -rf /" 就出事。
     lines = max(1, min(int(lines), 200))
 
-    if BACKEND == "local":
-        entries = _local_logs(host, service, lines)
+    source = "mock 仿真数据"
+    if BACKEND in ("local", "ssh"):
+        got = _run_logs(host, service, lines)
+        entries, source = got["lines"], got["source"]
     else:
         entries = _mock(host)["logs"].get(service)
         if entries is None:
@@ -397,6 +745,9 @@ def tail_log(host: str, service: str, lines: int = 20) -> dict:
     found = [{"pattern": k, "meaning": v} for k, v in patterns.items()
              if k.lower() in text.lower()]
     return {"host": host, "service": service, "backend": BACKEND,
+            # 来源必须写清楚：同一批日志可能来自 journalctl、某个文件、
+            # 或容器日志，覆盖范围完全不同。
+            "source": source,
             "count": len(entries), "lines": entries,
             "matched_patterns": found,
             "hint": ("日志中命中已知错误模式：" +
@@ -478,6 +829,28 @@ def run_command(command: str, purpose: str = "") -> dict:
         "reason": decision.reason,
         "executed": False,
     }
+
+    # ---- 闸门零：ssh 后端下，执行通道整体关闭（fail-closed）----
+    # 为什么必须关掉，而不是"顺手让它在本机执行"：
+    #   诊断走的是远端（OPS_BACKEND=ssh），但沙箱的执行通道只会在**本机**落地
+    #   （见 sandbox/executor.py 的 host 通道，基于本地 subprocess）。
+    #   于是就成了：模型对着远端机器下结论，命令却打在本机上 ——
+    #   打错的机器和打对的机器只差一个环境变量，这种错误不该靠"记得改"来避免。
+    #
+    #   **宁可让处置能力不可用，也不要执行到错误的机器上。**
+    #   这是和沙箱"探测不到 docker 不降级"同一条原则：
+    #   安全属性的缺失要立刻暴露，不能悄悄降级。
+    if BACKEND == "ssh":
+        base["error"] = "ssh 后端下不提供执行能力"
+        base["hint"] = (
+            "当前 OPS_BACKEND=ssh，工具层查的是远端主机；"
+            "而沙箱的执行通道目前只在本机落地。"
+            "「诊断在远端、执行在本地」的错配比「不能执行」危险得多，"
+            "所以这里直接关闭。"
+            "需要真实处置时，请在目标主机上以 OPS_BACKEND=local 运行，"
+            "或改用 check_disk / tail_log 等只读工具先拿到现场数据。"
+        )
+        return base
 
     # ---- 情况一：策略拒绝 ----
     if decision.decision == policy.DENY:
