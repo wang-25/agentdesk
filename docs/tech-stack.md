@@ -714,7 +714,7 @@ curl http://127.0.0.1:8000/sandbox
 # 小样本试跑（6 条，约 ¥0.08）
 .venv\Scripts\python.exe scripts\run_eval.py --limit 6
 
-# 完整评测（40 条 × 2 模式，约 ¥0.55，5 分钟）
+# 完整评测（40 条 × 2 模式，约 ¥0.234，5 分钟）
 .venv\Scripts\python.exe scripts\run_eval.py
 
 # 断点续跑
@@ -828,7 +828,7 @@ RAG 模块可以直接当 CLI 跑：
 .venv\Scripts\python.exe scripts\smoke_test.py --full   # 加一次真实 Agent 调用
 ```
 
-一条命令跑完九层：**运行环境 → 模型连通 → 检索与问答 → Agent（工具+编排）→ 沙箱与人工确认 → 可观测 → 评测 → MCP Server → HTTP 22 个接口**，
+一条命令跑完九层：**运行环境 → 模型连通 → 检索与问答 → Agent（工具+编排）→ 沙箱与人工确认 → 可观测 → 评测 → MCP Server → HTTP 24 个路由**，
 最后给出汇总表和失败项的修复提示。**退出码 0 = 已检查项全通**，可以接进自动化。
 
 `--full` 才会跑真实 Agent 调用（约 7k token）—— **默认跳过花钱项，这样你可以随手跑。**
@@ -850,7 +850,7 @@ RAG 模块可以直接当 CLI 跑：
 | **6 观测** | trace/span 记录、父子关系、嵌套 usage 归并、成本核算、导出 payload | `smoke_test.py` 第 6 层 | 9 项全 ✅ |
 | **7 评测** | 评测集标注完整性、4 项规则判定的正反例、判定器自校验（`--full`） | `smoke_test.py` 第 7 层 | 5 项全 ✅（含回归用例） |
 | **8 MCP** | schema 无漂移、协议层握手/调用/资源读取、错误路径 | `smoke_test.py` 第 8 层；或 `mcp_check.py` | 2 项全 ✅（协议层 9/9） |
-| **9 服务** | 22 个接口都能通、参数校验生效、告警分级正确 | `smoke_test.py` 第 9 层；或 `/docs` 逐点点 | 12 项接口全 ✅ |
+| **9 服务** | 第 9 层实际探测的 12 个接口全通、参数校验生效、告警分级正确 | `smoke_test.py` 第 9 层；或 `/docs` 逐点点 | 12 项接口全 ✅ |
 
 **几个"故意制造错误"的测试**（比"能跑通"更能证明你理解系统）：
 
