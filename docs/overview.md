@@ -46,16 +46,27 @@ cd "E:/Workbuddy/ai agent/agentdesk"
 
 ---
 
-## 2. 四种用法（按上手难度排）
+## 2. 五种用法（按上手难度排）
 
-### ① 打开 `/docs` 点着试 —— 最推荐
+### ① 打开线上地址点着用 —— 最省事
 
 ```
-http://127.0.0.1:8000/docs
+https://agent.simosheng.fun/try
 ```
 
-FastAPI 自动生成的交互式文档，不用写一行前端。找到 `POST /agent/ask` →
-"Try it out" → 填：
+填令牌 → 填问题 → 点「开始」。返回里带完整执行轨迹（它自己决定了查什么、跑几轮）。
+
+访问令牌在服务器 `/opt/agentdesk/.env` 的 `AGENT_TOKEN` 那一行。
+这个实例开了鉴权：除 `/`、`/try`、`/health`、`/docs` 之外都要令牌。
+
+### ② `/docs` 交互式文档 —— 开发者的调法
+
+```
+http://127.0.0.1:8000/docs         # 本地（未开鉴权，直接可用）
+https://agent.simosheng.fun/docs   # 线上（先点右上角 Authorize 填令牌）
+```
+
+找到 `POST /agent/ask` → "Try it out" → 填：
 
 ```json
 {"question": "web-01 上的网站访问很慢，有时报 502，帮我看下原因",
@@ -64,7 +75,11 @@ FastAPI 自动生成的交互式文档，不用写一行前端。找到 `POST /a
 
 `engine` 有三档：`handwritten`（手写 ReAct 循环）／`langgraph`（状态图）／`supervisor`（多 Agent 编排）。
 
-### ② 命令行（不起服务也能用一部分）
+> 线上实例**必须先点 Authorize 填令牌**，否则每个请求都是 401。
+> 鉴权是在中间件里做的，对框架是黑盒，所以这个声明是单独写进
+> OpenAPI schema 的 —— 目的就是让 Swagger UI 把那个按钮渲染出来。
+
+### ③ 命令行（不起服务也能用一部分）
 
 ```bash
 # RAG 检索与问答
@@ -81,17 +96,18 @@ FastAPI 自动生成的交互式文档，不用写一行前端。找到 `POST /a
 .venv\Scripts\python.exe -m app.mcp_server.server --check   # 工具清单 + schema 校验
 ```
 
-### ③ 一条命令自检 —— 改完代码先跑这个
+### ④ 一条命令自检 —— 改完代码先跑这个
 
 ```bash
-.venv\Scripts\python.exe scripts\smoke_test.py          # 快速（不花钱）
-.venv\Scripts\python.exe scripts\smoke_test.py --full   # 完整（含真实 Agent 调用）
+.venv\Scripts\python.exe scripts\smoke_test.py            # 九层快速自检（不花钱）
+.venv\Scripts\python.exe scripts\smoke_test.py --full     # 含真实 Agent 调用
+.venv\Scripts\python.exe scripts\security_check.py        # 公网安全层 23 项
 ```
 
 **九层**：环境 → 模型 → 检索 → Agent → 沙箱 → 观测 → 评测 → MCP → HTTP 接口。
 退出码 0 = 全通，可以接进自动化。
 
-### ④ 现场演示
+### ⑤ 现场演示
 
 ```bash
 .venv\Scripts\python.exe scripts\demo.py    # 走完上面那张表的全部检查

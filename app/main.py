@@ -38,6 +38,7 @@ from datetime import datetime
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.openapi.utils import get_openapi
 from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -63,6 +64,49 @@ app = FastAPI(
 # 公网安全层：token 鉴权 + 限流 + 每日额度。
 # AUTH_ENABLED=0（默认）时完全放行，本地开发行为不变。
 security.install_security(app)
+
+
+# ============================================================
+# 让 /docs 上出现 Authorize 按钮
+# ============================================================
+# 【为什么必须做这一步】
+# 鉴权是在中间件里做的，中间件对 FastAPI 是「黑盒」——
+# 它拦请求，但框架并不知道「这些接口需要 token」这件事。
+# 结果就是 /docs 生成的交互式文档里**没有填 token 的地方**：
+# 用户在页面上点 "Try it out"，请求不带任何凭据，一律 401。
+# 用户体验上就是「文档骗我，点了就报错」。
+#
+# 所以要把这个约定**告诉 OpenAPI**：在 schema 里声明一个 apiKey 类型的
+# securityScheme。声明之后 Swagger UI 才会渲染那个 Authorize 按钮，
+# 用户填一次 token，之后所有请求自动带上。
+def _custom_openapi():
+    if app.openapi_schema:
+        return app.openapi_schema
+
+    schema = get_openapi(
+        title=app.title,
+        version=app.version,
+        description=app.description,
+        routes=app.routes,
+    )
+    schema.setdefault("components", {})["securitySchemes"] = {
+        "AgentDeskToken": {
+            "type": "apiKey",
+            "in": "header",
+            "name": "X-API-Key",
+            "description": (
+                "部署到公网时开启的访问令牌，值在服务器 .env 的 AGENT_TOKEN。\n\n"
+                "点右上角 Authorize 填入后，后续请求会自动带上这个头。\n"
+                "本地开发（AUTH_ENABLED=0）时不需要填。"
+            ),
+        }
+    }
+    schema["security"] = [{"AgentDeskToken": []}]
+    app.openapi_schema = schema
+    return schema
+
+
+app.openapi = _custom_openapi
 
 # ============================================================
 # 审计日志
@@ -298,14 +342,15 @@ def index():
     不该混进 /docs 的接口清单里干扰视线。
     """
     links = [
-        ("/docs", "交互式接口文档", "不用写前端，点着就能试每个接口 —— 从这里开始"),
+        ("/try", "★ 在线试用", "填问题、点按钮，看它自己决定查什么。不用懂 API，从这里开始"),
+        ("/docs", "22 个接口的调试台", "交互式文档。要先点右上角 Authorize 填 token，否则一律 401"),
         ("/metrics/summary", "成本看板", "按 Agent / 动作两维看成本、缓存命中率、P95 延迟"),
         ("/traces", "链路追踪", "每次运行发生了什么、哪一步最慢最贵"),
         ("/agent/tools", "工具清单", "Agent 能调用的 7 个工具，含风险等级"),
         ("/sandbox", "沙箱状态", "当前是 mock 还是真容器、白名单概览、fail-closed"),
         ("/approvals", "审批单", "Agent 想执行但还没执行的写操作"),
         ("/audit", "审计日志", "谁、何时、哪条告警、判成什么风险、做了什么"),
-        ("/health", "健康检查", "给容器探活和监控用"),
+        ("/health", "健康检查", "不需要 token，给容器探活和监控用"),
     ]
     rows = "".join(
         f'<tr><td><a href="{u}"><code>{u}</code></a></td>'
@@ -353,23 +398,310 @@ def index():
 <tr><th>地址</th><th>是什么</th><th>说明</th></tr>
 {rows}
 </table>
+<p style="font-size:13px;color:#59636e">
+除 <code>/</code>、<code>/health</code>、<code>/docs</code>、<code>/try</code>
+之外，所有接口都要求请求头带令牌（<code>X-API-Key</code>）。
+所以直接点上面表格里的链接会看到 401 &mdash; 那是安全层在正常工作，不是服务坏了。</p>
 
 <h2>最快的一次体验</h2>
-<p>打开 <a href="/docs">/docs</a>，找到 <code>POST /agent/ask</code> &rarr;
-点 &quot;Try it out&quot; &rarr; 填下面的内容 &rarr; Execute：</p>
-<pre>{{"question": "web-01 上的网站访问很慢，有时报 502，帮我看下原因",
- "engine": "supervisor"}}</pre>
-<p>返回里会有完整轨迹（它自己决定了查什么、跑几轮）和校验结论。
-换个知识库里没有的问题问它（比如「Kafka 消费组 lag 怎么排查」），
+<p>打开 <a href="/try"><b>/try</b></a>：填令牌、填问题、点「开始」。
+它会自己决定查什么、查几轮，返回里带完整的执行轨迹和校验结论。</p>
+<p>换个知识库里没有的问题问它（比如「Kafka 消费组 lag 怎么排查」），
 它会明确告诉你<strong>知识库里没有</strong> &mdash; 这是刻意设计的，不是能力不足。</p>
+
+<h2>用命令行调</h2>
+<pre>curl -H "X-API-Key: &lt;你的令牌&gt;" \\
+     -H "Content-Type: application/json" \\
+     -d '{{"question":"web-01 磁盘快满了怎么处理"}}' \\
+     https://agent.simosheng.fun/rag/ask   # 或 /agent/ask</pre>
+<p style="font-size:13px;color:#59636e">令牌在服务器的
+<code>/opt/agentdesk/.env</code> 里，<code>AGENT_TOKEN</code> 那一行。</p>
 
 <div class="note"><b>安全边界</b>：所有写操作（重启服务、清空日志）
 都不会自动执行。它们会变成一张审批单挂在 <a href="/approvals">/approvals</a>，
 等人批准；沙箱不可用时宁可拒绝执行，也不降级。</div>
 
 <p style="margin-top:32px;color:#8b949e;font-size:13px">
-如果这是本地跑的，只有这台机器能访问。要给别人看需要部署到公网 &mdash;&mdash;
-见 <code>docs/overview.md</code>。</p>
+这个实例跑在阿里云一台 2 核 2G 的机器上，与 WordPress、Zabbix 共 8 个容器共存，
+经 Nginx Proxy Manager 提供 HTTPS。<br>
+鉴权采用白名单：默认拒绝，只放行上面标注的那几个路径。
+部署过程与安全设计见仓库的 <code>docs/deployment.md</code>。</p>
+</body></html>"""
+
+
+# ============================================================
+# 在线试用页
+# ============================================================
+@app.get("/try", response_class=HTMLResponse, include_in_schema=False)
+def try_page():
+    """一个不用懂 API 就能试的页面。
+
+    【为什么要有它】
+    /docs 是给开发者的，它要求你懂 HTTP 方法、请求体格式、鉴权头。
+    但演示的观众是面试官 —— 他不会为了看你一个项目去学怎么发 curl。
+    一个「填问题 → 点按钮 → 看结果」的页面，把试用的门槛降到了零。
+
+    页面本身是静态的，所有逻辑都在浏览器里：token 存在 localStorage，
+    点击后直接 fetch 后端的 /agent/ask 或 /rag/ask。
+    """
+    return """<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AgentDesk · 在线试用</title>
+<style>
+ *{box-sizing:border-box}
+ body{font-family:-apple-system,"Segoe UI","Microsoft YaHei",sans-serif;
+      max-width:900px;margin:0 auto;padding:32px 20px 80px;color:#1f2328;
+      line-height:1.65;background:#fff}
+ h1{margin:0 0 4px;font-size:24px}
+ .sub{color:#59636e;margin-bottom:24px;font-size:14px}
+ h2{font-size:15px;margin:26px 0 10px;padding-bottom:6px;
+    border-bottom:1px solid #e6e8eb;color:#24292f}
+ label{display:block;font-size:13px;color:#59636e;margin:12px 0 5px}
+ input,select,textarea{width:100%;padding:9px 11px;border:1px solid #d0d7de;
+      border-radius:6px;font-size:14px;font-family:inherit;background:#fff;color:#1f2328}
+ textarea{min-height:74px;resize:vertical;line-height:1.5}
+ input:focus,select:focus,textarea:focus{outline:2px solid #0969da;
+      outline-offset:-1px;border-color:#0969da}
+ .row{display:flex;gap:12px;flex-wrap:wrap}
+ .row>div{flex:1;min-width:210px}
+ button{margin-top:16px;padding:10px 22px;background:#1f883d;color:#fff;
+      border:0;border-radius:6px;font-size:15px;font-weight:600;cursor:pointer}
+ button:hover{background:#1a7f37} button:disabled{background:#94d3a2;cursor:wait}
+ .ghost{background:#f6f8fa;color:#24292f;border:1px solid #d0d7de;
+      font-weight:400;padding:6px 12px;font-size:13px;margin:0}
+ .ghost:hover{background:#eef1f4}
+ .hint{font-size:12.5px;color:#59636e;margin:5px 0 0}
+ .card{border:1px solid #e6e8eb;border-radius:10px;padding:18px 20px;
+      margin-top:14px;background:#fff}
+ .note{background:#fff8e6;border-left:3px solid #d4a017;padding:11px 15px;
+      border-radius:0 6px 6px 0;font-size:13.5px;margin:14px 0}
+ .err{background:#fff0f0;border-left:3px solid #cf222e;padding:11px 15px;
+      border-radius:0 6px 6px 0;font-size:13.5px;margin:14px 0;color:#a40e26}
+ .ok{background:#eaf7ee;border-left:3px solid #1f883d;padding:11px 15px;
+      border-radius:0 6px 6px 0;font-size:13.5px;margin:14px 0;color:#0a5c26}
+ pre{background:#f6f8fa;padding:13px 15px;border-radius:8px;overflow-x:auto;
+      font-size:13px;border:1px solid #e6e8eb;
+      font-family:ui-monospace,Consolas,monospace;white-space:pre-wrap;
+      word-break:break-word}
+ code{background:#f4f5f7;padding:2px 5px;border-radius:4px;
+      font-family:ui-monospace,Consolas,monospace;font-size:12.5px}
+ table{width:100%;border-collapse:collapse;font-size:13px;margin:10px 0}
+ td,th{padding:7px 9px;border-bottom:1px solid #eef0f2;text-align:left;
+      vertical-align:top}
+ th{color:#59636e;font-weight:600;font-size:12.5px;background:#fafbfc}
+ .md{font-size:14.5px} .md h1,.md h2,.md h3{font-size:15px;margin:16px 0 8px;
+      border:0;padding:0} .md table{font-size:13px}
+ .md pre{font-size:12.5px}
+ .spin{display:inline-block;width:13px;height:13px;border:2px solid #94d3a2;
+      border-top-color:#1f883d;border-radius:50%;animation:sp .8s linear infinite;
+      vertical-align:-2px;margin-right:8px}
+ @keyframes sp{to{transform:rotate(360deg)}}
+ .meta{display:flex;gap:18px;flex-wrap:wrap;font-size:13px;color:#59636e;
+      padding:11px 0 3px}
+ .meta b{color:#1f2328;font-weight:600}
+</style></head><body>
+
+<h1>AgentDesk 在线试用</h1>
+<div class="sub">多 Agent 智能体系统 &middot; 面向运维场景 &middot;
+填问题、点按钮，看它自己决定查什么</div>
+
+<div class="note"><b>需要访问令牌。</b>这个实例部署在公网，除首页外的接口
+都要求 token。令牌在服务器 <code>/opt/agentdesk/.env</code> 的
+<code>AGENT_TOKEN</code> 那一行。填一次即可，浏览器会记住。
+<br><b>别在公共电脑上填。</b>令牌存在本机浏览器里，等于一把钥匙。</div>
+
+<div class="card">
+  <label for="token">访问令牌</label>
+  <div class="row">
+    <div style="flex:3"><input id="token" type="password"
+      placeholder="粘贴 AGENT_TOKEN 的值" autocomplete="off"></div>
+    <div style="flex:0 0 auto;align-self:flex-end">
+      <button class="ghost" id="forget">清除</button></div>
+  </div>
+  <p class="hint" id="tokstate"></p>
+</div>
+
+<div class="card">
+  <label for="q">问它一个问题</label>
+  <textarea id="q">web-01 上的网站访问很慢，有时报 502，帮我看下原因</textarea>
+
+  <div class="row">
+    <div>
+      <label for="mode">能力</label>
+      <select id="mode">
+        <option value="supervisor">多 Agent 编排（推荐，约 10-30 秒）</option>
+        <option value="rag">知识库问答 · 带引用溯源（约 4 秒）</option>
+        <option value="langgraph">Agent 诊断 · LangGraph 状态图</option>
+        <option value="handwritten">Agent 诊断 · 手写 ReAct 循环</option>
+      </select>
+    </div>
+  </div>
+
+  <button id="go">开始</button>
+  <p class="hint">多 Agent 编排会调用真实模型，属于计费动作，计入每日额度。</p>
+</div>
+
+<div id="out"></div>
+
+<script src="https://cdn.jsdelivr.net/npm/marked@12/marked.min.js"></script>
+<script>
+var $ = function (id) { return document.getElementById(id); };
+var KEY = 'agentdesk_token';
+var t0 = 0, timer = null;
+
+(function restore() {
+  var v = localStorage.getItem(KEY) || '';
+  $('token').value = v;
+  $('tokstate').textContent = v ? '已保存令牌（本机浏览器），直接点「开始」即可。'
+                                : '还没有填写令牌。';
+})();
+
+$('forget').onclick = function () {
+  localStorage.removeItem(KEY);
+  $('token').value = '';
+  $('tokstate').textContent = '已清除。';
+};
+
+function esc(s) {
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;')
+                  .replace(/>/g, '&gt;');
+}
+
+function md(text) {
+  if (typeof marked !== 'undefined' && marked.parse) {
+    try { return marked.parse(text); } catch (e) { /* 降级 */ }
+  }
+  return '<pre>' + esc(text) + '</pre>';
+}
+
+function elapsed() { return ((Date.now() - t0) / 1000).toFixed(1); }
+
+function tick() {
+  $('out').innerHTML = '<div class="card"><span class="spin"></span>' +
+    '正在处理…已等待 <b>' + elapsed() + '</b> 秒' +
+    '<p class="hint">多 Agent 编排要跑好几轮工具调用，慢是正常的。</p></div>';
+}
+
+$('go').onclick = async function () {
+  var token = $('token').value.trim();
+  var question = $('q').value.trim();
+  var mode = $('mode').value;
+
+  if (!token) {
+    $('out').innerHTML = '<div class="err">请先填写访问令牌。它在服务器的 ' +
+      '<code>/opt/agentdesk/.env</code> 里。</div>';
+    return;
+  }
+  if (!question) {
+    $('out').innerHTML = '<div class="err">问题不能为空。</div>';
+    return;
+  }
+
+  localStorage.setItem(KEY, token);
+  $('tokstate').textContent = '已保存令牌（本机浏览器），直接点「开始」即可。';
+  $('go').disabled = true;
+  t0 = Date.now();
+  tick();
+  timer = setInterval(tick, 400);
+
+  var path, body;
+  if (mode === 'rag') {
+    path = '/rag/ask';
+    body = { question: question, top_k: 5, mode: 'hybrid' };
+  } else {
+    path = '/agent/ask';
+    body = { question: question, engine: mode, include_trace: true };
+  }
+
+  try {
+    var r = await fetch(path, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-API-Key': token },
+      body: JSON.stringify(body)
+    });
+    clearInterval(timer);
+    var text = await r.text();
+    var data = null;
+    try { data = JSON.parse(text); } catch (e) { }
+
+    if (r.status === 401) {
+      $('out').innerHTML = '<div class="err"><b>令牌不对（HTTP 401）。</b>' +
+        '请检查它是否和服务器 <code>.env</code> 里的 <code>AGENT_TOKEN</code> ' +
+        '完全一致 —— 注意别多复制了空格或换行。</div>';
+      return;
+    }
+    if (r.status === 429) {
+      $('out').innerHTML = '<div class="err"><b>触发限流（HTTP 429）。</b>' +
+        (data && data.detail ? esc(data.detail) : '') +
+        '<p class="hint">每 IP 每分钟 20 次、全站 60 次、每天 300 次。等一下再试。</p></div>';
+      return;
+    }
+    if (!r.ok) {
+      $('out').innerHTML = '<div class="err"><b>HTTP ' + r.status + '</b><pre>' +
+        esc(text.slice(0, 800)) + '</pre></div>';
+      return;
+    }
+
+    $('out').innerHTML = render(data, mode);
+  } catch (e) {
+    clearInterval(timer);
+    $('out').innerHTML = '<div class="err"><b>请求失败：</b>' + esc(e.message) +
+      '<p class="hint">如果是网络错误，检查一下服务是否在跑：' +
+      '<code>https://agent.simosheng.fun/health</code></p></div>';
+  } finally {
+    $('go').disabled = false;
+  }
+};
+
+function render(d, mode) {
+  var html = '';
+  if (d === null) {
+    return '<div class="err">返回的不是合法 JSON。</div>';
+  }
+
+  var m = d.metrics || {};
+  if (mode !== 'rag') {
+    html += '<div class="meta">' +
+      '<span>引擎 <b>' + esc(d.engine || mode) + '</b></span>' +
+      '<span>轮次 <b>' + (m.rounds !== undefined ? m.rounds : '-') + '</b></span>' +
+      '<span>工具调用 <b>' + (m.tool_calls !== undefined ? m.tool_calls : '-') + '</b></span>' +
+      '<span>tokens <b>' + (m.tokens !== undefined ? m.tokens : '-') + '</b></span>' +
+      '<span>耗时 <b>' + (m.elapsed_ms ? (m.elapsed_ms / 1000).toFixed(1) + 's' : elapsed() + 's') + '</b></span>' +
+      '</div>';
+  }
+
+  html += '<h2>回答</h2><div class="card md">' +
+    md(d.answer || '（没有返回 answer 字段）') + '</div>';
+
+  if (d.sources && d.sources.length) {
+    html += '<h2>引用来源</h2><div class="card"><table>' +
+      '<tr><th>#</th><th>来源</th><th>标题</th><th>片段</th></tr>';
+    d.sources.forEach(function (s, i) {
+      html += '<tr><td>' + (i + 1) + '</td><td><code>' + esc(s.source || '') +
+        '</code></td><td>' + esc(s.title || '') + '</td><td>' +
+        esc((s.preview || s.text || '').slice(0, 150)) + '…</td></tr>';
+    });
+    html += '</table></div>';
+  }
+
+  if (d.trace && d.trace.length) {
+    html += '<h2>执行轨迹</h2><div class="card"><table>' +
+      '<tr><th>步</th><th>它的判断</th><th>调用的工具</th><th>参数</th><th>结果</th></tr>';
+    d.trace.forEach(function (s) {
+      html += '<tr><td>' + esc(s.step) + '</td><td>' +
+        esc((s.thought || '').slice(0, 110)) + '</td><td><code>' +
+        esc(s.tool || '') + '</code></td><td><code>' +
+        esc(JSON.stringify(s.args || {})) + '</code></td><td>' +
+        (s.ok ? '成功' : '失败') +
+        (s.risk ? ' · 风险 ' + esc(s.risk) : '') + '</td></tr>';
+    });
+    html += '</table></div>';
+  }
+
+  return html;
+}
+</script>
 </body></html>"""
 
 

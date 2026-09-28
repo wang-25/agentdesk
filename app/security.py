@@ -63,7 +63,14 @@ GLOBAL_PER_MIN = int(os.getenv("RATE_LIMIT_GLOBAL_PER_MIN", "60"))
 DAILY_QUOTA = int(os.getenv("DAILY_QUOTA", "300"))
 
 # 白名单：只有这些路径不需要 token。其余一律要求鉴权。
-PUBLIC_EXACT = {"/", "/health", "/openapi.json", "/favicon.ico"}
+#
+# 【为什么 /try 是公开的】
+# 它只是一个静态 HTML 页面，本身不含任何数据——真正的数据要它
+# 用浏览器里的 fetch 去调 /agent/ask 拿，而那一步仍然要 token。
+# 把它放进来，是为了让人「打开链接就能看到有这个东西」；
+# token 由用户在页面上自己填。如果连页面都要先拿 token 才能看，
+# 演示就成了「你得先有钥匙才能看见门」。
+PUBLIC_EXACT = {"/", "/try", "/health", "/openapi.json", "/favicon.ico"}
 PUBLIC_PREFIX = ("/docs", "/redoc")
 
 # 「花钱」的路径：会调用模型或 embedding API。只有这些扣每日额度。
