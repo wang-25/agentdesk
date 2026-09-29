@@ -70,7 +70,15 @@ DAILY_QUOTA = int(os.getenv("DAILY_QUOTA", "300"))
 # 把它放进来，是为了让人「打开链接就能看到有这个东西」；
 # token 由用户在页面上自己填。如果连页面都要先拿 token 才能看，
 # 演示就成了「你得先有钥匙才能看见门」。
-PUBLIC_EXACT = {"/", "/try", "/health", "/openapi.json", "/favicon.ico"}
+#
+# 【/dashboard 为什么也放进白名单】
+# 同一个道理，而且要说清楚一件事：**放进来的只是"空壳"**。
+# 页面本身不含任何数据 —— 成本、轨迹、待审批命令都是它用浏览器 fetch
+# 去调接口拿的，那一步照样要 token。所以把 /dashboard 公开出去，
+# **没有泄露任何一个数字**；真正被保护的仍然是接口，不是页面。
+# （反过来想：如果连看板页面都要先拿 token 才能打开，那这个页面
+#   就只有"已经拿到钥匙的人"能用了 —— 而它本来就是为了让第一次来的人看明白的。）
+PUBLIC_EXACT = {"/", "/try", "/dashboard", "/health", "/openapi.json", "/favicon.ico"}
 PUBLIC_PREFIX = ("/docs", "/redoc")
 
 # 「花钱」的路径：会调用模型或 embedding API。只有这些扣每日额度。

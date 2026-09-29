@@ -7,7 +7,7 @@ AgentDesk 服务入口
 【运行方式】在 agentdesk 目录下执行：
     .venv\\Scripts\\python.exe -m uvicorn app.main:app --reload --port 8000
 
-【接口一览】共 24 个业务路由，其中 22 个进 OpenAPI 文档。
+【接口一览】共 25 个业务路由，其中 22 个进 OpenAPI 文档。
   为什么是 24 而不是 22：`GET /`（导航页）和 `GET /try`（在线试用页）是给人看的
   页面，标了 `include_in_schema=False`，不进 OpenAPI 的路径表 ——
   它们真实存在、能访问，只是不该混进接口清单里干扰视线。
@@ -51,9 +51,10 @@ AgentDesk 服务入口
     GET  /traces                    最近运行列表
     GET  /traces/{id}               单次运行的完整轨迹
 
-  页面（不进 OpenAPI）
+  页面（不进 OpenAPI；页面只是空壳，数据仍由接口的令牌保护）
     GET  /                          导航页：这是什么、从哪开始试
     GET  /try                       在线试用页：填问题、点按钮
+    GET  /dashboard               可观测看板：成本归因 / 对账 / 逐步轨迹 / 待审批
 
 服务起来后打开 http://127.0.0.1:8000/docs 有自动生成的交互式文档。
 """
@@ -402,8 +403,10 @@ def index(response: Response):
         docs_hint = "交互式文档。要先点右上角 Authorize 填 token，否则一律 401"
         auth_block = (
             '<p style="font-size:13px;color:#59636e">'
-            '除 <code>/</code>、<code>/health</code>、<code>/docs</code>、<code>/try</code> '
-            '之外，所有接口都要求请求头带令牌（<code>X-API-Key</code>）。'
+            '除 <code>/</code>、<code>/try</code>、<code>/dashboard</code>、'
+            '<code>/health</code>、<code>/docs</code> 这几个<b>页面</b>之外，'
+            '所有<b>接口</b>都要求请求头带令牌（<code>X-API-Key</code>）。'
+            '（页面是空壳，数据仍由接口那一步的令牌保护。）'
             '所以直接点上面表格里的链接会看到 401 &mdash; 那是安全层在正常工作，不是服务坏了。</p>'
         )
         try_step = "填令牌、填问题、点「开始」"
@@ -439,8 +442,9 @@ def index(response: Response):
 
     links = [
         ("/try", "★ 在线试用", "填问题、点按钮，看它自己决定查什么。不用懂 API，从这里开始"),
+        ("/dashboard", "★ 可观测看板", "成本归因、对账偏差、逐步轨迹、待审批 —— 不用敲命令就能看"),
         ("/docs", "22 个接口的调试台", docs_hint),
-        ("/metrics/summary", "成本看板", "按 Agent / 动作两维看成本、缓存命中率、P95 延迟"),
+        ("/metrics/summary", "成本看板（JSON）", "按 Agent / 动作两维看成本、缓存命中率、P95 延迟"),
         ("/traces", "链路追踪", "每次运行发生了什么、哪一步最慢最贵"),
         ("/agent/tools", "工具清单", "Agent 能调用的 7 个工具，含风险等级"),
         ("/sandbox", "沙箱状态", "当前是 mock 还是真容器、白名单概览、fail-closed"),
@@ -845,6 +849,270 @@ function render(d, mode) {
     # ★ 这次就是从「浏览器一直给旧页面」开始的 —— 服务端已经改好了，
     #   用户看到的还是老界面，而且刷新键都不一定管用（普通刷新会走缓存）。
     #   页面本身就是服务端渲染的、内容随时可能变，没有任何缓存的理由。
+    response.headers["Cache-Control"] = "no-store, must-revalidate"
+    response.headers["Pragma"] = "no-cache"
+    return html
+
+
+# ============================================================
+# 可观测看板（页面）
+# ============================================================
+@app.get("/dashboard", response_class=HTMLResponse, include_in_schema=False)
+def dashboard_page(response: Response):
+    """把 /metrics/summary、/traces、/approvals 渲染成一个可读的页面。
+
+    【为什么要有这一页】
+    数据一直都是完整的（本地 JSONL 里躺着上百条 trace），但对第一次看的人，
+    一坨 JSON 等于没有 —— 尤其「成本按 Agent 分布」和「对账偏差」这两个最能
+    说明工程质量的东西，埋在 JSON 里谁也看不见。
+
+    【这一页刻意不做什么】
+    · 不引图表库、不做构建、不依赖 CDN —— 一个文件，部署即用
+    · 不做写入 —— 它只是**读**三个已有接口，不新增任何业务状态
+    · **不缓存**（见末尾 no-store）：看板显示的是"现在"，
+      缓存过的看板给出的是过去的数字，而读者会以为那是当前的
+
+    【"要不要令牌"由服务端决定】
+    与 /try 同一条规矩：服务端本来就知道 AUTH_ENABLED，直接写进页面，
+    前端只读取、不去探测（探测方案有三个失败面，/try 里已写过一遍）。
+    """
+    html = """<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AgentDesk · 可观测看板</title>
+<style>
+*{box-sizing:border-box}
+body{font-family:-apple-system,"Segoe UI","Microsoft YaHei",sans-serif;
+     max-width:1040px;margin:0 auto;padding:28px 20px 70px;color:#1f2328;
+     line-height:1.6;background:#fff}
+h1{font-size:22px;margin:0 0 3px}
+.sub{color:#59636e;font-size:13px;margin-bottom:20px}
+h2{font-size:15px;margin:26px 0 10px;padding-bottom:6px;
+    border-bottom:1px solid #e6e8eb}
+h3{font-size:13px;margin:16px 0 0;color:#24292f}
+.bar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:4px}
+input[type=text]{flex:1;min-width:230px;padding:8px 10px;border:1px solid #d0d7de;
+     border-radius:6px;font-size:13px}
+button{padding:8px 14px;border:1px solid #d0d7de;border-radius:6px;background:#f6f8fa;
+     font-size:13px;cursor:pointer;color:#1f2328}
+button:hover{background:#eef1f4}
+.cards{display:flex;gap:10px;flex-wrap:wrap;margin:10px 0 4px}
+.card{flex:1;min-width:128px;border:1px solid #e6e8eb;border-radius:8px;padding:11px 13px}
+.card .k{font-size:12px;color:#59636e}
+.card .v{font-size:19px;margin-top:2px}
+table{width:100%;border-collapse:collapse;font-size:13px;margin-top:8px}
+th,td{text-align:left;padding:7px 9px;border-bottom:1px solid #eef1f4}
+th{color:#59636e;font-weight:500;background:#f6f8fa}
+td.n{text-align:right;font-variant-numeric:tabular-nums}
+.ok{color:#1a7f37}.warn{color:#9a6700}.err{color:#cf222e}.mut{color:#59636e}
+.err-box{border:1px solid #ffcecb;background:#fff5f5;border-radius:8px;
+     padding:10px 12px;font-size:13px;color:#82071e;margin:8px 0}
+.note{font-size:12px;color:#59636e;margin-top:6px}
+.trace{border:1px solid #e6e8eb;border-radius:8px;padding:9px 11px;margin-bottom:7px;
+     cursor:pointer}
+.trace:hover{background:#f6f8fa}
+.spans{margin-top:8px;font-size:12px;color:#424a53;border-top:1px dashed #e6e8eb;
+     padding-top:7px}
+.empty{color:#59636e;font-size:13px;padding:10px 0}
+code{background:#f6f8fa;padding:1px 5px;border-radius:4px;font-size:12px}
+</style></head><body>
+
+<h1>AgentDesk · 可观测看板</h1>
+<div class="sub">数据来自 <code>/metrics/summary</code> · <code>/traces</code> ·
+  <code>/approvals</code> —— 这一页<b>只读</b>，不做任何写入。</div>
+
+<div class="bar" id="tokbar" style="display:none">
+  <input type="text" id="token" placeholder="访问令牌（本实例开启了鉴权）">
+  <button onclick="saveToken()">保存令牌</button>
+</div>
+<div class="bar">
+  <button onclick="loadAll()">刷新</button>
+  <label style="font-size:13px;color:#59636e;display:flex;align-items:center;gap:5px">
+    <input type="checkbox" id="auto" onchange="toggleAuto()"> 每 30 秒自动刷新</label>
+  <span class="note" id="stamp"></span>
+</div>
+
+<h2>概览</h2>
+<div id="summary"></div>
+
+<h2>成本归因</h2>
+<div class="note">两个维度是<b>同一笔钱的两种切法</b>（按 Agent / 按动作），
+  各自合计应等于总账 —— <b>不能相加</b>（相加等于翻倍）。</div>
+<div id="breakdown"></div>
+
+<h2>对账</h2>
+<div id="reconcile"></div>
+
+<h2>最近运行（点开看逐步轨迹）</h2>
+<div id="traces"></div>
+
+<h2>待人工确认的写操作</h2>
+<div id="approvals"></div>
+
+<script>
+var NEEDS_TOKEN = __NEEDS_TOKEN__;
+var TOKEN = localStorage.getItem('agentdesk_token') || '';
+var timer = null;
+
+if (NEEDS_TOKEN) {
+  document.getElementById('tokbar').style.display = 'flex';
+  document.getElementById('token').value = TOKEN;
+}
+function saveToken(){
+  TOKEN = document.getElementById('token').value.trim();
+  localStorage.setItem('agentdesk_token', TOKEN);
+  loadAll();
+}
+function headers(){
+  var h = {'Accept':'application/json'};
+  if (NEEDS_TOKEN && TOKEN) h['Authorization'] = 'Bearer ' + TOKEN;
+  return h;
+}
+async function getJson(path){
+  var r = await fetch(path, {headers: headers(), cache: 'no-store'});
+  if (r.status === 401) throw new Error('需要令牌（HTTP 401）—— 请在上方填入');
+  if (!r.ok) throw new Error(path + ' → HTTP ' + r.status);
+  return r.json();
+}
+function money(v){ return '¥' + Number(v || 0).toFixed(4); }
+function card(k, v, cls){
+  return '<div class="card"><div class="k">' + k +
+         '</div><div class="v ' + (cls || '') + '">' + v + '</div></div>';
+}
+function fail(e, w){
+  document.getElementById(w).innerHTML =
+    '<div class="err-box">' + w + ' 取数失败：' + e.message + '</div>';
+}
+function tbl(m, title, kh){
+  var rows = '';
+  for (var k in m) {
+    rows += '<tr><td>' + k + '</td><td class="n">' + m[k].calls +
+            '</td><td class="n">' + m[k].tokens +
+            '</td><td class="n">' + money(m[k].cost_cny) +
+            '</td><td class="n">' + m[k].elapsed_ms + '</td></tr>';
+  }
+  return '<h3>' + title + '</h3><table><tr><th>' + kh +
+         '</th><th style="text-align:right">次数</th>' +
+         '<th style="text-align:right">token</th>' +
+         '<th style="text-align:right">成本</th>' +
+         '<th style="text-align:right">耗时ms</th></tr>' + rows + '</table>';
+}
+
+async function loadSummary(){
+  try {
+    var d = await getJson('/metrics/summary?limit=50');
+    var e = d.elapsed_ms || {}, tk = (d.tokens || {}).total_tokens || 0;
+    document.getElementById('summary').innerHTML = '<div class="cards">' +
+      card('运行次数', d.runs || 0) +
+      card('错误', d.errors || 0, d.errors ? 'err' : 'ok') +
+      card('总成本', money(d.cost_cny)) + card('token', tk) +
+      card('缓存命中率', ((d.prompt_cache_hit_rate || 0) * 100).toFixed(1) + '%') +
+      card('P50 / P95', (e.p50 || 0) + ' / ' + (e.p95 || 0) + ' ms') + '</div>' +
+      '<div class="note">延迟只统计单次请求（批处理不计入）· 样本 ' +
+      (e.sample || 0) + ' 次</div>';
+    document.getElementById('breakdown').innerHTML =
+      tbl(d.by_span_name || {}, '按 Agent（钱花在谁身上）', '节点') +
+      tbl(d.by_span_type || {}, '按动作（钱花在什么事上）', '类型');
+
+    var rc = d.reconcile || {};
+    function gc(g){ return Math.abs(g) <= 0.01 ? 'ok' : 'warn'; }
+    var h = '<table><tr><th>口径</th><th style="text-align:right">金额</th>' +
+      '<th style="text-align:right">与总账偏差</th></tr>' +
+      '<tr><td>总账</td><td class="n">' + money(rc.trace_total_cny) +
+      '</td><td class="n mut">基准</td></tr>' +
+      '<tr><td>按动作合计</td><td class="n">' + money(rc.by_type_total_cny) +
+      '</td><td class="n ' + gc(rc.by_type_gap || 0) + '">' +
+      ((rc.by_type_gap || 0) * 100).toFixed(2) + '%</td></tr>' +
+      '<tr><td>按 Agent 合计</td><td class="n">' + money(rc.by_name_total_cny) +
+      '</td><td class="n ' + gc(rc.by_name_gap || 0) + '">' +
+      ((rc.by_name_gap || 0) * 100).toFixed(2) + '%</td></tr></table>';
+    if (rc.warning) h += '<div class="err-box">' + rc.warning + '</div>';
+    if (d.unpriced_models && d.unpriced_models.length) {
+      h += '<div class="err-box">未定价模型：' + d.unpriced_models.join('、') +
+           ' —— 这些数字是按兜底价估的</div>';
+    }
+    h += '<div class="note">' + (rc.note || '') + ' · 无 span 的 trace：' +
+         (rc.traces_without_spans || 0) + ' 条（残差的已知来源）</div>';
+    document.getElementById('reconcile').innerHTML = h;
+  } catch (err) {
+    fail(err, 'summary'); fail(err, 'breakdown'); fail(err, 'reconcile');
+  }
+}
+
+async function loadTraces(){
+  try {
+    var items = (await getJson('/traces?limit=8')).items || [];
+    if (!items.length) {
+      document.getElementById('traces').innerHTML =
+        '<div class="empty">还没有运行记录。先跑一次 /try 或 /agent/ask。</div>';
+      return;
+    }
+    var h = '';
+    items.forEach(function(t){
+      h += '<div class="trace" onclick="expand(this,\'' + t.trace_id + '\')">' +
+        '<div><b>' + t.name + '</b> <span class="mut">' + t.trace_id + '</span> ' +
+        '<span class="' + (t.status === 'ok' ? 'ok' : 'err') + '">' + t.status +
+        '</span></div><div class="mut" style="font-size:12px">' +
+        (t.question || '') + ' · ' + (t.elapsed_ms || 0) + 'ms · ' +
+        money(t.cost_cny) + ' · ' + (t.span_count || 0) + ' span</div>' +
+        '<div class="spans" style="display:none"></div></div>';
+    });
+    document.getElementById('traces').innerHTML = h;
+  } catch (err) { fail(err, 'traces'); }
+}
+
+async function expand(el, id){
+  var box = el.querySelector('.spans');
+  if (box.style.display !== 'none') { box.style.display = 'none'; return; }
+  box.innerHTML = '加载中…'; box.style.display = 'block';
+  try {
+    var rows = '';
+    ((await getJson('/traces/' + id)).spans || []).forEach(function(s){
+      rows += '<div>' + s.type + ' · <b>' + s.name + '</b> · ' +
+        (s.elapsed_ms || 0) + 'ms · ' +
+        '<span class="' + (s.status === 'ok' ? 'ok' : 'err') + '">' + s.status +
+        '</span>' + (s.error ? ' · ' + s.error : '') + '</div>';
+    });
+    box.innerHTML = rows || '（这条 trace 没有 span）';
+  } catch (err) { box.innerHTML = '加载失败：' + err.message; }
+}
+
+async function loadApprovals(){
+  try {
+    var items = (await getJson('/approvals?status=pending&limit=10')).items || [];
+    if (!items.length) {
+      document.getElementById('approvals').innerHTML =
+        '<div class="empty">没有待确认的写操作。</div>';
+      return;
+    }
+    var h = '<table><tr><th>编号</th><th>命令</th><th>风险</th><th>到期</th></tr>';
+    items.forEach(function(a){
+      h += '<tr><td>' + a.id + '</td><td><code>' + a.command + '</code></td><td>' +
+        (a.risk || '') + '</td><td class="mut">' + (a.expires_at || '') + '</td></tr>';
+    });
+    document.getElementById('approvals').innerHTML = h + '</table>';
+  } catch (err) { fail(err, 'approvals'); }
+}
+
+function toggleAuto(){
+  if (document.getElementById('auto').checked) timer = setInterval(loadAll, 30000);
+  else { clearInterval(timer); timer = null; }
+}
+async function loadAll(){
+  document.getElementById('stamp').textContent = '载入中…';
+  await Promise.all([loadSummary(), loadTraces(), loadApprovals()]);
+  document.getElementById('stamp').textContent =
+    '更新于 ' + new Date().toLocaleTimeString();
+}
+loadAll();
+</script>
+</body></html>"""
+
+    # ★ "要不要令牌"由服务端决定，前端只读取 —— 与 /try 同一条规矩。
+    needs_token = "true" if security.AUTH_ENABLED else "false"
+    html = html.replace("__NEEDS_TOKEN__", needs_token)
+
+    # 看板显示的是"现在"，没有任何缓存的理由
     response.headers["Cache-Control"] = "no-store, must-revalidate"
     response.headers["Pragma"] = "no-cache"
     return html

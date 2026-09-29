@@ -238,7 +238,7 @@ Agent 只知道 `web-01` 这样的**逻辑名**，它不知道、也不该知道
 
 ## 接口
 
-24 个路由（22 个进 OpenAPI 文档），按功能分组（完整定义见 [在线文档](https://agent.simosheng.fun/docs)）：
+25 个路由（22 个进 OpenAPI 文档），按功能分组（完整定义见 [在线文档](https://agent.simosheng.fun/docs)）：
 
 <details>
 <summary><b>Agent 与检索</b></summary>
@@ -336,7 +336,7 @@ curl -H "X-API-Key: <你的令牌>" \
 agentdesk/
 ├── app/
 │   ├── llm.py              模型调用统一入口
-│   ├── main.py             FastAPI 服务入口（24 个路由）
+│   ├── main.py             FastAPI 服务入口（25 个路由）
 │   ├── security.py         公网安全层：白名单鉴权 + 三层限流 + 每日额度
 │   ├── rag/                检索层：切分 / 向量化 / 存储 / 混合检索管线
 │   ├── tools/              工具层：7 个运维工具（6 只读 + 1 执行）+ 参数白名单
