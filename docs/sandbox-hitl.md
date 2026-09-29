@@ -207,6 +207,45 @@ subprocess 无隔离执行**。要无隔离执行必须显式设 `SANDBOX_BACKEN
 
 ---
 
+### 6.6 真容器隔离：逐条实测（Windows + Docker Desktop，2026-09-29）
+
+Docker 运行中时 `/sandbox` 报 `backend=docker`、`isolated=true`。
+下面是**逐条打点**的结果 —— 用项目自己的 `executor.docker_argv()` 起容器，
+所以验的是真实参数，不是另抄一份：
+
+| 声明的限制 | 容器内实测输出 | 结论 |
+|---|---|---|
+| 非 root | `uid=65534(nobody) gid=65534(nobody)` | ✅ |
+| 根文件系统只读 | `touch /pwned` → `Read-only file system`；`mount` 显示 `overlay on / (ro,…)` | ✅ |
+| /tmp 能写不能执行 | 写文件成功；执行 `sh /tmp/x.sh` → `Permission denied`；`tmpfs on /tmp (rw,nosuid,nodev,noexec,size=16384k)` | ✅ |
+| capability 全掉 | `CapPrm / CapEff / CapBnd` 全是 `0000000000000000` | ✅ |
+| 内存封顶 | `cat /sys/fs/cgroup/memory.max` → `134217728`（=128MB） | ✅ |
+| CPU 封顶 | `cpu.max` → `50000 100000`（=0.5 核） | ✅ |
+| 进程数封顶 | `pids.max` → `64` | ✅ |
+| 不能提权 | `su -` → `must be suid to work properly` | ✅ |
+| **无网络** | 只有 `lo`；默认路由 **0 条**；TCP 连 `1.1.1.1:53`、`8.8.8.8:53`、HTTP 取 example.com **全部失败（退出码 1）** | ✅ |
+| **写操作真落到宿主机** | 挂一个 5000 字节的宿主文件 → 容器内 `truncate -s 0` → 宿主上变成 **0 字节** | ✅ |
+
+> **这不是"参数写对了"的证明，是"参数真的生效了"的证明。**
+> 上面任何一条只在代码里写着、没在容器里 `cat` 出来过，都不算验证过 ——
+> 本项目的审计报告当初正是卡在这一步：「真容器执行这条路我测不了」。
+
+**通道差异（容易被误读）**：只读命令走**宿主面子进程**，写命令才走**一次性容器** ——
+
+| 命令 | 通道 | 含义 |
+|---|---|---|
+| `df -h` / `free -m` | `host` | 直接在宿主上跑，`isolated=False`（只读、不拼 shell、argv 走白名单） |
+| `truncate -s 0 <日志>` | `container` | 一次性容器，`isolated=True` |
+
+所以自检里看到「后端 docker 但 `isolated=False`」是正常的 —— 那条探的是只读通道。
+**"后端是 docker"和"这一条命令跑在容器里"是两件事。**
+
+**已知前提（是取舍，不是 bug）**：容器以 `nobody` 运行，因此「挂载出来的目录必须对它可写」。
+在 Windows + Docker Desktop 上直接跑真实的 `truncate /var/log/nginx/error.log` 会得到
+`open: Permission denied` —— 该目录在宿主上不存在、由 Docker 新建，属主不匹配。
+这与 `docs/observability.md` 里记的是同一件事：**`Permission denied` 正是"非 root 运行"
+在做它该做的事**。要在真机上用这条路，需让目标日志目录对 `nobody`（或等价 uid）可写。
+
 ## 七、踩到的坑（比结论更值钱）
 
 **一、白名单规则静默失效**

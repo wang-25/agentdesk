@@ -33,7 +33,7 @@ cd "E:/Workbuddy/ai agent/agentdesk"
 | 检查项 | 结果 |
 |---|---|
 | 服务版本 | `0.9.0`，24 个路由，实测全部 200 |
-| 沙箱 | 后端 `mock`（真隔离=False）· **fail-closed=True** |
+| 沙箱 | 后端 `docker`（**真隔离=True**，十项限制逐条实测）· **fail-closed=True** |
 | 白名单 | 13 条（直通 10 / 需审批 3）· 高危拦截 **42 个二进制** |
 | Agent 工具 | 7 个（6 只读 + 1 高危 `run_command`） |
 | 真实诊断 | `intent → knowledge → diagnose → verify → finalize`，5 次工具调用、9.7s、校验通过 |
