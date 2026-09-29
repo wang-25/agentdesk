@@ -262,11 +262,32 @@ def span(stype: str, name: str, **attrs):
 
 
 @contextmanager
-def trace(name: str, question: str = "", batch: bool = False, **attrs):
+def trace(name: str, question: str = "", batch: bool = False,
+          source: str = "live", **attrs):
     """打开一个 trace（一次完整运行）。
 
     结束时写一条 kind=trace 的汇总记录：总 token / 总成本 / 完整 spans
     都并进这一条 —— 查询单次详情只需要读一行。
+
+    ★ source 标记这条 trace 是**怎么产生的**：
+
+      · "live"     —— 真实运行（HTTP 请求、Agent 诊断、评测批处理…）
+      · "selftest" —— 自检脚本写的，**不是真实流量**
+
+      为什么必须分开（这是被一个假数字逼出来的）：
+
+        某天看 /metrics/summary，显示 **errors=8**。真实运行里一次错误都没有 ——
+        那 8 条全是 `scripts/smoke_test.py` 每次跑都要造的 `smoke-err`
+        （它专门用来验证"错误 trace 能被正确记录"）。
+        同一窗口里 50 条 trace 有 24 条是自检造的。
+
+        成本上这些假记录占比很小（不到 2%），所以金额看不出问题；
+        但**计数类指标被直接污染** —— "50 次运行、8 次错误"读起来
+        像一个错误率 16% 的系统，而真相是 0%。
+
+        **自检数据用于验证"记录机制对不对"，不能拿来当"系统运行状况"。**
+        它必须能被一眼认出、且默认不计入对外口径。
+
 
     ★ batch=True 表示**批处理任务**（比如跑一次评测：160 次模型调用、
       几分钟），不是"一次用户请求"。
@@ -323,6 +344,10 @@ def trace(name: str, question: str = "", batch: bool = False, **attrs):
                 "kind": "trace", "trace_id": tid, "name": name,
                 # batch=True 的 trace 会计入成本，但不计入延迟统计（见上方说明）
                 "batch": bool(batch),
+                # ★ live = 真实运行 / selftest = 自检脚本造的。
+                #   聚合时默认把 selftest 排除在外，否则"运行次数/错误数"
+                #   这类计数指标会被自检数据污染（实测污染过 100%）。
+                "source": source,
                 "question": str(question or "")[:200],
                 "started_at": _now(), "elapsed_ms": int((time.time() - started) * 1000),
                 "status": status, "usage": usage,
@@ -421,8 +446,25 @@ def read_recent(limit: int = 800) -> list:
         return []
 
 
-def recent_traces(limit: int = 20) -> list:
+def recent_traces(limit: int = 20, source: str = "live", stats: dict = None) -> list:
     """最近的 trace 汇总（不含 spans，列表视图用）。新的在前。
+
+    stats：可选。传一个 dict 进来，会把"扫过多少条、滤掉多少条"写回去 ——
+           调用方（/metrics/summary）需要如实报告"排除了多少自检记录"。
+           **静默过滤和不过滤一样是撒谎**：读者看到 runs=48 时应该能知道
+           窗口里其实还有 75 条自检记录被挡在外面。
+
+
+    ★ source 默认 "live" —— **列表视图默认不显示自检记录**。
+
+      两个理由：
+        ① 自检数据要用来验证"记录机制对不对"，混进"最近运行"列表里
+           只会让人以为系统真跑过这些请求（`smoke` / `smoke-err` 尤其误导）
+        ② 过滤放在"读"这一层（而不是聚合层），才能保证
+           **要 50 条就给 50 条**：否则读 50 条、再在聚合里剔掉 24 条，
+           接口返回 26 条却说自己查的是 50 次运行 —— 又一次静默少给。
+
+      传 source=None 可拿到全部（自检脚本自己要用，见 smoke_test.py）。
 
     ★ 不能固定按 limit×N 读原始记录再筛 —— 这一点踩过：
 
@@ -438,9 +480,26 @@ def recent_traces(limit: int = 20) -> list:
       代价是极端情况下多读一两次文件（尾部 2MB，很便宜），
       换来的是"接口承诺多少就给多少"。
     """
+    excluded, raw, out = 0, [], []
     for factor in (6, 20, 60):
-        traces = [r for r in read_recent(limit=limit * factor)
-                  if r.get("kind") == "trace"]
+        raw = [r for r in read_recent(limit=limit * factor)
+               if r.get("kind") == "trace"]
+        # ★ 每轮重新计数：换更大的 factor 会**重扫一遍范围更大的尾部**，
+        #   累加会把同一批记录数多次（实测报出 163 条，而扫过的一共只有 123 条 ——
+        #   **排除数比扫描数还大**，一眼假）。
+        excluded = 0
+        traces = []
+        for r in raw:
+            # 老记录没有 source 字段 → 视作 live（不能因为加字段
+            # 就把历史数据全弄丢）
+            src = r.get("source") or "live"
+            if source is not None and src != source:
+                excluded += 1
+                continue
+            traces.append(r)
+        # 扫到的真实运行**总数**（可能多于 limit —— 那部分是被窗口截掉的，
+        # 不是被排除的，两者不能混为一谈）
+        live_total = len(traces)
         seen, out = set(), []
         for t in reversed(traces):
             tid = t.get("trace_id")
@@ -449,7 +508,16 @@ def recent_traces(limit: int = 20) -> list:
             seen.add(tid)
             out.append(t)
             if len(out) >= limit:
-                return out
+                break
+        if stats is not None:
+            # ★ 三个数必须能对上：scanned = selftest_excluded + live_available
+            #   （报过一次 selftest_excluded=163 而 scanned 只有 123 —— 排除数
+            #    比扫描数还大，一眼假。根因是扩读时重复累加。）
+            stats["excluded_selftest"] = excluded
+            stats["scanned"] = len(raw)
+            stats["live_available"] = live_total
+        if len(out) >= limit:
+            return out
     return out
 
 

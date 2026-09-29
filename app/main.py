@@ -605,6 +605,8 @@ def try_page(response: Response):
 
 <div class="note" id="authnote">__AUTH_NOTE__</div>
 
+__DATA_SOURCE_NOTE__
+
 <div class="card" id="tokcard"__TOKCARD_STYLE__>
   <label for="token">访问令牌</label>
   <div class="row">
@@ -839,8 +841,44 @@ function render(d, mode) {
         )
         tokcard_style = ' style="display:none"'
 
+    # ★★ 必须**如实告诉用户这些数字是从哪来的**。
+    #
+    #   起因：公网演示实例跑在 mock 后端（不连任何真实机器），
+    #   而页面上没有任何提示。于是「web-01 磁盘还剩多少」会答
+    #   「用了 96%」—— 一个**看起来像真的、实际是预置样例值**的答案，
+    #   而真机上是 36%。README 里写了，但用户不会先读 README 再提问。
+    #
+    #   这个项目的卖点就是"数字可信"（对账、溯源、评测）。
+    #   一个不标注数据来源的演示页，恰恰在削弱它自己的卖点。
+    #   **数据来源不是脚注，是结论的一部分** —— 尤其在运维场景里，
+    #   「我查到磁盘 96%」和「我查到样例值里的磁盘 96%」是两件事。
+    from app.tools import ops as _ops
+    backend = (_ops.BACKEND or "mock").lower()
+    if backend == "mock":
+        data_source_note = (
+            '<div class="err" style="font-size:13.5px">'
+            '<b>⚠️ 本实例用的是仿真数据，不连接任何真实机器。</b><br>'
+            '工具层跑在 <code>mock</code> 后端，下面查到的磁盘 / 负载 / 容器 '
+            '都是<b>预置的样例值</b>，不是你环境里的真实情况。<br>'
+            '（真机后端是 <code>ssh</code>，本项目在本地就是这么跑的 —— '
+            '两套实例刻意分开：演示服务不该和生产机共用取证通道。）'
+            '</div>')
+    else:
+        # ★ 报"真正连得上的主机"，不是"已知主机名清单"。
+        #   KNOWN_HOSTS 里有 db-01 / cache-01（逻辑主机名，用于意图路由），
+        #   但它们没有配 SSH 目标、查询会明确报错。
+        #   把它们列在"数据来自实时查询"后面，又是一次"看起来像真的"。
+        reachable = list(_ops.SSH_TARGETS) if backend == "ssh" else list(_ops.KNOWN_HOSTS)
+        hosts = "、".join(reachable)
+        data_source_note = (
+            '<div class="ok" style="font-size:13.5px">'
+            f'✓ 数据来自<b>实时查询</b>（后端 <code>{backend}</code>'
+            + (f'，主机 {hosts}' if hosts else "")
+            + '）。每条结论都能追到具体命令与输出。</div>')
+
     html = (
         html.replace("__AUTH_NOTE__", auth_note)
+        .replace("__DATA_SOURCE_NOTE__", data_source_note)
         .replace("__TOKCARD_STYLE__", tokcard_style)
         .replace("__NEEDS_TOKEN__", "true" if needs_token else "false")
     )
@@ -2030,12 +2068,29 @@ def metrics_summary(limit: int = Query(50, ge=1, le=500,
       - P95 延迟在哪、错误率多少
       - DeepSeek 缓存命中率（命中率低 = system prompt 每次都在变，白花钱）
     """
-    traces = obs.recent_traces(limit=limit)
+    stats = {}
+    traces = obs.recent_traces(limit=limit, stats=stats)
     report = obs_costs.aggregate(traces)
     report["langfuse"] = langfuse_export.describe()
     report["export_failures"] = obs.export_failures()
     report["store"] = {
         "path": str(obs.TRACE_PATH.relative_to(PROJECT_ROOT)),
         "exists": obs.TRACE_PATH.exists(),
+    }
+    # ★ 如实交代"这份报告统计的是什么"。
+    #   起因：这个接口曾经报 errors=8，而真实运行一次错误都没有 ——
+    #   8 条全是自检脚本每次都要造的错误 trace。计数类指标被污染到 100%，
+    #   金额却看不出问题（自检记录花的钱很少）。**所以光看总成本发现不了。**
+    report["scope"] = {
+        "window_requested": limit,
+        "live_runs": len(traces),
+        "records_scanned": stats.get("scanned", 0),
+        "selftest_excluded": stats.get("excluded_selftest", 0),
+        "live_available": stats.get("live_available", len(traces)),
+        "note": ("只统计真实运行（source=live）。自检脚本 scripts/smoke_test.py "
+                 "写的记录被排除 —— 它们用来验证「记录机制对不对」，"
+                 "不能代表「系统运行状况」。"
+                 "records_scanned = live_available + selftest_excluded，"
+                 "live_runs 是其中被窗口取用的部分（min(live_available, limit)）。"),
     }
     return report

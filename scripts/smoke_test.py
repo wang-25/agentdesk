@@ -500,7 +500,7 @@ def check_observability(full: bool = False):
         #   而真实运行里 token 永远产生在最内层那次模型调用（llm span）上，
         #   再向上归并。成本核算现在按叶子 span 归因（只有叶子知道用了哪个模型），
         #   所以旧写法的成本会算成 0 —— 是**测试用例不真实**，不是代码错了。
-        with tracer.trace("smoke", question="自检用例") as tid:
+        with tracer.trace("smoke", question="自检用例", source="selftest") as tid:
             with tracer.span(tracer.TYPE_AGENT, name="intent") as sp:
                 with tracer.span(tracer.TYPE_LLM, name="chat_step") as lsp:
                     lsp.set_usage({"prompt_tokens": 100, "completion_tokens": 20,
@@ -508,7 +508,7 @@ def check_observability(full: bool = False):
                                    "prompt_cache_miss_tokens": 40})
                 with tracer.span(tracer.TYPE_TOOL, name="check_disk") as tsp:
                     tsp.set("host", "web-01")
-        traces = tracer.recent_traces(limit=5)
+        traces = tracer.recent_traces(limit=5, source="selftest")
         t = next((x for x in traces if x["trace_id"] == tid), None)
         ok_trace = t is not None
         spans_ok = ok_trace and t.get("span_count") == 3 and len(t.get("spans") or []) == 3
@@ -538,7 +538,7 @@ def check_observability(full: bool = False):
     #   前三个字段（prompt/completion/total）正常，后面的缓存字段全丢，
     #   于是节点成本按"全部未命中"算，看板数字虚高。
     try:
-        with tracer.trace("smoke-nested") as tid2:
+        with tracer.trace("smoke-nested", source="selftest") as tid2:
             with tracer.span(tracer.TYPE_AGENT, name="node"):
                 with tracer.span(tracer.TYPE_LLM, name="chat_step") as lsp:
                     lsp.set_usage({
@@ -548,7 +548,7 @@ def check_observability(full: bool = False):
                         "prompt_cache_hit_tokens": 768,
                         "prompt_cache_miss_tokens": 236,
                     })
-        t2 = next((x for x in tracer.recent_traces(limit=5)
+        t2 = next((x for x in tracer.recent_traces(limit=5, source="selftest")
                    if x["trace_id"] == tid2), None)
         node = next((s for s in (t2 or {}).get("spans", [])
                      if s.get("name") == "node"), None)
@@ -566,13 +566,13 @@ def check_observability(full: bool = False):
     # ---- 2. 异常会被记下来且原样抛出（观测绝不吞业务异常） ----
     raised, recorded = False, False
     try:
-        with tracer.trace("smoke-err", question=""):
+        with tracer.trace("smoke-err", question="", source="selftest"):
             with tracer.span(tracer.TYPE_AGENT, name="boom"):
                 raise ValueError("故意抛出")
     except ValueError:
         raised = True
     if raised:
-        bad = [t for t in tracer.recent_traces(limit=5)
+        bad = [t for t in tracer.recent_traces(limit=5, source="selftest")
                if t["name"] == "smoke-err"]
         recorded = bool(bad) and bad[0].get("status") == "error"
     record("观测", "异常：记录状态且原样抛出", raised and recorded,

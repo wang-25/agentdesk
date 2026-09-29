@@ -182,7 +182,28 @@ def aggregate(traces: list) -> dict:
     ★ 这里的维度选择是刻意设计的。讲可观测时最有力的是这句：
       「我不只知道花了多少钱，我知道**每个环节**花了多少、
        哪一步最慢、哪一步在白花钱」—— 所以按 span 拆维度。
+
+    ★ **不统计自检记录**（source="selftest"）。
+
+      起因是一个很能骗人的数字：某天 /metrics/summary 显示 `errors=8`，
+      而真实运行里一次错误都没有 —— 8 条全是 smoke_test.py 每次
+      都要造的 `smoke-err`（它存在的意义是验证"错误 trace 能被记录"）。
+      同一窗口 50 条 trace 里有 24 条是自检造的。
+
+      成本上这些假记录占比很小（<2%），所以**金额看不出问题**；
+      但**计数类指标被直接污染**：50 次运行、8 次错误，
+      读起来像一个错误率 16% 的系统，而真相是 0%。
+
+      **自检数据只能用来验证「记录机制对不对」，不能代表「系统运行状况」。**
+
+      这里只是**兜底**再滤一道 —— 正常路径下调用方（/metrics/summary）
+      传进来的已经是过滤过的（过滤发生在 tracer.recent_traces，
+      这样才保证"要 50 条就给 50 条真实运行"）。
+      "排除了多少"由调用方报告，不在这里返回：
+      **同一个数字有两个来源，迟早会打架。**
     """
+    traces = [t for t in traces if (t.get("source") or "live") == "live"]
+
     n = len(traces)
     if not n:
         return {"runs": 0}
@@ -359,7 +380,7 @@ def aggregate(traces: list) -> dict:
         "unpriced_models": unpriced_models(),
         "price_table_checked_at": "2026-09-28",
         "generated_at": datetime.now().isoformat(timespec="seconds"),
-        "window": f"最近 {n} 次 trace",
+        "window": f"最近 {n} 次真实运行",
     }
 
 
