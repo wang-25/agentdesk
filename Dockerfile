@@ -33,6 +33,28 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# ★ openssh-client 单独一层，**特意放在 pip 之后**。
+#
+#   为什么单独放（一次实测换来的）：把它塞进上面那个 apt 层，会让 pip 层的
+#   缓存**全部失效** —— 父层一变，下游每一层都要重建。实测改一行 apt，
+#   就要重装全部 Python 依赖，跑了 9 分钟还在下载（几百 MB）。
+#
+#   分开之后：改 apt 只重建这一层（几 MB，秒级）；改依赖只重建 pip 那一层。
+#   **变化频率完全不同的两件事，不该塞进同一层。**
+#
+#   顺带换国内源：python:3.12-slim 默认用 deb.debian.org，在阿里云 ECS 上
+#   拉索引要好几分钟；mirrors.aliyun.com 走内网，快得多。
+#   （只在这一层换 —— 上面那层保持原样，才不破坏它的缓存。）
+RUN set -e; \
+    for f in /etc/apt/sources.list /etc/apt/sources.list.d/debian.sources; do \
+        if [ -f "$f" ]; then \
+            sed -i 's|deb.debian.org|mirrors.aliyun.com|g; s|security.debian.org|mirrors.aliyun.com|g' "$f"; \
+        fi; \
+    done; \
+    apt-get update \
+    && apt-get install -y --no-install-recommends openssh-client \
+    && rm -rf /var/lib/apt/lists/*
+
 # 代码层
 COPY app/ ./app/
 COPY data/ ./data/
@@ -42,10 +64,17 @@ COPY docs/ ./docs/
 COPY README.md ./
 COPY .env.example ./
 
-# 非 root 用户 + 可写的日志目录
+# 非 root 用户 + 可写的日志目录 + ~/.ssh
+#
+# ★ 为什么必须预先建 /home/agent/.ssh：
+#   ssh 后端第一次连一台新主机时会写 known_hosts（StrictHostKeyChecking=accept-new）。
+#   如果这个目录不存在，写会静默失败 —— **每一次连接都会被当成"首次"**，
+#   于是 accept-new 退化成无条件接受，中间人检测形同关闭。
+#   （实测表现：连接完全正常，不报任何错 —— 又一处"静默失效"。）
 RUN useradd -m -u 10001 -s /usr/sbin/nologin agent \
-    && mkdir -p /app/logs \
-    && chown -R agent:agent /app
+    && mkdir -p /app/logs /home/agent/.ssh \
+    && chmod 700 /home/agent/.ssh \
+    && chown -R agent:agent /app /home/agent
 
 USER agent
 

@@ -39,6 +39,24 @@ services:
     env_file:
       - .env
 
+    # ★ 工具层数据源。**默认 mock（仿真）**，要连真机就在 .env 里覆盖。
+    #
+    #   为什么默认 mock：clone 下来直接 `docker compose up` 就该能跑通。
+    #   如果默认写 ssh，别人没有那台机器、没有密钥，容器一起来就报错。
+    #
+    #   为什么用 ${VAR:-默认值} 而不是直接写字面量：
+    #   数据源是**环境相关**的（主机地址、密钥路径、用户名都不同），
+    #   写进 compose 就等于把一个具体环境钉死在仓库里 —— 既泄漏内网拓扑，
+    #   也让这份文件对别人没用。值放 .env，这里只声明"有哪些旋钮"。
+    #
+    #   本项目的线上演示实例用的是 mock；本地开发实例用 ssh（见 .env.example
+    #   「工具层数据源」一节的两种配法）。
+    environment:
+      OPS_BACKEND: ${OPS_BACKEND:-mock}
+      OPS_SSH_TARGETS: ${OPS_SSH_TARGETS:-}
+      OPS_SSH_KEY: ${OPS_SSH_KEY:-}
+      OPS_HOSTS: ${OPS_HOSTS:-}
+
     ports:
       # 只监听回环，公网必须经 NPM 进来
       - "127.0.0.1:8088:8000"
@@ -47,6 +65,15 @@ services:
       # 索引和日志挂出来，重建容器不丢
       - ./data:/app/data
       - ./logs:/app/logs
+      # ★ SSH 私钥（仅 OPS_BACKEND=ssh 时需要），**只读**挂载。
+      #
+      #   只读是关键：容器跑的是别人能通过 HTTP 触发的代码，
+      #   不能让它有机会改写这把钥匙。
+      #   容器内是非 root（uid 10001）运行，所以宿主上这份文件
+      #   要让 uid 10001 可读 —— 见 docs/deployment.md。
+      #
+      #   路径同样用变量：不同环境放的位置不同，默认 ./.ssh。
+      - ${OPS_KEY_DIR:-./.ssh}:/app/.ssh:ro
 
     # 内存硬上限：稳态实测约 153MB，这里是 2.5 倍余量
     mem_limit: 400m
