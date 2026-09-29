@@ -1012,12 +1012,34 @@ def webhook_alert(payload: dict):
         base["parse_attempts"] = attempts
 
         # ---- 第二步：按风险等级决定做还是停 ----
-        if risk == "high":
-            # 高危操作不自动执行。这不是能力不足，是责任边界 ——
-            # 生产环境不能靠"相信模型不会干坏事"。
+        #
+        # ★ 这里原先只判断 `risk == "high"`，于是有一个**闸门形同虚设**的漏洞：
+        #   本文件用的 INTENT_SYSTEM_PROMPT 把"重启服务"定义为 medium，
+        #   而闸门只拦 high —— 结果"mysql 服务挂了，需要立即重启"这种请求
+        #   一路走到 auto_diagnose，被标成"只读诊断，已生成处置预案"。
+        #   实测复现：action=restart、risk=medium、decision=auto_diagnose。
+        #
+        #   更麻烦的是同一个"重启服务"在本项目里有**三套互相矛盾的风险判定**：
+        #     ① 这个提示词（告警链路用）      → medium
+        #     ② sandbox/policy.py（白名单）   → needs_approval，要人工
+        #     ③ tools/ops.py 的 run_command  → risk=high
+        #   而危害最大的一条路径（无人值守）偏偏用了最松的那一套。
+        #
+        #   现在改成**同时看 action 和 risk**：只要意图是"要动手改系统"
+        #   （restart / cleanup），一律转人工，与 risk 数字无关 ——
+        #   因为"写操作必须有人点头"是这个项目的核心边界（见 policy.py），
+        #   不能因为某个字段被模型标成了 medium 就绕过去。
+        #   **安全判断要看"要做什么"，不能只看"模型说有多危险"。**
+        wants_write = intent.get("action") in ("restart", "cleanup")
+        if risk == "high" or wants_write:
             report = {**base, "decision": "need_human",
-                      "reason": "风险等级 high，未执行任何操作，等待人工确认",
+                      "reason": ("请求包含写操作（action=%s），未执行任何操作，等待人工确认"
+                                 % intent.get("action")) if wants_write
+                                else "风险等级 high，未执行任何操作，等待人工确认",
                       "playbook": []}
+            write_audit("alert.gate_blocked", {
+                "alertname": alert["alertname"], "action": intent.get("action"),
+                "risk": risk, "reason": report["reason"]})
         else:
             playbook = DIAGNOSE_PLAYBOOK.get(service, DEFAULT_PLAYBOOK)
             report = {**base, "decision": "auto_diagnose",
