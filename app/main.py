@@ -1024,6 +1024,11 @@ async function getJson(path){
   if (!r.ok) throw new Error(path + ' → HTTP ' + r.status);
   return r.json();
 }
+ function esc(s){
+   return String(s == null ? '' : s)
+     .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+     .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+ }
 function money(v){ return '¥' + Number(v || 0).toFixed(4); }
 function card(k, v, cls){
   return '<div class="card"><div class="k">' + k +
@@ -1052,14 +1057,24 @@ async function loadSummary(){
   try {
     var d = await getJson('/metrics/summary?limit=50');
     var e = d.elapsed_ms || {}, tk = (d.tokens || {}).total_tokens || 0;
+    var sc = d.scope || {};
     document.getElementById('summary').innerHTML = '<div class="cards">' +
       card('运行次数', d.runs || 0) +
+      card('不同问题', d.distinct_questions || 0) +
       card('错误', d.errors || 0, d.errors ? 'err' : 'ok') +
       card('总成本', money(d.cost_cny)) + card('token', tk) +
       card('缓存命中率', ((d.prompt_cache_hit_rate || 0) * 100).toFixed(1) + '%') +
       card('P50 / P95', (e.p50 || 0) + ' / ' + (e.p95 || 0) + ' ms') + '</div>' +
       '<div class="note">延迟只统计单次请求（批处理不计入）· 样本 ' +
-      (e.sample || 0) + ' 次</div>';
+      (e.sample || 0) + ' 次</div>' +
+      (sc.caveat
+        ? '<div class="note" style="background:#fff8e6;border-left:3px solid #d4a017">' +
+          '<b>「运行次数」不等于「用户数」。</b> ' + esc(sc.caveat) + '</div>'
+        : '') +
+      (sc.records_scanned
+        ? '<div class="note">记录口径：扫描 ' + sc.records_scanned + ' 条 → 真实运行 ' +
+          sc.live_available + ' 条 · 已排除自检 ' + sc.selftest_excluded + ' 条</div>'
+        : '');
     document.getElementById('breakdown').innerHTML =
       tbl(d.by_span_name || {}, '按 Agent（钱花在谁身上）', '节点') +
       tbl(d.by_span_type || {}, '按动作（钱花在什么事上）', '类型');
@@ -2092,5 +2107,20 @@ def metrics_summary(limit: int = Query(50, ge=1, le=500,
                  "不能代表「系统运行状况」。"
                  "records_scanned = live_available + selftest_excluded，"
                  "live_runs 是其中被窗口取用的部分（min(live_available, limit)）。"),
+        # ★★ 这一条是用户逼出来的。他看到「最近运行」列表后直接说
+        #   「最近运行应该不是真的」—— 他是对的：那 49 条里，
+        #   同一句健康检查重复 14 次、同一句验证问句重复 7 次，
+        #   全是我调试这个项目时产生的，没有一条是真实用户提问。
+        #
+        #   而**服务端没有能力区分"真实用户"和"开发者"** ——
+        #   同一个接口、同一份凭据、同一种请求格式，HTTP 层面看不出区别。
+        #   所以这里不假装能区分，只把已知的口径讲清楚，
+        #   并给出能自己说话的旁证（distinct_questions）。
+        "caveat": ("「运行次数」= 接口被调用的次数，不等于「被多少真实用户用过」。"
+                   "服务端无法区分真实用户与开发者调试（同一接口、同一凭据、"
+                   "同一请求格式），所以判断方法是看问题的多样性："
+                   "runs 明显大于 distinct_questions，就是在反复测同一件事。"
+                   "当前这批记录来自开发调试（含评测批处理与告警测试），"
+                   "不代表有人在使用这个服务。"),
     }
     return report

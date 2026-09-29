@@ -319,6 +319,25 @@ def aggregate(traces: list) -> dict:
 
     hit_rate = (cache_hit / (cache_hit + cache_miss)) if (cache_hit + cache_miss) else 0.0
 
+    # ★★ 「运行次数」是全项目最容易读错的一个数字。
+    #
+    #   用户看到 `runs = 49` 会读成"这服务被用了 49 次"。而这台机器上的真相是：
+    #   **49 次里只有 8 个不同的问题** —— 同一句健康检查（"一句话说明什么是容器"）
+    #   重复了 14 次，同一句验证问句重复了 7 次。
+    #   也就是说：那是开发调试，不是使用量。
+    #
+    #   **服务端没有能力区分"真实用户"和"开发者"** —— 同一个接口、同一份凭据、
+    #   同一种请求格式，HTTP 层面看不出区别。所以这里不假装能区分，
+    #   而是给一个**能自己说话的旁证**：去重后还剩几个问题。
+    #
+    #     运行 49 次 / 不同问题 8 个  →  明显是反复测同一件事
+    #     运行 49 次 / 不同问题 47 个 →  才像真实使用
+    #
+    #   这和"成本按叶子 span 归因""相关性只统计库内题"是同一条原则：
+    #   **分母选错，指标就失去意义。**
+    distinct_questions = len({(t.get("question") or "").strip()
+                              for t in traces if (t.get("question") or "").strip()})
+
     # ---- 对账（reconcile）----
     # ★ 这是本次新增的部分，也是把"文档里的一句话"变成"被检查的事实"的地方。
     #   原先接口只返回三个数字（总账 + 两个维度），谁也不去算它们的差 ——
@@ -359,6 +378,9 @@ def aggregate(traces: list) -> dict:
 
     return {
         "runs": n,
+        # ★ 和 runs 一起看才有意义：49 次运行 / 8 个不同问题 = 在反复测同一件事；
+        #   49 次运行 / 47 个不同问题 = 才像真实使用。见上方说明。
+        "distinct_questions": distinct_questions,
         "errors": errors,
         "tokens": total_usage,
         "cost_cny": round(total_cost, 4),
