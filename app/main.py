@@ -950,6 +950,18 @@ code{background:#f6f8fa;padding:1px 5px;border-radius:4px;font-size:12px}
 <div id="approvals"></div>
 
 <script>
+// ★ 全局错误必须显示出来，不能让页面"静默空白"。
+//   第一版就栽在这里：一处 JS 语法错误让整个脚本没执行，
+//   页面上五块数据区全空、连一条报错都没有 —— 看起来像"没数据"，
+//   实际是"代码根本没跑"。**空白和出错必须是两种可见的状态。**
+window.onerror = function (msg, src, line) {
+  var d = document.createElement('div');
+  d.className = 'err-box';
+  d.textContent = '页面脚本出错：' + msg + '（第 ' + line + ' 行）—— 数据区因此是空的';
+  document.body.insertBefore(d, document.body.firstChild);
+  return false;
+};
+
 var NEEDS_TOKEN = __NEEDS_TOKEN__;
 var TOKEN = localStorage.getItem('agentdesk_token') || '';
 var timer = null;
@@ -1047,17 +1059,32 @@ async function loadTraces(){
         '<div class="empty">还没有运行记录。先跑一次 /try 或 /agent/ask。</div>';
       return;
     }
-    var h = '';
+    // ★ 用 DOM 构造 + 事件绑定，不用内联 onclick。
+    //   第一版是用字符串拼一个内联 onclick 处理器，里面要嵌单引号 ——
+    //   而这段 JS 是放在 Python 的普通三引号字符串里的，
+    //   反斜杠转义被 Python 先吃掉一层，发出去的属性变成空引号拼接，
+    //   整个 script 直接语法错误、一行都没执行，页面全空。
+    //   两个教训：
+    //     ① 靠转义引号来生成属性，等于把"能不能跑"押在两层转义的配合上 ——
+    //        改用 DOM API + addEventListener，这个问题根本不存在
+    //     ② 在 Python 里写 JS，尽量不产生转义序列；
+    //        本地读代码是对的、发出去的字节是错的，这种错最难查
+    var box = document.getElementById('traces');
+    box.innerHTML = '';
     items.forEach(function(t){
-      h += '<div class="trace" onclick="expand(this,\'' + t.trace_id + '\')">' +
+      var el = document.createElement('div');
+      el.className = 'trace';
+      el.dataset.id = t.trace_id;
+      el.innerHTML =
         '<div><b>' + t.name + '</b> <span class="mut">' + t.trace_id + '</span> ' +
         '<span class="' + (t.status === 'ok' ? 'ok' : 'err') + '">' + t.status +
         '</span></div><div class="mut" style="font-size:12px">' +
         (t.question || '') + ' · ' + (t.elapsed_ms || 0) + 'ms · ' +
         money(t.cost_cny) + ' · ' + (t.span_count || 0) + ' span</div>' +
-        '<div class="spans" style="display:none"></div></div>';
+        '<div class="spans" style="display:none"></div>';
+      el.addEventListener('click', function () { expand(el, el.dataset.id); });
+      box.appendChild(el);
     });
-    document.getElementById('traces').innerHTML = h;
   } catch (err) { fail(err, 'traces'); }
 }
 
