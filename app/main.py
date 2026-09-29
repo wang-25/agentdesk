@@ -59,6 +59,8 @@ AgentDesk 服务入口
 """
 
 import json
+import os
+import time
 from datetime import datetime
 from typing import Optional
 
@@ -186,7 +188,13 @@ INTENT_SYSTEM_PROMPT = """你是一个运维意图解析器。把用户的一句
 - service     涉及的服务名，如 nginx / mysql / docker。用户没提到就填 null
 - host        主机名，如 web-01。用户没提到就填 null
 - risk        危险程度，只能取 low / medium / high。
-              判断依据：只读操作是 low；重启服务是 medium；删除、清理、修改配置是 high
+              判断依据：只读、查原因、问原理是 low；
+              **重启服务、清理资源、任何"动手改系统"的请求都是 high**；
+              认不出来填 medium。
+              ★ 注意：这只是一个**判断意见**，不是最终决定。
+                真正的放行规则在策略层（policy.ACTION_RISK），
+                你判得比它松时以它为准 —— 我只能让你更谨慎，不能让你更冒险。
+                （这个值曾经被当成决定依据，结果"重启服务"被标成 medium 就放行了。）
 - need_confirm 是否需要人工确认，布尔值。risk 为 high 时必须为 true
 - reason      一句话说明你判断的依据
 
@@ -279,6 +287,26 @@ def parse_intent(question: str):
 # ============================================================
 # 不同告警系统推过来的格式不一样。统一成同一种结构，
 # 后面的逻辑就不用关心数据是从哪来的 —— 这叫「归一化」。
+
+# ★ 是否让告警**真的**触发一轮 Agent 诊断。**默认关闭。**
+#
+#   为什么默认关：开启后每条告警都要跑一次完整的模型链路（实测 6–20 秒、
+#   几分钱）。"自动"是有价的 —— 凌晨网络抖一下推 500 条告警，
+#   就是 500 次诊断。所以在能力打开的同时，必须带上下面两道闸：
+#
+#     ① 去重：同名 + 同机的告警，窗口内只处理一次
+#     ② 频控：每小时最多自动诊断 N 次，超了转人工
+#
+#   **这两道闸必须挡在调模型之前**，否则被抑制的那部分告警也在悄悄烧钱，
+#   那才是真正的"告警风暴"。
+ALERT_AUTO_DIAGNOSE = (os.getenv("ALERT_AUTO_DIAGNOSE", "0").strip() == "1")
+ALERT_DEDUP_SECONDS = int(os.getenv("ALERT_DEDUP_SECONDS", "600"))
+ALERT_MAX_PER_HOUR = int(os.getenv("ALERT_MAX_PER_HOUR", "10"))
+
+# 去重与频控的计数（进程内内存态，与限流层同一种取舍：重启即清零）。
+# 单进程部署下准确；多实例需要换成 Redis —— 已知边界，不隐藏。
+_ALERT_LAST_SEEN = {}                      # (alertname, host) -> 上次处理的时间戳
+_ALERT_HOUR = {"hour": "", "count": 0}
 DIAGNOSE_PLAYBOOK = {
     "nginx": ["systemctl status nginx", "tail -100 /var/log/nginx/error.log",
               "df -h", "ss -lntp | grep :80"],
@@ -980,10 +1008,14 @@ def webhook_alert(payload: dict):
 
     「无人值守」是 Agent 服务和通用助手最本质的差别。
 
-    【当前的执行边界】
-    risk 为 low / medium 时生成诊断预案；risk 为 high 时拒绝执行、转人工。
-    命令的真实执行需要沙箱层，在此之前只产出计划不落地。
-    这个边界是刻意的：宁可少做，不可做错。
+    【执行边界（很重要，别被字段名骗了）】
+    1. 风险判定：唯一的判定源在 `policy.ACTION_RISK`；
+       模型自报的 risk **只能抬高、不能降低**（policy.escalate）。
+       凡是"要动手改系统"的告警一律转人工，不管模型说它有多安全。
+    2. 写操作永不自动执行 —— 这是本项目的核心边界，宁可少做，不可做错。
+    3. 默认只产出**处置预案**（一份写死的命令清单），**不是诊断结论**。
+       要让它真的去查机器，需要 `ALERT_AUTO_DIAGNOSE=1`（每条告警会跑一次
+       模型，因此默认关闭，并配了去重 + 频控两道闸）。
     """
     alerts = normalize_alerts(payload)
     reports = []
@@ -996,6 +1028,35 @@ def webhook_alert(payload: dict):
             "severity": alert["severity"],
         }
 
+        # ---- 第 0 步：去重 + 频控，两道闸都挡在"花钱"之前 ----
+        # ★ 顺序是关键：必须在 parse_intent（调模型）**之前**判。
+        #   放在之后的话，被抑制的那部分告警也已经为每个 token 付过钱了 ——
+        #   抑制的意义在于不花钱，不在于不返回。
+        key = (alert["alertname"], alert.get("host"))
+        now = time.time()
+        last = _ALERT_LAST_SEEN.get(key)
+        if last is not None and (now - last) < ALERT_DEDUP_SECONDS:
+            report = {**base, "decision": "suppressed_duplicate",
+                      "reason": (f"{ALERT_DEDUP_SECONDS}s 内已处理过同名同机的告警，"
+                                 f"本次跳过（不重复花钱）")}
+            write_audit("alert.suppressed", report)
+            reports.append(report)
+            continue
+        _ALERT_LAST_SEEN[key] = now
+
+        hour = time.strftime("%Y%m%d%H", time.localtime(now))
+        if _ALERT_HOUR["hour"] != hour:
+            _ALERT_HOUR["hour"] = hour
+            _ALERT_HOUR["count"] = 0
+        if _ALERT_HOUR["count"] >= ALERT_MAX_PER_HOUR:
+            report = {**base, "decision": "rate_limited",
+                      "reason": (f"本小时自动诊断已达上限 {ALERT_MAX_PER_HOUR} 次，"
+                                 f"本次交给人工。调大 ALERT_MAX_PER_HOUR 可放宽")}
+            write_audit("alert.rate_limited", report)
+            reports.append(report)
+            continue
+        _ALERT_HOUR["count"] += 1
+
         # ---- 第一步：理解告警 ----
         try:
             intent, attempts = parse_intent(question)
@@ -1006,47 +1067,83 @@ def webhook_alert(payload: dict):
             reports.append(report)
             continue
 
-        risk = intent.get("risk")
+        action = intent.get("action")
         service = (intent.get("service") or "").lower()
         base["intent"] = intent
         base["parse_attempts"] = attempts
 
-        # ---- 第二步：按风险等级决定做还是停 ----
+        # ---- 第二步：定风险 ----
         #
-        # ★ 这里原先只判断 `risk == "high"`，于是有一个**闸门形同虚设**的漏洞：
-        #   本文件用的 INTENT_SYSTEM_PROMPT 把"重启服务"定义为 medium，
-        #   而闸门只拦 high —— 结果"mysql 服务挂了，需要立即重启"这种请求
-        #   一路走到 auto_diagnose，被标成"只读诊断，已生成处置预案"。
-        #   实测复现：action=restart、risk=medium、decision=auto_diagnose。
+        # ★ 这里曾经是个**闸门形同虚设**的漏洞：原先只用模型自报的 risk，
+        #   而本文件那份提示词把"重启服务"定义成 medium、闸门只拦 high ——
+        #   实测"mysql 挂了需要立即重启"一路走到 auto_diagnose。
         #
-        #   更麻烦的是同一个"重启服务"在本项目里有**三套互相矛盾的风险判定**：
-        #     ① 这个提示词（告警链路用）      → medium
-        #     ② sandbox/policy.py（白名单）   → needs_approval，要人工
-        #     ③ tools/ops.py 的 run_command  → risk=high
-        #   而危害最大的一条路径（无人值守）偏偏用了最松的那一套。
+        #   更根本的问题是，同一个"重启服务"在本项目里有三处各自定义风险：
+        #     ① 这份提示词            → medium
+        #     ② policy.py 的命令规则  → needs_approval（要人工）
+        #     ③ ops.py 的 run_command → high
+        #   现在三者收敛到 policy.py 一处（ACTION_RISK），判定的规则是：
         #
-        #   现在改成**同时看 action 和 risk**：只要意图是"要动手改系统"
-        #   （restart / cleanup），一律转人工，与 risk 数字无关 ——
-        #   因为"写操作必须有人点头"是这个项目的核心边界（见 policy.py），
-        #   不能因为某个字段被模型标成了 medium 就绕过去。
-        #   **安全判断要看"要做什么"，不能只看"模型说有多危险"。**
-        wants_write = intent.get("action") in ("restart", "cleanup")
-        if risk == "high" or wants_write:
+        #     **模型自报的 risk 只能抬高、不能降低**（policy.escalate 取更危险者）。
+        #     它会判错，而它的错会直接把闸门打开；
+        #     反过来，它判得更严时值得尊重 —— 它可能看到了规则表没覆盖的上下文。
+        #     **它可以让我们更谨慎，不能让我们更冒险。**
+        #
+        #   两个值都留在返回里：risk 是实际用于决策的，risk_reported 是模型的原本判断，
+        #   留着对账（哪条告警被抬高了、抬到第几档，审计里要看得到）。
+        from app.sandbox import policy
+        reported = intent.get("risk")
+        risk = policy.escalate(reported, policy.risk_of_action(action))
+        base["risk"] = risk
+        base["risk_reported"] = reported
+
+        if risk == "high":
             report = {**base, "decision": "need_human",
-                      "reason": ("请求包含写操作（action=%s），未执行任何操作，等待人工确认"
-                                 % intent.get("action")) if wants_write
-                                else "风险等级 high，未执行任何操作，等待人工确认",
+                      "reason": (f"请求要动手改系统（action={action}），未执行任何操作，"
+                                 f"等待人工确认"),
                       "playbook": []}
             write_audit("alert.gate_blocked", {
-                "alertname": alert["alertname"], "action": intent.get("action"),
-                "risk": risk, "reason": report["reason"]})
+                "alertname": alert["alertname"], "action": action,
+                "risk": risk, "risk_reported": reported,
+                "reason": report["reason"]})
+        elif ALERT_AUTO_DIAGNOSE:
+            # ---- 第三步 A：真的跑一轮诊断（需显式开启，因为它花钱）----
+            try:
+                from app.agents.supervisor import run as engine_run
+                result = engine_run(question)
+                # 指标字段与 /agent/ask 保持一致（同一套口径，两处复用）——
+                # 这样告警诊断和手动提问在可观测看板上是**可比的一组数**。
+                metrics = {
+                    "rounds": result.get("rounds"),
+                    "tool_calls": result.get("tool_calls"),
+                    "distinct_tools": len(result.get("distinct_tools") or []),
+                    "tokens": (result.get("usage") or {}).get("total_tokens", 0),
+                    "elapsed_ms": result.get("elapsed_ms"),
+                    "stop_reason": result.get("stop_reason"),
+                }
+                report = {**base, "decision": "auto_diagnosed",
+                          "reason": "已自动跑完一轮诊断（只读，未执行任何写操作）",
+                          "answer": result.get("answer"),
+                          "metrics": metrics,
+                          "executed": False}
+                write_audit("alert.diagnosed", {
+                    "alertname": alert["alertname"], "question": question,
+                    **metrics})
+            except Exception as e:
+                report = {**base, "decision": "diagnose_failed",
+                          "reason": f"自动诊断失败：{e}",
+                          "playbook": DIAGNOSE_PLAYBOOK.get(service, DEFAULT_PLAYBOOK)}
         else:
+            # ---- 第三步 B：只出预案（默认）——它**不是**诊断结果 ----
             playbook = DIAGNOSE_PLAYBOOK.get(service, DEFAULT_PLAYBOOK)
-            report = {**base, "decision": "auto_diagnose",
+            report = {**base, "decision": "playbook_only",
                       "reason": "只读诊断，已生成处置预案",
                       "playbook": playbook,
                       "executed": False,
-                      "note": "命令执行需接入沙箱层，尚未落地"}
+                      "note": ("这是一份**写死的命令清单**，不是诊断结论 —— "
+                               "它没查过任何机器。"
+                               "要让它真去查，把 ALERT_AUTO_DIAGNOSE=1 打开"
+                               "（每条告警会跑一次模型，有去重与频控兜底）")}
 
         write_audit("alert.handled", report)
         reports.append(report)

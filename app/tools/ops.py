@@ -43,6 +43,11 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+# ★ 这里在模块级就导入 policy，是为了让 TOOLS 里的 risk 字段**从策略层取值**，
+#   而不是再写一遍字面量（详见下面 TOOLS["run_command"] 的说明）。
+#   policy.py 只依赖标准库，不会和本模块形成循环导入。
+from app.sandbox import policy
+
 # 自己加载 .env —— 不依赖别的模块"恰好先加载过"。
 #
 # ★ 这里踩过一次，值得记下来：
@@ -1026,7 +1031,13 @@ TOOLS = {
     #   一个"平时都很安全"的通道，出事的恰恰是那 1% 的情况。
     "run_command": {
         "func": run_command,
-        "risk": "high",
+        # ★ risk 从 policy 取（= ACTION_RISK 里最高的那档），不再写字面量。
+        #   原因见 app/sandbox/policy.py 的「请求级风险」一节：
+        #   这个项目曾经在三处各自定义"重启服务有多危险"，结论互相矛盾
+        #   （提示词 medium / 白名单 needs_approval / 这里 high），
+        #   而最危险的那条路径用了最松的一份。**一个概念只能有一个定义源。**
+        #   run_command 能干到最危险的事，所以它就声明最高那档。
+        "risk": policy.MAX_ACTION_RISK,
         "desc": ("在沙箱里执行一条白名单命令。写操作（如重启服务、清理日志）"
                  "会先提交人工审批，批准后才执行。"
                  "只读诊断请优先用专用工具（check_disk / tail_log 等），"

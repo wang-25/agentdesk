@@ -76,6 +76,74 @@ CHANNEL_HOST = "host"
 MAX_OUTPUT_BYTES = 16 * 1024
 
 
+# ============================================================
+# 请求级风险：**唯一的定义源**
+# ============================================================
+# ★ 这一节是为了修一个真实的安全漏洞而加的。
+#
+#   原先这个项目有**三处各自定义"重启服务有多危险"**，结论互相矛盾：
+#
+#     app/main.py 的 INTENT_SYSTEM_PROMPT   →  medium（于是闸门放行）
+#     本文件的命令规则（systemctl restart）  →  needs_approval（要人工）
+#     app/tools/ops.py 的 run_command       →  risk=high
+#
+#   而**危害最大的那条路径（无人值守告警）偏偏用了最松的那一份**：
+#   实测"mysql 挂了需要立即重启"被判成 medium → 一路走到 auto_diagnose。
+#
+#   根因不是某处写错了，是"同一个概念允许被定义三次"。
+#   **一个概念只能有一个定义源**，否则迟早有一处会被读错 ——
+#   而且总是被最危险的那条路径读到。
+#
+# ★ 两个层级要分清，它们不是一回事：
+#     · 请求级风险（本节）—— 一句话想干的事有多危险。用于**放不放行的决策**。
+#     · 命令级风险（Decision.risk）—— 一条具体命令是只读还是可逆。用于展示与审计。
+#
+#   决策一律以本表 + decide() 为准；**模型自报的 risk 只能抬高、不能降低**
+#   （见 escalate）。因为它会判错，而它的错会直接把闸门打开。
+ACTION_RISK = {
+    "query":     "low",      # 只看看状态
+    "diagnose":  "low",      # 查原因，只读
+    "explain":   "low",      # 问原理/做法
+    "restart":   "high",     # 会中断服务
+    "cleanup":   "high",     # 会删/清数据
+    "remediate": "high",     # 任何"动手改系统"的请求
+    "other":     "medium",   # 认不出来 → 不确定，不自动执行
+}
+
+RISK_ORDER = {"low": 0, "medium": 1, "high": 2}
+
+# run_command 这类万能工具的声明风险 = 它可能做到的最危险的事
+MAX_ACTION_RISK = max(ACTION_RISK.values(), key=lambda r: RISK_ORDER.get(r, 0))
+
+
+def risk_of_action(action: str) -> str:
+    """由 action 得出请求级风险。认不出来按 other 处理（medium，不自动）。"""
+    return ACTION_RISK.get((action or "").strip().lower(), ACTION_RISK["other"])
+
+
+def escalate(reported: str, floor: str) -> str:
+    """取两者中更危险的那个 —— 这是"安全底线"的标准写法。
+
+    ★ 为什么要这样设计，而不是"以模型为准"或"以代码为准"：
+
+      模型判得**更严**时必须尊重它（它可能看到了代码规则没覆盖的上下文，
+      比如用户说"这是生产库"，那查询也该谨慎对待）；
+
+      模型判得**更松**时不能听它的（它判错一次，闸门就开一次，
+      而这类错误不会被任何测试抓住 —— 它只表现为"什么都没发生"）。
+
+      所以规则是：**模型可以让我更谨慎，不可以让我更冒险。**
+      这与"模型提议、代码决定"是同一条原则的两个面。
+    """
+    a = RISK_ORDER.get((reported or "").strip().lower(), -1)
+    b = RISK_ORDER.get((floor or "").strip().lower(), -1)
+    if a < 0:
+        return floor if b >= 0 else ACTION_RISK["other"]
+    if b < 0:
+        return reported
+    return reported if a >= b else floor
+
+
 class PolicyError(Exception):
     """策略层拒绝。消息是给模型看的 —— 它会据此换一个做法。"""
 
