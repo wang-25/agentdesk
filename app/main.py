@@ -1463,8 +1463,14 @@ def _settings_snapshot() -> dict:
         "ops": {
             "backend": (_ops.BACKEND or "mock").lower(),
             "targets": {k: v for k, v in _ops.SSH_TARGETS.items()},
+            # ★ 序列化成 _parse_ssh_targets 能吃回去的 `名=user@host[:port]`。
+            #   第一版直接 f"{k}={v}"，v 是解析后的 dict —— 回填到表单里
+            #   就是 `web-01={'user': 'root'...}`，用户一点「应用」就 400。
+            #   序列化和解析是同一份数据的两个方向，必须能对账往返。
             "targets_raw": ",".join(
-                f"{k}={v}" for k, v in _ops.SSH_TARGETS.items()),
+                f"{k}={v['user']}@{v['host']}"
+                + (f":{v['port']}" if v.get("port") not in (None, 22) else "")
+                for k, v in _ops.SSH_TARGETS.items()),
             "key": _ops.SSH_KEY,
             "hosts_env": (os.getenv("OPS_HOSTS") or "").strip(),
             "known_hosts": list(_ops.KNOWN_HOSTS),
