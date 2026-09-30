@@ -11,7 +11,7 @@
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Self-check](https://img.shields.io/badge/self--check-9%20layers%20passing-brightgreen.svg)](#自检)
 
-**[▶ 在线试用](https://agent.simosheng.fun/try)　·　[接口文档](https://agent.simosheng.fun/docs)　·　[项目全景](docs/overview.md)**
+**[▶ 部署到你自己的机器](docs/quickstart-own-server.md)　·　[项目全景](docs/overview.md)　·　[评测数据](#实测数据)**
 
 </div>
 
@@ -23,11 +23,10 @@
 差别不是少敲几条命令，而是从「我操作工具」变成「我表达意图」。
 
 > [!NOTE]
-> 在线实例跑在阿里云一台 **2 核 2G** 的 ECS 上，与 WordPress、Zabbix 共 **8 个容器**共存
-> （部署时可用内存仅 359MB、swap=0，见 [部署文档](docs/deployment.md)）。
-> 试用页需要访问令牌；线上实例的工具层跑在 `ssh` 后端 —— 它连的是**这台 ECS 自己**
-> （容器 SSH 回宿主机），所以磁盘/内存/容器查的都是真实数据。
-> 这是一次**明知代价仍然做的取舍**：代价与三层防护见 [部署文档](docs/deployment.md)。
+> **演示实例**曾部署在阿里云一台 **2 核 2G** 的 ECS 上（与 WordPress、Zabbix 共 **8 个容器**共存，
+> 容器 SSH 回宿主机查真实数据；完整部署实录与安全取舍见 [部署文档](docs/deployment.md)），
+> **当前暂停对外开放** —— 要体验，按 [三步 Quickstart](docs/quickstart-own-server.md)
+> 部署到你自己的机器（默认仿真模式 1 分钟跑通，连你自己的服务器再配三行）。
 
 ---
 
@@ -111,7 +110,7 @@ flowchart TB
     K --> R["RAG 混合检索<br/>向量 + BM25 + RRF"]
     D --> T["工具层 · 7 个工具<br/>6 只读 + 1 执行"]
     T --> M["mock 内置假数据（默认）"]
-    T --> SSH["ssh 远程真机<br/>（线上实例用它）"]
+    T --> SSH["ssh 远程真机<br/>（自部署时用它）"]
     T --> L["local 本机真命令"]
 
     D -->|写操作| H["审批单 HITL<br/>指纹防重放"]
@@ -170,11 +169,10 @@ DEEPSEEK_API_KEY=sk-你的key
 | **`local`** | 在本机真执行 `df -hP` / `systemctl` / `docker ps -a` / `tail`（全部只读） | Linux 上查看**本机**真实状态 |
 | **`ssh`** | 通过 SSH 到真实远程主机，执行同一批只读命令 | 查看**远程**真机 |
 
-> **线上演示实例当前用的是 `ssh`**（它 SSH 回自己所在的宿主机），
-> 所以 `/try` 页面顶部会显示「数据来自实时查询（后端 ssh）」而不是仿真警示。
-> 这是一次**明知代价仍然做的取舍**，不是默认行为 ——
-> 完整说明（含三层防护与回退方式）见 [部署文档](docs/deployment.md)。
-> 默认值仍是 `mock`：别人 clone 下来不配任何东西就能跑通整条链路。
+> **演示实例曾用 `ssh`**（容器 SSH 回自己所在的宿主机查真实数据），
+> 属于**明知代价仍然做的取舍**，不是默认行为 —— 完整说明见 [部署文档](docs/deployment.md)。
+> 默认值仍是 `mock`：别人 clone 下来不配任何东西就能跑通整条链路；
+> 要连自己的服务器，见 [三步 Quickstart](docs/quickstart-own-server.md)。
 
 ```env
 OPS_BACKEND=ssh
@@ -252,7 +250,7 @@ Agent 只知道 `web-01` 这样的**逻辑名**，它不知道、也不该知道
 
 ## 接口
 
-25 个路由（22 个进 OpenAPI 文档），按功能分组（完整定义见 [在线文档](https://agent.simosheng.fun/docs)）：
+25 个路由（22 个进 OpenAPI 文档），按功能分组（本地起服务后打开 <http://127.0.0.1:8000/docs> 即可）：
 
 <details>
 <summary><b>Agent 与检索</b></summary>
@@ -315,7 +313,7 @@ Agent 只知道 `web-01` 这样的**逻辑名**，它不知道、也不该知道
 curl -H "X-API-Key: <你的令牌>" \
      -H "Content-Type: application/json" \
      -d '{"question":"web-01 磁盘快满了怎么处理"}' \
-     https://agent.simosheng.fun/rag/ask
+     http://127.0.0.1:8000/rag/ask
 ```
 
 ---
