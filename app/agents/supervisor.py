@@ -493,14 +493,30 @@ def run(question: str, max_retries: int = 1, verbose: bool = False,
     final = graph.invoke(
         init, config={"recursion_limit": 4 * (max_retries + 1) * 3 + 12})
 
-    log = final.get("node_log") or []
     if verbose:
+        log = final.get("node_log") or []
         print(f"\n──── 多 Agent 执行轨迹（{len(log)} 步）────")
         for item in log:
             mark = "✓" if item["ok"] else "✗"
             print(f"  {mark} {item['node']:12s} {item['elapsed_ms']:>5d}ms  "
                   f"{item['summary']}")
 
+    diagnosis = final.get("diagnosis") or {}
+    verdict = final.get("verdict") or {}
+    remediation = final.get("remediation") or {}
+    usage = final.get("usage") or new_usage()
+
+    return _build_result(final, question, started)
+
+
+def _build_result(final: dict, question: str, started: float) -> dict:
+    """从图的终态构造返回结构 —— run() 与 run_stream() 共用。
+
+    ★ 单独抽出来只有一个理由：流式版的最后一个事件必须与一次性版
+      逐字段一致。同一个问题从两个入口进来给出不同结构，
+      那是比少一个功能严重得多的对账问题。
+    """
+    log = final.get("node_log") or []
     diagnosis = final.get("diagnosis") or {}
     verdict = final.get("verdict") or {}
     remediation = final.get("remediation") or {}
@@ -542,6 +558,65 @@ def run(question: str, max_retries: int = 1, verbose: bool = False,
     }
 
 
+
+
+def run_stream(question: str, max_retries: int = 1, config: dict = None):
+    """run() 的生成器版：每完成一个节点产出一个事件，最后一个事件是完整结果。
+
+    事件两种：
+      {"type": "node",   "node": "intent", "elapsed_ms": 812}
+      {"type": "result", ...与 run() 返回逐字段一致...}
+
+    ★ 实现要点：stream_mode 用 "values" 而不是 "updates" ——
+      本 state 的 visited / node_log / usage 都带 reducer，updates 给的是
+      增量，自己合并等于复刻框架的合并语义（第一版实测 usage 被覆盖成 0）。
+      values 模式每步给全量 state，最后一块天然与 invoke 终态一致；
+      节点事件从 visited 的增长推出。细节见函数体内的注释。
+    """
+    config = config or {}
+    started = time.time()
+    graph = build_graph(max_retries, config)
+
+    init = {
+        "question": question,
+        "intent": {}, "knowledge": {}, "diagnosis": {}, "verdict": {},
+        "remediation": {},
+        "next_step": "", "supervisor_reason": "",
+        "visited": [], "retries": 0, "node_log": [],
+        "usage": new_usage(), "answer": "",
+        "stop_reason": "answered",
+    }
+
+    # ★ 用 values 模式而不是 updates：
+    #   本 state 的 visited / node_log / usage 都带 reducer（operator.add /
+    #   _merge_usage），updates 模式给的是「增量」，自己合并就得把 reducer
+    #   语义重新实现一遍 —— 实测我第一版用 dict.update，usage 被最后一次
+    #   增量覆盖成 0，与 invoke 的结果对不上。**与其复刻框架的合并语义，
+    #   不如让它自己给完整状态**：values 模式每步产出全量 state，
+    #   最后一块天然与 invoke 的终态逐字段一致（下方有对账测试）。
+    #   节点事件从 visited 的增长推出 —— 每个节点跑完都会把自己名字加进去。
+    final: dict = {}
+    prev_visited = 0
+    step_started = time.time()
+    for chunk in graph.stream(
+            init,
+            config={"recursion_limit": 4 * (max_retries + 1) * 3 + 12},
+            stream_mode="values"):
+        final = chunk
+        visited = chunk.get("visited") or []
+        if len(visited) > prev_visited:
+            now = time.time()
+            nlog = chunk.get("node_log") or []
+            last = nlog[-1] if nlog else {}
+            summary = last.get("summary", "") if last.get("node") == visited[-1] else ""
+            yield {"type": "node", "node": visited[-1],
+                   "elapsed_ms": int((now - step_started) * 1000),
+                   "summary": summary}
+            step_started = now
+        prev_visited = len(visited)
+
+    if final:
+        yield {"type": "result", **_build_result(final, question, started)}
 def _main(argv=None):
     import argparse
     import sys

@@ -7,7 +7,7 @@ AgentDesk 服务入口
 【运行方式】在 agentdesk 目录下执行：
     .venv\\Scripts\\python.exe -m uvicorn app.main:app --reload --port 8000
 
-【接口一览】共 25 个业务路由，其中 22 个进 OpenAPI 文档。
+【接口一览】共 26 个业务路由，其中 23 个进 OpenAPI 文档。
   为什么是 24 而不是 22：`GET /`（导航页）和 `GET /try`（在线试用页）是给人看的
   页面，标了 `include_in_schema=False`，不进 OpenAPI 的路径表 ——
   它们真实存在、能访问，只是不该混进接口清单里干扰视线。
@@ -55,6 +55,7 @@ AgentDesk 服务入口
     GET  /                          导航页：这是什么、从哪开始试
     GET  /try                       在线试用页：填问题、点按钮
     GET  /dashboard               可观测看板：成本归因 / 对账 / 逐步轨迹 / 待审批
+    POST /agent/ask/stream        Agent 诊断的 SSE 流式版（实时编排过程）
 
 服务起来后打开 http://127.0.0.1:8000/docs 有自动生成的交互式文档。
 """
@@ -381,6 +382,140 @@ def alert_to_question(alert: dict) -> str:
 # ============================================================
 # 接口 0：首页
 # ============================================================
+# ============================================================
+# 三页共享的视觉基建：设计变量（亮/暗）+ 流式/时间线/图表组件样式。
+# 经 __BASE_CSS__ 占位注入各页 <style> 的**末尾** —— 级联上后到者胜，
+# 暗色覆盖才能压过页面原有的亮色硬编码。
+# ============================================================
+_BASE_CSS = """
+:root {
+  --bg: #f6f8fa; --surface: #ffffff; --text: #1f2328; --muted: #59636e;
+  --border: #e6e8eb; --accent: #0969da; --ok: #1f883d; --err: #cf222e;
+  --warn: #d4a017; --track: #eef0f2;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0d1117; --surface: #161b22; --text: #e6edf3; --muted: #8b949e;
+    --border: #30363d; --accent: #58a6ff; --ok: #3fb950; --err: #f85149;
+    --warn: #d29922; --track: #21262d;
+  }
+}
+
+/* ---- 流式步骤 ---- */
+.steps { display: flex; flex-direction: column; gap: 6px; }
+.step { display: flex; align-items: baseline; gap: 8px; font-size: 13.5px;
+        padding: 6px 2px; border-bottom: 1px dashed var(--border); }
+.step:last-child { border-bottom: 0; }
+.step .dot { width: 8px; height: 8px; border-radius: 50%;
+             background: var(--accent); flex: 0 0 auto;
+             align-self: center; }
+.step.done .dot { background: var(--ok); }
+.step .ms { color: var(--muted); font-size: 12px; margin-left: auto; }
+.step .sum { color: var(--muted); font-size: 12.5px; }
+
+/* ---- 执行轨迹时间线 ---- */
+.tl { display: flex; flex-direction: column; gap: 7px; margin-top: 8px; }
+.tl-row { display: flex; align-items: center; gap: 8px; font-size: 12.5px; }
+.tl-name { width: 92px; flex: 0 0 auto; color: var(--muted);
+           text-align: right; }
+.tl-track { flex: 1 1 auto; height: 10px; border-radius: 5px;
+            background: var(--track); overflow: hidden; }
+.tl-fill { height: 100%; border-radius: 5px; background: var(--accent); }
+.tl-fill.bad { background: var(--err); }
+.tl-ms { width: 64px; flex: 0 0 auto; color: var(--muted);
+         font-variant-numeric: tabular-nums; }
+
+/* ---- 横向条形图（手写 SVG 外的行内条）---- */
+.hbar { display: flex; align-items: center; gap: 8px;
+        font-size: 12.5px; margin: 6px 0; }
+.hbar .label { width: 110px; flex: 0 0 auto; color: var(--muted);
+               text-align: right; }
+.hbar .track { flex: 1 1 auto; height: 12px; border-radius: 6px;
+               background: var(--track); overflow: hidden; }
+.hbar .fill { height: 100%; background: var(--accent); border-radius: 6px; }
+.hbar .val { width: 76px; flex: 0 0 auto; color: var(--text);
+             font-variant-numeric: tabular-nums; }
+
+/* ---- 暗色模式：覆盖三页已有的亮色硬编码 ---- */
+@media (prefers-color-scheme: dark) {
+  body { background: var(--bg); color: var(--text); }
+  h1, h2, h3, b { color: var(--text); }
+  .sub, .hint, .mut, .k { color: var(--muted); }
+  .card { background: var(--surface); border-color: var(--border); }
+  .note { background: #241d08; border-left-color: var(--warn); color: var(--warn); }
+  .note b { color: var(--warn); }
+  .err, .err-box { background: #2d1214; border-left-color: var(--err); color: #ff8182; }
+  .ok { background: #12261e; border-left-color: var(--ok); color: #5bd49a; }
+  input, select, textarea { background: var(--bg); border-color: var(--border);
+                            color: var(--text); }
+  button { background: #238636; }
+  button:hover { background: #2ea043; }
+  .ghost { background: #21262d; color: var(--text); border-color: var(--border); }
+  table th { background: var(--surface); color: var(--muted);
+             border-color: var(--border); }
+  table td { border-color: #21262d; }
+  pre { background: var(--surface); border-color: var(--border); color: var(--text); }
+  code { background: #21262d; color: var(--text); }
+  .meta { color: var(--muted); } .meta b { color: var(--text); }
+  .trace { background: var(--surface); border-color: var(--border); }
+  .err-box { background: #2d1214; }
+}
+"""
+
+# ============================================================
+# 两页共享的前端工具：节点中文名 / 时间线 / 条形图。纯原生 JS，
+# 经 __BASE_JS__ 占位注入 /try 与 /dashboard 的 <script>。
+# ============================================================
+_BASE_JS = """
+var NL = String.fromCharCode(10);
+var NODE_LABEL = { supervisor: "调度决策", intent: "意图路由",
+  knowledge: "知识检索", diagnose: "工具执行", reason: "纯推理分析",
+  verify: "结果校验", remediate: "处置建议", finalize: "汇总输出" };
+
+function timelineHTML(items) {
+  /* 执行时间线：条宽按耗时占比。items: [{node|name, elapsed_ms, ok, summary?}] */
+  items = items || [];
+  var total = 0;
+  items.forEach(function (it) { total += (it.elapsed_ms || 0); });
+  if (!total) return '<p class="hint">（无计时数据）</p>';
+  var rows = "";
+  items.forEach(function (it) {
+    var ms = it.elapsed_ms || 0;
+    var pct = Math.max(1, Math.round(ms * 100 / total));
+    var nm = it.node || it.name || "?";
+    rows += '<div class="tl-row">' +
+      '<span class="tl-name">' + (NODE_LABEL[nm] || nm) + '</span>' +
+      '<span class="tl-track"><span class="tl-fill' +
+      (it.ok === false ? ' bad' : '') + '" style="width:' + pct +
+      '%"></span></span>' +
+      '<span class="tl-ms">' + ms + 'ms</span></div>';
+  });
+  return '<div class="tl">' + rows +
+    '<div class="hint">总耗时 ' + (total / 1000).toFixed(1) +
+    's · 条宽按各步耗时占比</div></div>';
+}
+
+function hbars(m) {
+  /* 横向条形图：{名字: {cost_cny, ...}} 按成本降序。纯 DOM/CSS，不引图表库 */
+  var keys = Object.keys(m || {}).sort(function (a, b) {
+    return ((m[b] || {}).cost_cny || 0) - ((m[a] || {}).cost_cny || 0); });
+  var max = 0;
+  keys.forEach(function (k) { max = Math.max(max, (m[k] || {}).cost_cny || 0); });
+  if (!max) return '<p class="hint">（暂无数据）</p>';
+  var h = "";
+  keys.forEach(function (k) {
+    var v = (m[k] || {}).cost_cny || 0;
+    var pct = Math.max(1, Math.round(v * 100 / max));
+    h += '<div class="hbar"><span class="label">' + esc(k) + '</span>' +
+      '<span class="track"><span class="fill" style="width:' + pct +
+      '%"></span></span>' +
+      '<span class="val">' + money(v) + '</span></div>';
+  });
+  return h;
+}
+"""
+
+
 @app.get("/", response_class=HTMLResponse, include_in_schema=False)
 def index(response: Response):
     """根路径给一张「这是什么 + 怎么试」的导航页。
@@ -443,7 +578,7 @@ def index(response: Response):
     links = [
         ("/try", "★ 在线试用", "填问题、点按钮，看它自己决定查什么。不用懂 API，从这里开始"),
         ("/dashboard", "★ 可观测看板", "成本归因、对账偏差、逐步轨迹、待审批 —— 不用敲命令就能看"),
-        ("/docs", "22 个接口的调试台", docs_hint),
+        ("/docs", "23 个接口的调试台", docs_hint),
         ("/metrics/summary", "成本看板（JSON）", "按 Agent / 动作两维看成本、缓存命中率、P95 延迟"),
         ("/traces", "链路追踪", "每次运行发生了什么、哪一步最慢最贵"),
         ("/agent/tools", "工具清单", "Agent 能调用的 7 个工具，含风险等级"),
@@ -482,6 +617,7 @@ def index(response: Response):
        border-radius:0 6px 6px 0;font-size:14px;margin:16px 0}}
  .k{{display:inline-block;background:#eef4ff;color:#0550ae;border-radius:4px;
     padding:1px 7px;font-size:12px;margin-right:6px}}
+__BASE_CSS__
 </style></head><body>
 
 <h1>AgentDesk</h1>
@@ -514,8 +650,7 @@ def index(response: Response):
 等人批准；沙箱不可用时宁可拒绝执行，也不降级。</div>
 
 <p style="margin-top:32px;color:#8b949e;font-size:13px">
-这个实例跑在阿里云一台 2 核 2G 的机器上，与 WordPress、Zabbix 共 8 个容器共存，
-经 Nginx Proxy Manager 提供 HTTPS。<br>
+演示实例曾部署在阿里云一台 2 核 2G 的机器上（完整部署实录见 docs/deployment.md），<b>当前暂停对外开放</b> —— 按 docs/quickstart-own-server.md 可部署到你自己的机器。
 {acl_block}
 部署过程与安全设计见仓库的 <code>docs/deployment.md</code>。</p>
 </body></html>"""
@@ -523,6 +658,8 @@ def index(response: Response):
     # HTML 一律不缓存 —— 和 /try 页同一个理由（服务端渲染、内容随配置变）。
     response.headers["Cache-Control"] = "no-store, must-revalidate"
     response.headers["Pragma"] = "no-cache"
+    # f-string 先求值（占位符不含花括号），再注入共享样式
+    page = page.replace('__BASE_CSS__', _BASE_CSS)
     return page
 
 
@@ -597,6 +734,7 @@ def try_page(response: Response):
  .meta{display:flex;gap:18px;flex-wrap:wrap;font-size:13px;color:#59636e;
       padding:11px 0 3px}
  .meta b{color:#1f2328;font-weight:600}
+__BASE_CSS__
 </style></head><body>
 
 <h1>AgentDesk 在线试用</h1>
@@ -670,6 +808,7 @@ $('forget').onclick = function () {
 //           ③ 探测是异步的 —— 手快在它返回前点「开始」，NEEDS_TOKEN 还是初值 true。
 //   第三版（当前）：服务端**本来就知道**答案，直接写进页面，前端只读不算。
 //           把决定权放在知道答案的那一侧，就不会有这三类问题。
+__BASE_JS__
 var NEEDS_TOKEN = __NEEDS_TOKEN__;
 
 function esc(s) {
@@ -729,6 +868,21 @@ $('go').onclick = async function () {
   // 没有令牌就不带这个头 —— 服务端没开鉴权时，多带一个空令牌只会让人困惑
   var headers = { 'Content-Type': 'application/json' };
   if (token) { headers['X-API-Key'] = token; }
+  // supervisor 引擎走流式 —— 编排过程本身就是演示的主菜，
+  // 让访问者看着「意图路由 → 知识检索 → 正在查磁盘」一步步亮起来，
+  // 而不是对着空白页干等 20 秒。其他引擎保持一次性请求。
+  if (mode === 'supervisor') {
+    try {
+      await askStream(question, headers);
+    } catch (e) {
+      $('out').innerHTML = '<div class="err"><b>流式请求失败：</b>' +
+        esc(e.message) + '</div>';
+    } finally {
+      clearInterval(timer);
+      $('go').disabled = false;
+    }
+    return;
+  }
 
   try {
     var r = await fetch(path, {
@@ -769,6 +923,82 @@ $('go').onclick = async function () {
     $('go').disabled = false;
   }
 };
+
+async function askStream(question, headers) {
+  /* 消费 /agent/ask/stream 的 SSE：step 事件实时点亮，
+     result 事件与一次性接口同一结构（同一个 _agent_payload），
+     所以渲染直接复用 render()。 */
+  $('out').innerHTML = '<div class="card"><h2 style="margin-top:0">执行过程</h2>' +
+    '<div class="steps" id="steps"></div></div><div id="final"></div>';
+  var stepBox = document.getElementById('steps');
+  var gotResult = false;
+
+  var r = await fetch('/agent/ask/stream', {
+    method: 'POST', headers: headers,
+    body: JSON.stringify({ question: question, engine: 'supervisor' })
+  });
+  if (r.status === 401) {
+    $('out').innerHTML = '<div class="err"><b>令牌不对（HTTP 401）。</b>' +
+      '请检查它是否和服务器 <code>.env</code> 里的 <code>AGENT_TOKEN</code> 完全一致。</div>';
+    return;
+  }
+  if (r.status === 429) {
+    $('out').innerHTML = '<div class="err"><b>触发限流（HTTP 429）。</b>等一下再试。</div>';
+    return;
+  }
+  if (!r.ok || !r.body) {
+    throw new Error('流式接口不可用（HTTP ' + r.status + '）');
+  }
+
+  var reader = r.body.getReader();
+  var dec = new TextDecoder();
+  var buf = '';
+  var lastStep = null;
+  while (true) {
+    var c = await reader.read();
+    if (c.done) break;
+    buf += dec.decode(c.value, { stream: true });
+    var i;
+    while ((i = buf.indexOf(NL + NL)) >= 0) {
+      var frame = buf.slice(0, i);
+      buf = buf.slice(i + 2);
+      var evName = '';
+      var dataRaw = '';
+      frame.split(NL).forEach(function (ln) {
+        if (ln.indexOf('event: ') === 0) { evName = ln.slice(7); }
+        else if (ln.indexOf('data: ') === 0) { dataRaw = ln.slice(6); }
+      });
+      if (!dataRaw) { continue; }
+      var d = JSON.parse(dataRaw);
+      if (evName === 'step') {
+        if (lastStep) { lastStep.className = 'step done'; }
+        var row = document.createElement('div');
+        row.className = 'step';
+        row.innerHTML = '<span class="dot"></span><b>' +
+          (NODE_LABEL[d.node] || d.node) + '</b>' +
+          (d.summary ? '<span class="sum">' + esc(d.summary) + '</span>' : '') +
+          '<span class="ms">' + d.elapsed_ms + 'ms</span>';
+        stepBox.appendChild(row);
+        lastStep = row;
+      } else if (evName === 'result') {
+        if (lastStep) { lastStep.className = 'step done'; }
+        gotResult = true;
+        document.getElementById('final').innerHTML =
+          '<h2>结果</h2>' + render(d, 'supervisor') +
+          '<h2>执行时间线</h2><div class="card">' +
+          timelineHTML(d.node_log) + '</div>';
+      } else if (evName === 'error') {
+        gotResult = true;
+        document.getElementById('final').innerHTML =
+          '<div class="err"><b>诊断中断：</b>' + esc(d.error || '未知错误') + '</div>';
+      }
+    }
+  }
+  // 流结束但没等到 result —— 被截断了。不能静默：空白和出错是两种状态
+  if (!gotResult) {
+    throw new Error('流在结果到达前结束（服务端可能中断）');
+  }
+}
 
 function render(d, mode) {
   var html = '';
@@ -880,6 +1110,8 @@ function render(d, mode) {
         html.replace("__AUTH_NOTE__", auth_note)
         .replace("__DATA_SOURCE_NOTE__", data_source_note)
         .replace("__TOKCARD_STYLE__", tokcard_style)
+        .replace("__BASE_JS__", _BASE_JS)
+        .replace("__BASE_CSS__", _BASE_CSS)
         .replace("__NEEDS_TOKEN__", "true" if needs_token else "false")
     )
 
@@ -953,6 +1185,7 @@ td.n{text-align:right;font-variant-numeric:tabular-nums}
      padding-top:7px}
 .empty{color:#59636e;font-size:13px;padding:10px 0}
 code{background:#f6f8fa;padding:1px 5px;border-radius:4px;font-size:12px}
+__BASE_CSS__
 </style></head><body>
 
 <h1>AgentDesk · 可观测看板</h1>
@@ -1000,6 +1233,7 @@ window.onerror = function (msg, src, line) {
   return false;
 };
 
+__BASE_JS__
 var NEEDS_TOKEN = __NEEDS_TOKEN__;
 var TOKEN = localStorage.getItem('agentdesk_token') || '';
 var timer = null;
@@ -1078,6 +1312,9 @@ async function loadSummary(){
     document.getElementById('breakdown').innerHTML =
       tbl(d.by_span_name || {}, '按 Agent（钱花在谁身上）', '节点') +
       tbl(d.by_span_type || {}, '按动作（钱花在什么事上）', '类型');
+    document.getElementById('breakdown').innerHTML +=
+      '<h2>成本分布</h2><div class="card">' + hbars(d.by_span_name || {}) +
+      '</div>';
 
     var rc = d.reconcile || {};
     function gc(g){ return Math.abs(g) <= 0.01 ? 'ok' : 'warn'; }
@@ -1146,14 +1383,12 @@ async function expand(el, id){
   if (box.style.display !== 'none') { box.style.display = 'none'; return; }
   box.innerHTML = '加载中…'; box.style.display = 'block';
   try {
-    var rows = '';
-    ((await getJson('/traces/' + id)).spans || []).forEach(function(s){
-      rows += '<div>' + s.type + ' · <b>' + s.name + '</b> · ' +
-        (s.elapsed_ms || 0) + 'ms · ' +
-        '<span class="' + (s.status === 'ok' ? 'ok' : 'err') + '">' + s.status +
-        '</span>' + (s.error ? ' · ' + s.error : '') + '</div>';
-    });
-    box.innerHTML = rows || '（这条 trace 没有 span）';
+      var items = [];
+      ((await getJson('/traces/' + id)).spans || []).forEach(function (s) {
+        items.push({ name: s.name, elapsed_ms: s.elapsed_ms || 0,
+                     ok: s.status === 'ok' });
+      });
+      box.innerHTML = timelineHTML(items) || '（这条 trace 没有 span）';
   } catch (err) { box.innerHTML = '加载失败：' + err.message; }
 }
 
@@ -1190,6 +1425,8 @@ loadAll();
 
     # ★ "要不要令牌"由服务端决定，前端只读取 —— 与 /try 同一条规矩。
     needs_token = "true" if security.AUTH_ENABLED else "false"
+    html = html.replace("__BASE_JS__", _BASE_JS)
+    html = html.replace("__BASE_CSS__", _BASE_CSS)
     html = html.replace("__NEEDS_TOKEN__", needs_token)
 
     # 看板显示的是"现在"，没有任何缓存的理由
@@ -1696,12 +1933,24 @@ def agent_ask(req: AgentRequest):
         # 模型层故障 → 502（上游问题，可重试）
         raise HTTPException(status_code=502, detail=str(e))
 
+    return _agent_payload(result, started_ts, req.engine, req.include_trace)
+
+
+def _agent_payload(result: dict, started_ts: str, engine: str,
+                   include_trace: bool = True) -> dict:
+    """审计留痕 + 响应组装 —— 一次性接口与流式接口共用。
+
+    ★ 与 supervisor._build_result 同一个理由：流式版的 result 事件
+      必须与 /agent/ask 的 JSON 逐字段一致 —— 同一个问题两个入口
+      给出不同结构，是新的对账问题。（那里保证引擎层一致，
+      这里保证 HTTP 层一致。）
+    """
     # 审计留痕：Agent 自己做了决定这件事，必须可追溯。
     # 记的是"它查了什么"，而不是"它答了什么" —— 后者可以从日志里再取，
     # 前者才是排查"它为什么这么判断"的关键。
     write_audit("agent.ask", {
-        "question": req.question,
-        "engine": req.engine,
+        "question": result["question"],
+        "engine": engine,
         "rounds": result["rounds"],
         "tool_calls": result["tool_calls"],
         "tools": result["distinct_tools"],
@@ -1727,7 +1976,7 @@ def agent_ask(req: AgentRequest):
     }
     # 多 Agent 编排特有的产出：意图标签、校验结论、执行路径、Supervisor 决策。
     # 这些是"单 Agent 模式拿不到的信息" —— 也是拆分之后才能讲出来的东西。
-    if req.engine == "supervisor":
+    if engine == "supervisor":
         payload["orchestration"] = {
             "intent": result.get("intent"),
             "intent_status": result.get("intent_status"),
@@ -1750,7 +1999,7 @@ def agent_ask(req: AgentRequest):
             "agents": 5,
         }
 
-    if req.include_trace:
+    if include_trace:
         # ★ 去掉 observation_text —— 那是给内部校验用的完整工具返回，
         #   对外只需要预览。**数据在源头保留完整，由出口决定裁剪**（见 common.py）。
         payload["trace"] = [
@@ -1788,6 +2037,75 @@ class ApprovalAction(BaseModel):
                     description="审批人标识（姓名 / 工号 / 邮箱均可）。"
                                 "**必填**，它是审计里最关键的一个字段")
     note: str = Field("", max_length=300, description="备注")
+
+
+# ============================================================
+# 接口：流式版 Agent 诊断（SSE）
+# ============================================================
+@app.post("/agent/ask/stream")
+def agent_ask_stream(req: AgentRequest):
+    """/agent/ask 的流式版（SSE，仅 supervisor 引擎）。
+
+    【为什么要有它 —— 这是被演示体验逼出来的】
+    supervisor 跑一轮要 5-20 秒。一次性接口下，/try 页面点「开始」后
+    用户对着空白页干等 —— 而**最值得看的部分（Agent 自己决定查什么、
+    一共跑了几步）恰好发生在这段等待里**。SSE 把每个节点完成的事件
+    实时推给前端，「多 Agent 编排」从结果里的文字变成看得见的过程。
+
+    【为什么只支持 supervisor】
+    流式要展示的是「编排过程」；handwritten / langgraph 是单 Agent，
+    没有可展示的节点序列。传其他引擎直接 400，宁可报错不要静默降级。
+
+    【鉴权与降级】
+    走统一安全中间件（与其他接口同规则，令牌必填）；
+    SSE 中途出错以 error 事件收尾（HTTP 200 已发出，错误必须在事件里）。
+    """
+    if req.engine != "supervisor":
+        raise HTTPException(
+            status_code=400,
+            detail="流式接口仅支持 supervisor 引擎 —— 要展示的正是编排过程本身")
+
+    def gen():
+        started_ts = datetime.now().isoformat(timespec="seconds")
+        yield _sse_event("start", {"question": req.question})
+        try:
+            from app.agents.supervisor import run_stream
+            for ev in run_stream(req.question, max_retries=req.max_retries):
+                if ev.get("type") == "result":
+                    # ★ result 事件 = 与 POST /agent/ask 完全相同的 JSON 结构
+                    #   （同一个 _agent_payload 组装）—— 前端两种模式可以
+                    #   用同一套渲染代码，不存在"流式的结果少几个字段"。
+                    ev.pop("type", None)
+                    yield _sse_event("result", _agent_payload(
+                        ev, started_ts, "supervisor", req.include_trace))
+                else:
+                    yield _sse_event("step", ev)
+        except Exception as e:                      # noqa: BLE001
+            # SSE 头已发出，HTTP 状态码救不了 —— 错误必须作为事件送达
+            yield _sse_event("error", {"error": str(e)[:300]})
+        except Exception as e:                      # noqa: BLE001
+            # SSE 头已发出，HTTP 状态码救不了 —— 错误必须作为事件送达
+            yield _sse_event("error", {"error": str(e)[:300]})
+
+    return StreamingResponse(
+        gen(), media_type="text/event-stream",
+        headers={"Cache-Control": "no-store",
+                 "X-Accel-Buffering": "no"},   # 防 Nginx 缓冲把流变成一次性到达
+    )
+
+
+def _sse_event(event: str, data: dict) -> str:
+    """一条 SSE 帧。
+
+    ★ 换行写成 chr(10) 而不是反斜杠字面量 —— 本文件的改动经常由脚本完成，
+      反斜杠转义在 JSON/shell/Python 三层传递里最容易被吃掉一层
+      （本项目实测两次：一次 onclick 引号、一次就是这一行）。
+      用 chr(10) 之后，这个函数不再含有任何转义序列，脚本怎么传都不会坏。
+    """
+    nl = chr(10)
+    return (f"event: {event}{nl}"
+            f"data: {json.dumps(data, ensure_ascii=False)}{nl}{nl}")
+
 
 
 @app.get("/sandbox")
