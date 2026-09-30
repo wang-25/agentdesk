@@ -1566,8 +1566,17 @@ def settings_ops(req: SettingsOpsRequest):
         "OPS_SSH_KEY": _ops.SSH_KEY,
         **({"OPS_HOSTS": hosts_env} if hosts_env else {"OPS_HOSTS": ""}),
     })
-    return {"ok": True, "backend": backend,
+    resp = {"ok": True, "backend": backend,
             "known_hosts": list(_ops.KNOWN_HOSTS), "persist": persisted}
+    # ★ 实测踩过的坑（2026-09-30）：key 留空保存后，ssh 每次查询都
+    #   Permission denied，而 responses 里只有 ok=true —— 用户要到
+    #   前端查不出数据才回头找原因。不阻止（有人的 ssh 靠默认路径/
+    #   agent 转发就能通），但必须把后果说明白。
+    if backend == "ssh" and not _ops.SSH_KEY:
+        resp["warning"] = ("未配置私钥：ssh 将退回 ssh 客户端的默认密钥搜索路径，"
+                           "大概率每次查询都 Permission denied。"
+                           "如果连不上，回到本页把私钥路径填上。")
+    return resp
 
 
 _SETTINGS_HTML = """<!DOCTYPE html>
@@ -1773,7 +1782,9 @@ $('applyops').onclick = async function () {
   if (!r.ok) { msg('err', '<b>应用失败：</b>' + esc(data && data.detail || ('HTTP ' + r.status))); return; }
   msg('ok', '<b>数据源已切换为 <code>' + esc(data.backend) +
     '</code> 并即时生效。</b>' + esc(data.persist) +
-    '。到 <a href="/try">/try</a> 问一句机器状态即可验证。');
+    '。到 <a href="/try">/try</a> 问一句机器状态即可验证。' +
+    (data.warning ? '<div class="warn" style="margin-top:8px"><b>' +
+      esc(data.warning) + '</b></div>' : ''));
   load();
 };
 
