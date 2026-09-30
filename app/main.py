@@ -7,7 +7,7 @@ AgentDesk 服务入口
 【运行方式】在 agentdesk 目录下执行：
     .venv\\Scripts\\python.exe -m uvicorn app.main:app --reload --port 8000
 
-【接口一览】共 27 个业务路由，其中 23 个进 OpenAPI 文档。
+【接口一览】共 31 个业务路由，其中 26 个进 OpenAPI 文档。
   为什么是 24 而不是 22：`GET /`（导航页）和 `GET /try`（在线试用页）是给人看的
   页面，标了 `include_in_schema=False`，不进 OpenAPI 的路径表 ——
   它们真实存在、能访问，只是不该混进接口清单里干扰视线。
@@ -58,6 +58,11 @@ AgentDesk 服务入口
     GET  /view/{name}              7 个 JSON 接口的可视化皮：metrics/traces/
                                     tools/sandbox/approvals/audit/health，
                                     每张表可导出 CSV、整页可导出 JSON
+    GET  /settings                 系统设置页：令牌查看/修改、数据源切换
+  系统设置（/settings 页的数据接口；开鉴权时须持当前令牌）
+    GET  /settings/api             当前令牌（明文，见安全模型注释）与数据源
+    POST /settings/token           修改令牌：运行时生效 + 写回 .env
+    POST /settings/ops             切换 mock/local/ssh 与 SSH 目标/私钥/清单
     POST /agent/ask/stream        Agent 诊断的 SSE 流式版（实时编排过程）
 
 服务起来后打开 http://127.0.0.1:8000/docs 有自动生成的交互式文档。
@@ -552,7 +557,7 @@ def index(response: Response):
     links = [
         ("/try", "★ 在线试用", "填问题、点按钮，看它自己决定查什么。不用懂 API，从这里开始"),
         ("/dashboard", "★ 可观测看板", "成本归因、对账偏差、逐步轨迹、待审批 —— 不用敲命令就能看"),
-        ("/docs", "23 个接口的调试台", docs_hint),
+        ("/docs", "26 个接口的调试台", docs_hint),
         ("/view/metrics", "成本看板", "按 Agent / 动作两维看成本、缓存命中率、P95 延迟（数据源 /metrics/summary）"),
         ("/view/traces", "链路追踪", "每次运行发生了什么、哪一步最慢最贵（数据源 /traces）"),
         ("/view/tools", "工具清单", "Agent 能调用的 7 个工具，含风险等级（数据源 /agent/tools）"),
@@ -560,6 +565,7 @@ def index(response: Response):
         ("/view/approvals", "审批单", "Agent 想执行但还没执行的写操作（数据源 /approvals）"),
         ("/view/audit", "审计日志", "谁、何时、哪条告警、判成什么风险、做了什么（数据源 /audit）"),
         ("/view/health", "健康检查", "不需要 token，给容器探活和监控用（数据源 /health）"),
+        ("/settings", "系统设置", "查看/修改访问令牌；切换工具层数据源（mock / 本机 / ssh）与 SSH 目标"),
     ]
     # 「地址 | 是什么」两列合并成一列：点「是什么」就跳转，地址以小字附在链接里
     rows = "".join(
@@ -1388,6 +1394,386 @@ def view_page(name: str, response: Response):
         html = html.replace(k, v)
     response.headers["Cache-Control"] = "no-store, must-revalidate"
     return HTMLResponse(html)
+
+
+
+# ============================================================
+# 系统设置：令牌管理 + 工具层数据源切换（页面 + 三个接口）
+# ============================================================
+# 【为什么要这个页面】
+# 改令牌、切数据源原来是「ssh 上服务器改 .env 再重启」的事；
+# 演示和联调时这个回路太长。三个接口把两件事做成运行时可操作：
+#   · security.AGENT_TOKEN / ops.BACKEND / ops.SSH_TARGETS 都是
+#     「调用时读模块级全局」，直接改写立刻生效（有对账测试兜底）；
+#   · 同时写回项目根 .env（先备份 .env.bak.settings），重启不丢，
+#     容器部署时 compose 的 env_file 读同一份。
+# 【安全模型】页面壳公开（和 /try 同理，壳里没有数据）；
+# 三个数据接口不豁免 —— 开了鉴权时必须持当前令牌才能读/改，
+# 「改钥匙要先出示旧钥匙」。读接口会返回完整令牌：持令牌者
+# 本来就能以服务身份行事，不在展示层假装它更保密。
+
+_SETTINGS_ENV_KEYS = ("AGENT_TOKEN", "OPS_BACKEND", "OPS_SSH_TARGETS",
+                      "OPS_SSH_KEY", "OPS_HOSTS")
+
+
+def _mask_token(v: str) -> str:
+    if not v:
+        return "（未设置）"
+    if len(v) <= 10:
+        return v[0] + "…" + v[-1]
+    return v[:4] + "…" + v[-4:]
+
+
+def _persist_env(updates: dict) -> str:
+    """把键值对写回项目根 .env（存在才写；先备份上一份）。
+
+    返回说明字符串：写到了哪里 / 为什么没写。**只改认识的键**，
+    其它行原样保留 —— .env 里还有 DEEPSEEK_API_KEY 这些不能碰的东西。
+    """
+    env_path = PROJECT_ROOT / ".env"
+    if not env_path.exists():
+        return "项目根目录没有 .env，改动只在本次运行内生效（重启后还原）"
+    text = env_path.read_text(encoding="utf-8")
+    (env_path.parent / ".env.bak.settings").write_text(text, encoding="utf-8")
+    lines_out = text.splitlines()
+    for k, v in updates.items():
+        hit = False
+        for i, ln in enumerate(lines_out):
+            if ln.startswith(k + "="):
+                lines_out[i] = k + "=" + v
+                hit = True
+                break
+        if not hit:
+            lines_out.append(k + "=" + v)
+    env_path.write_text("\n".join(lines_out) + "\n", encoding="utf-8")
+    return ("已写回 .env（原文件备份为 .env.bak.settings）—— 重启后仍生效；"
+            "容器部署时 compose 的 env_file 读同一份")
+
+
+def _settings_snapshot() -> dict:
+    from app.tools import ops as _ops
+    env_path = PROJECT_ROOT / ".env"
+    return {
+        "auth": {
+            "auth_enabled": security.AUTH_ENABLED,
+            "token_masked": _mask_token(security.AGENT_TOKEN),
+            "token": security.AGENT_TOKEN,
+            "token_len": len(security.AGENT_TOKEN),
+        },
+        "ops": {
+            "backend": (_ops.BACKEND or "mock").lower(),
+            "targets": {k: v for k, v in _ops.SSH_TARGETS.items()},
+            "targets_raw": ",".join(
+                f"{k}={v}" for k, v in _ops.SSH_TARGETS.items()),
+            "key": _ops.SSH_KEY,
+            "hosts_env": (os.getenv("OPS_HOSTS") or "").strip(),
+            "known_hosts": list(_ops.KNOWN_HOSTS),
+        },
+        "env_file": "项目根 .env（可持久化）" if env_path.exists()
+                    else "无 .env（改动仅本次运行生效）",
+    }
+
+
+@app.get("/settings", response_class=HTMLResponse, include_in_schema=False)
+def settings_page(response: Response):
+    """设置页壳：数据由 /settings/api 出（开了鉴权时同样要令牌）。"""
+    html = _SETTINGS_HTML
+    for k, v in (
+        ("__NEEDS_TOKEN__", "true" if security.AUTH_ENABLED else "false"),
+        ("__TOKEN_MASKED__", _mask_token(security.AGENT_TOKEN)),
+        ("__BASE_CSS__", _BASE_CSS),
+    ):
+        html = html.replace(k, v)
+    response.headers["Cache-Control"] = "no-store, must-revalidate"
+    return HTMLResponse(html)
+
+
+@app.get("/settings/api")
+def settings_api():
+    """当前令牌（含完整值，见上方安全模型说明）与数据源配置。"""
+    return _settings_snapshot()
+
+
+class SettingsTokenRequest(BaseModel):
+    token: str = Field(min_length=16, max_length=200,
+                       description="新令牌：>=16 字符、不含空白。建议 32+ 随机字符")
+
+
+@app.post("/settings/token")
+def settings_token(req: SettingsTokenRequest):
+    """修改访问令牌：运行时立即生效 + 写回 .env。旧令牌当场作废。"""
+    v = req.token.strip()
+    if len(v) < 16:
+        raise HTTPException(400, detail="令牌太短：至少 16 个字符")
+    if any(ch.isspace() for ch in v):
+        raise HTTPException(400, detail="令牌不能含空白字符")
+    old_masked = _mask_token(security.AGENT_TOKEN)
+    security.AGENT_TOKEN = v
+    os.environ["AGENT_TOKEN"] = v
+    persisted = _persist_env({"AGENT_TOKEN": v})
+    return {"ok": True, "old": old_masked, "new_masked": _mask_token(v),
+            "persist": persisted}
+
+
+class SettingsOpsRequest(BaseModel):
+    backend: str = Field(description="mock | local | ssh")
+    targets: str = Field(default="", description="web-01=root@1.2.3.4:22,db-01=ops@10.0.0.9")
+    key: str = Field(default="", description="SSH 私钥路径（ssh 后端用）")
+    hosts: str = Field(default="", description="可选：显式主机清单，逗号分隔；留空=自动推导")
+
+
+@app.post("/settings/ops")
+def settings_ops(req: SettingsOpsRequest):
+    """切换工具层数据源。ssh 后端要求至少配一个目标，否则 400（fail-closed）。"""
+    from app.tools import ops as _ops
+    backend = (req.backend or "").strip().lower()
+    if backend not in ("mock", "local", "ssh"):
+        raise HTTPException(400, detail="backend 只能是 mock / local / ssh")
+    targets_raw = (req.targets or "").strip()
+    if backend == "ssh" and not targets_raw:
+        raise HTTPException(400, detail="ssh 后端至少要配一个目标，"
+                            "例如 web-01=root@1.2.3.4 —— 没有目标的 ssh 只会"
+                            "在每次查询时报错，不如显式拒绝")
+    try:
+        targets = _ops._parse_ssh_targets(targets_raw) if targets_raw else {}
+    except ValueError as e:
+        raise HTTPException(400, detail=f"目标格式不对：{e}")
+
+    _ops.BACKEND = backend
+    _ops.SSH_TARGETS = targets
+    _ops.SSH_KEY = (req.key or "").strip()
+    hosts_env = (req.hosts or "").strip()
+    if hosts_env:
+        os.environ["OPS_HOSTS"] = hosts_env
+    else:
+        os.environ.pop("OPS_HOSTS", None)
+    # KNOWN_HOSTS 是导入时算好的，换后端必须重推 ——
+    # 漏了这步就会出现「配置已是 ssh、提示词还列着旧的机器清单」的矛盾
+    _ops.KNOWN_HOSTS = _ops._resolve_hosts()
+
+    os.environ["OPS_BACKEND"] = backend
+    os.environ["OPS_SSH_TARGETS"] = targets_raw
+    os.environ["OPS_SSH_KEY"] = _ops.SSH_KEY
+    persisted = _persist_env({
+        "OPS_BACKEND": backend,
+        "OPS_SSH_TARGETS": targets_raw,
+        "OPS_SSH_KEY": _ops.SSH_KEY,
+        **({"OPS_HOSTS": hosts_env} if hosts_env else {"OPS_HOSTS": ""}),
+    })
+    return {"ok": True, "backend": backend,
+            "known_hosts": list(_ops.KNOWN_HOSTS), "persist": persisted}
+
+
+_SETTINGS_HTML = """<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AgentDesk · 系统设置</title>
+<style>
+ *{box-sizing:border-box}
+ body{font-family:-apple-system,"Segoe UI","Microsoft YaHei",sans-serif;
+      max-width:900px;margin:0 auto;padding:32px 20px 80px;color:#1f2328;
+      line-height:1.65;background:#fff}
+ h1{margin:0 0 4px;font-size:22px}
+ h2{font-size:15px;margin:28px 0 10px;padding-bottom:6px;
+    border-bottom:1px solid #e6e8eb;color:#24292f}
+ .sub{color:#59636e;margin-bottom:20px;font-size:14px}
+ label{display:block;font-size:13px;color:#59636e;margin:12px 0 5px}
+ input,textarea{width:100%;padding:9px 11px;border:1px solid #d0d7de;
+      border-radius:6px;font-size:14px;font-family:inherit;background:#fff;color:#1f2328}
+ textarea{min-height:64px;resize:vertical;font-family:ui-monospace,Consolas,monospace;
+      font-size:13px}
+ input:focus,textarea:focus{outline:2px solid #0969da;outline-offset:-1px;
+      border-color:#0969da}
+ button{padding:9px 18px;background:#1f883d;color:#fff;border:0;
+        border-radius:6px;font-size:14px;font-weight:600;cursor:pointer}
+ button:hover{background:#1a7f37}
+ button.ghost{background:#f6f8fa;color:#24292f;border:1px solid #d0d7de;
+              font-weight:400;padding:6px 12px;font-size:13px}
+ button.ghost:hover{background:#eef1f4}
+ .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+ .row input{flex:1 1 260px;width:auto}
+ .card{border:1px solid #e6e8eb;border-radius:10px;padding:16px 18px;margin:12px 0}
+ .hint{font-size:12.5px;color:#59636e;margin:6px 0 0}
+ .warn{background:#fff8e6;border-left:3px solid #d4a017;padding:10px 14px;
+       border-radius:0 6px 6px 0;font-size:13.5px;margin:10px 0}
+ .ok-msg{background:#f0fff4;border-left:3px solid #1f883d;padding:10px 14px;
+       border-radius:0 6px 6px 0;font-size:13.5px;margin:10px 0}
+ .err{background:#ffebe9;border-left:3px solid #cf222e;padding:10px 14px;
+      border-radius:0 6px 6px 0;font-size:13.5px;margin:10px 0}
+ code{background:#f4f5f7;padding:1px 5px;border-radius:4px;
+      font-family:ui-monospace,Consolas,monospace;font-size:12.5px}
+ table{width:100%;border-collapse:collapse;font-size:13px;margin-top:8px}
+ td,th{padding:7px 9px;border-bottom:1px solid #f0f1f3;text-align:left}
+ th{color:#59636e;font-weight:600}
+ .radio-row{display:flex;gap:18px;flex-wrap:wrap;margin:8px 0;font-size:14px}
+ .radio-row label{display:flex;align-items:center;gap:6px;margin:0;color:#1f2328}
+__BASE_CSS__
+</style></head><body>
+
+<h1>系统设置</h1>
+<div class="sub">访问令牌与工具层数据源 —— 运行时生效，同时写回 .env（自动备份）</div>
+
+<div class="warn"><b>这一页能改钥匙。</b>开了鉴权的实例上，读/改这里的配置
+需要出示<b>当前有效</b>令牌；改完令牌后旧令牌立即作废，本页会自动把新令牌
+存进本机浏览器。令牌与配置明文只出现在服务端与你的浏览器之间，不进日志。</div>
+
+<div id="msg"></div>
+
+<h2>访问令牌</h2>
+<div class="card">
+  <div class="row">
+    <input id="cur" type="password" value="" readonly
+           style="flex:1 1 320px;font-family:ui-monospace,Consolas,monospace">
+    <button class="ghost" id="reveal" type="button">显示</button>
+    <button class="ghost" id="gen" type="button">生成随机令牌</button>
+  </div>
+  <label for="newtok">新令牌（≥16 字符，建议 32+；留空 = 不修改）</label>
+  <div class="row">
+    <input id="newtok" type="text" placeholder="粘贴或用上面按钮生成"
+           style="font-family:ui-monospace,Consolas,monospace">
+    <button id="savetok" type="button">确认修改</button>
+  </div>
+  <p class="hint" id="authline"></p>
+</div>
+
+<h2>工具层数据源</h2>
+<div class="card">
+  <div class="radio-row">
+    <label><input type="radio" name="backend" value="mock"> mock · 内置仿真数据（默认，最安全）</label>
+    <label><input type="radio" name="backend" value="local"> local · 查本机真实状态</label>
+    <label><input type="radio" name="backend" value="ssh"> ssh · 查远程主机</label>
+  </div>
+  <label for="targets">SSH 目标（逻辑名=user@地址[:端口]，逗号或换行分隔；ssh 后端必填）</label>
+  <textarea id="targets" placeholder="web-01=root@192.168.1.10,db-01=ops@192.168.1.11:2222"></textarea>
+  <label for="key">SSH 私钥路径（可选；例如 C:/Users/you/.ssh/ops_key 或 /opt/agentdesk/.ssh/ops_key）</label>
+  <input id="key" type="text" style="font-family:ui-monospace,Consolas,monospace">
+  <label for="hosts">主机清单（可选，逗号分隔；留空 = 按目标自动推导。这是「Agent 知道队里有哪几台」，和「能连到哪几台」不是一回事）</label>
+  <input id="hosts" type="text" placeholder="web-01,db-01">
+  <div class="row" style="margin-top:14px">
+    <button id="applyops" type="button">应用数据源</button>
+    <span class="hint" id="opshint"></span>
+  </div>
+  <div id="opsview"></div>
+</div>
+
+<p class="hint" id="persist"></p>
+
+<script>
+var NEEDS_TOKEN = __NEEDS_TOKEN__;
+var KEY = 'agentdesk_token';
+var RAW = null;
+
+function $(id) { return document.getElementById(id); }
+function esc(s) {
+  return String(s == null ? '' : s)
+    .split('&').join('&amp;').split('<').join('&lt;')
+    .split('>').join('&gt;').split('"').join('&quot;');
+}
+function msg(kind, text) {
+  $('msg').innerHTML = '<div class="' + kind + '">' + text + '</div>';
+}
+function headers() {
+  var h = { 'Content-Type': 'application/json' };
+  var t = localStorage.getItem(KEY) || '';
+  if (t) { h['X-API-Key'] = t; }
+  return h;
+}
+function authed(r, data) {
+  if (r.status !== 401) { return true; }
+  msg('err', '<b>需要当前有效令牌（HTTP 401）。</b>' +
+    '先在右上角令牌框确认本机浏览器存的令牌还有效。');
+  return false;
+}
+
+async function load() {
+  var r = await fetch('/settings/api', { headers: headers() });
+  var data = await r.json().catch(function () { return null; });
+  if (!authed(r, data)) { return; }
+  if (!r.ok) { msg('err', 'HTTP ' + r.status); return; }
+  RAW = data;
+  $('cur').value = data.auth.token || '';
+  $('authline').textContent = '当前令牌 ' + data.auth.token_len +
+    ' 字符 · 鉴权' + (data.auth.auth_enabled ? '已开启（接口都要令牌）'
+                                             : '未开启（本地开发模式）');
+  document.querySelectorAll('input[name=backend]').forEach(function (el) {
+    el.checked = (el.value === data.ops.backend);
+  });
+  $('targets').value = data.ops.targets_raw;
+  $('key').value = data.ops.key;
+  $('hosts').value = data.ops.hosts_env;
+  $('persist').textContent = '持久化位置：' + data.env_file +
+    ' · 每次修改前自动把上一份备份为 .env.bak.settings';
+  renderOps(data.ops);
+}
+
+function renderOps(ops) {
+  var h = '<table><tr><th>当前生效</th><th>值</th></tr>' +
+    '<tr><td>后端</td><td><code>' + esc(ops.backend) + '</code></td></tr>' +
+    '<tr><td>能说出名字的主机</td><td><code>' + esc(ops.known_hosts.join(', ')) +
+    '</code></td></tr>' +
+    '<tr><td>SSH 目标</td><td>' +
+    (Object.keys(ops.targets).length
+      ? Object.keys(ops.targets).map(function (k) {
+          return '<code>' + esc(k + ' → ' + ops.targets[k]) + '</code>';
+        }).join(' ')
+      : '<span class="hint">（未配置）</span>') + '</td></tr>' +
+    '<tr><td>私钥路径</td><td>' + (ops.key ? '<code>' + esc(ops.key) + '</code>'
+      : '<span class="hint">（未配置）</span>') + '</td></tr></table>';
+  $('opsview').innerHTML = h;
+}
+
+$('reveal').onclick = function () {
+  $('cur').type = ($('cur').type === 'password') ? 'text' : 'password';
+  $('reveal').textContent = ($('cur').type === 'password') ? '显示' : '隐藏';
+};
+$('gen').onclick = function () {
+  var b = new Uint8Array(32);
+  crypto.getRandomValues(b);
+  var s = btoa(String.fromCharCode.apply(null, b));
+  $('newtok').value = s.split('+').join('-').split('/').join('_')
+                       .split('=').join('');
+};
+
+$('savetok').onclick = async function () {
+  var v = $('newtok').value.trim();
+  if (!v) { msg('err', '新令牌为空 —— 留空就是不修改。'); return; }
+  var r = await fetch('/settings/token', {
+    method: 'POST', headers: headers(), body: JSON.stringify({ token: v })
+  });
+  var data = await r.json().catch(function () { return null; });
+  if (!authed(r, data)) { return; }
+  if (!r.ok) { msg('err', '<b>修改失败：</b>' + esc(data && data.detail || ('HTTP ' + r.status))); return; }
+  localStorage.setItem(KEY, v);          // 立刻换上新手，免得把自己锁在门外
+  $('newtok').value = '';
+  msg('ok', '<b>令牌已修改并即时生效。</b>' + esc(data.persist) +
+    '。旧令牌 <code>' + esc(data.old) + '</code> 已作废；' +
+    '其它页面 / 调用方要换用新令牌。');
+  load();
+};
+
+$('applyops').onclick = async function () {
+  var backend = document.querySelector('input[name=backend]:checked').value;
+  var body = {
+    backend: backend,
+    targets: $('targets').value.trim(),
+    key: $('key').value.trim(),
+    hosts: $('hosts').value.trim()
+  };
+  var r = await fetch('/settings/ops', {
+    method: 'POST', headers: headers(), body: JSON.stringify(body)
+  });
+  var data = await r.json().catch(function () { return null; });
+  if (!authed(r, data)) { return; }
+  if (!r.ok) { msg('err', '<b>应用失败：</b>' + esc(data && data.detail || ('HTTP ' + r.status))); return; }
+  msg('ok', '<b>数据源已切换为 <code>' + esc(data.backend) +
+    '</code> 并即时生效。</b>' + esc(data.persist) +
+    '。到 <a href="/try">/try</a> 问一句机器状态即可验证。');
+  load();
+};
+
+load();
+</script>
+</body></html>"""
 
 
 

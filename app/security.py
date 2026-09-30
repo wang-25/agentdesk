@@ -78,8 +78,11 @@ DAILY_QUOTA = int(os.getenv("DAILY_QUOTA", "300"))
 # **没有泄露任何一个数字**；真正被保护的仍然是接口，不是页面。
 # （反过来想：如果连看板页面都要先拿 token 才能打开，那这个页面
 #   就只有"已经拿到钥匙的人"能用了 —— 而它本来就是为了让第一次来的人看明白的。）
-PUBLIC_EXACT = {"/", "/try", "/dashboard", "/health", "/openapi.json", "/favicon.ico"}
+PUBLIC_EXACT = {"/", "/try", "/dashboard", "/settings", "/health", "/openapi.json", "/favicon.ico"}
 PUBLIC_PREFIX = ("/docs", "/redoc")
+# /settings 是「设置页的壳」：跟 /try 一样只放 HTML 骨架，不含任何机密；
+# 它的数据接口 /settings/api|token|ops 不在豁免清单里 —— 开了鉴权时，
+# 必须持**当前有效令牌**才能读/改配置（改钥匙得先出示旧钥匙）。
 
 # 「花钱」的路径：会调用模型或 embedding API。只有这些扣每日额度。
 COST_PREFIX = (
