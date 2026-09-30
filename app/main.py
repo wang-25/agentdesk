@@ -7,7 +7,7 @@ AgentDesk 服务入口
 【运行方式】在 agentdesk 目录下执行：
     .venv\\Scripts\\python.exe -m uvicorn app.main:app --reload --port 8000
 
-【接口一览】共 26 个业务路由，其中 23 个进 OpenAPI 文档。
+【接口一览】共 27 个业务路由，其中 23 个进 OpenAPI 文档。
   为什么是 24 而不是 22：`GET /`（导航页）和 `GET /try`（在线试用页）是给人看的
   页面，标了 `include_in_schema=False`，不进 OpenAPI 的路径表 ——
   它们真实存在、能访问，只是不该混进接口清单里干扰视线。
@@ -55,6 +55,9 @@ AgentDesk 服务入口
     GET  /                          导航页：这是什么、从哪开始试
     GET  /try                       在线试用页：填问题、点按钮
     GET  /dashboard               可观测看板：成本归因 / 对账 / 逐步轨迹 / 待审批
+    GET  /view/{name}              7 个 JSON 接口的可视化皮：metrics/traces/
+                                    tools/sandbox/approvals/audit/health，
+                                    每张表可导出 CSV、整页可导出 JSON
     POST /agent/ask/stream        Agent 诊断的 SSE 流式版（实时编排过程）
 
 服务起来后打开 http://127.0.0.1:8000/docs 有自动生成的交互式文档。
@@ -388,19 +391,13 @@ def alert_to_question(alert: dict) -> str:
 # 暗色覆盖才能压过页面原有的亮色硬编码。
 # ============================================================
 _BASE_CSS = """
+/* ★ 固定明亮模式（用户 2026-09-30 决定）：不跟系统 prefers-color-scheme 走。
+   原因：演示与截图场景以亮色为主，暗色双套维护面大于收益。 */
 :root {
   --bg: #f6f8fa; --surface: #ffffff; --text: #1f2328; --muted: #59636e;
   --border: #e6e8eb; --accent: #0969da; --ok: #1f883d; --err: #cf222e;
   --warn: #d4a017; --track: #eef0f2;
 }
-@media (prefers-color-scheme: dark) {
-  :root {
-    --bg: #0d1117; --surface: #161b22; --text: #e6edf3; --muted: #8b949e;
-    --border: #30363d; --accent: #58a6ff; --ok: #3fb950; --err: #f85149;
-    --warn: #d29922; --track: #21262d;
-  }
-}
-
 /* ---- 流式步骤 ---- */
 .steps { display: flex; flex-direction: column; gap: 6px; }
 .step { display: flex; align-items: baseline; gap: 8px; font-size: 13.5px;
@@ -437,29 +434,6 @@ _BASE_CSS = """
              font-variant-numeric: tabular-nums; }
 
 /* ---- 暗色模式：覆盖三页已有的亮色硬编码 ---- */
-@media (prefers-color-scheme: dark) {
-  body { background: var(--bg); color: var(--text); }
-  h1, h2, h3, b { color: var(--text); }
-  .sub, .hint, .mut, .k { color: var(--muted); }
-  .card { background: var(--surface); border-color: var(--border); }
-  .note { background: #241d08; border-left-color: var(--warn); color: var(--warn); }
-  .note b { color: var(--warn); }
-  .err, .err-box { background: #2d1214; border-left-color: var(--err); color: #ff8182; }
-  .ok { background: #12261e; border-left-color: var(--ok); color: #5bd49a; }
-  input, select, textarea { background: var(--bg); border-color: var(--border);
-                            color: var(--text); }
-  button { background: #238636; }
-  button:hover { background: #2ea043; }
-  .ghost { background: #21262d; color: var(--text); border-color: var(--border); }
-  table th { background: var(--surface); color: var(--muted);
-             border-color: var(--border); }
-  table td { border-color: #21262d; }
-  pre { background: var(--surface); border-color: var(--border); color: var(--text); }
-  code { background: #21262d; color: var(--text); }
-  .meta { color: var(--muted); } .meta b { color: var(--text); }
-  .trace { background: var(--surface); border-color: var(--border); }
-  .err-box { background: #2d1214; }
-}
 """
 
 # ============================================================
@@ -579,17 +553,18 @@ def index(response: Response):
         ("/try", "★ 在线试用", "填问题、点按钮，看它自己决定查什么。不用懂 API，从这里开始"),
         ("/dashboard", "★ 可观测看板", "成本归因、对账偏差、逐步轨迹、待审批 —— 不用敲命令就能看"),
         ("/docs", "23 个接口的调试台", docs_hint),
-        ("/metrics/summary", "成本看板（JSON）", "按 Agent / 动作两维看成本、缓存命中率、P95 延迟"),
-        ("/traces", "链路追踪", "每次运行发生了什么、哪一步最慢最贵"),
-        ("/agent/tools", "工具清单", "Agent 能调用的 7 个工具，含风险等级"),
-        ("/sandbox", "沙箱状态", "当前是 mock 还是真容器、白名单概览、fail-closed"),
-        ("/approvals", "审批单", "Agent 想执行但还没执行的写操作"),
-        ("/audit", "审计日志", "谁、何时、哪条告警、判成什么风险、做了什么"),
-        ("/health", "健康检查", "不需要 token，给容器探活和监控用"),
+        ("/view/metrics", "成本看板", "按 Agent / 动作两维看成本、缓存命中率、P95 延迟（数据源 /metrics/summary）"),
+        ("/view/traces", "链路追踪", "每次运行发生了什么、哪一步最慢最贵（数据源 /traces）"),
+        ("/view/tools", "工具清单", "Agent 能调用的 7 个工具，含风险等级（数据源 /agent/tools）"),
+        ("/view/sandbox", "沙箱状态", "当前是 mock 还是真容器、白名单概览、fail-closed（数据源 /sandbox）"),
+        ("/view/approvals", "审批单", "Agent 想执行但还没执行的写操作（数据源 /approvals）"),
+        ("/view/audit", "审计日志", "谁、何时、哪条告警、判成什么风险、做了什么（数据源 /audit）"),
+        ("/view/health", "健康检查", "不需要 token，给容器探活和监控用（数据源 /health）"),
     ]
+    # 「地址 | 是什么」两列合并成一列：点「是什么」就跳转，地址以小字附在链接里
     rows = "".join(
-        f'<tr><td><a href="{u}"><code>{u}</code></a></td>'
-        f'<td><b>{n}</b></td><td>{d}</td></tr>'
+        f'<tr><td><a href="{u}"><b>{n}</b><br><code>{u}</code></a></td>'
+        f'<td>{d}</td></tr>'
         for u, n, d in links
     )
     page = f"""<!DOCTYPE html>
@@ -631,7 +606,7 @@ __BASE_CSS__
 
 <h2>从哪儿开始试</h2>
 <table>
-<tr><th>地址</th><th>是什么</th><th>说明</th></tr>
+<tr><th>是什么（点击打开）</th><th>说明</th></tr>
 {rows}
 </table>
 {auth_block}
@@ -646,7 +621,7 @@ __BASE_CSS__
 {curl_demo}
 
 <div class="note"><b>安全边界</b>：所有写操作（重启服务、清空日志）
-都不会自动执行。它们会变成一张审批单挂在 <a href="/approvals">/approvals</a>，
+都不会自动执行。它们会变成一张审批单挂在 <a href="/view/approvals"><b>审批单</b></a>，
 等人批准；沙箱不可用时宁可拒绝执行，也不降级。</div>
 
 <p style="margin-top:32px;color:#8b949e;font-size:13px">
@@ -872,6 +847,9 @@ $('go').onclick = async function () {
   // 让访问者看着「意图路由 → 知识检索 → 正在查磁盘」一步步亮起来，
   // 而不是对着空白页干等 20 秒。其他引擎保持一次性请求。
   if (mode === 'supervisor') {
+    clearInterval(timer);   // ★ 流式有自己的进度展示；不定时器会把
+                            //   #out 连同 #steps/#final 覆盖掉，
+                            //   result 到达时 getElementById('final') 为 null
     try {
       await askStream(question, headers);
     } catch (e) {
@@ -1127,6 +1105,292 @@ function render(d, mode) {
 # ============================================================
 # 可观测看板（页面）
 # ============================================================
+# ============================================================
+# 数据可视化视图：把「一打开就是裸 JSON」的 7 个接口变成人能看的页面。
+# ============================================================
+# 【为什么是独立 /view/{name} 而不是让原接口返回 HTML】
+# 这些 JSON 同时被程序消费（dashboard 的 fetch、MCP、curl 探活）——
+# 改默认返回格式等于砸掉自己的 API。HTML 视图单独开路由，
+# 数据还是同一个接口出的：**一个事实源，两种皮**。
+_DATA_VIEWS = {
+    "metrics":   ("/metrics/summary?limit=20", "成本看板",
+                  "按 Agent / 动作两维的成本、缓存命中率、P95 延迟"),
+    "traces":    ("/traces?limit=20", "链路追踪",
+                  "每次运行发生了什么、哪一步最慢最贵"),
+    "tools":     ("/agent/tools", "工具清单",
+                  "Agent 能调用的工具与风险等级"),
+    "sandbox":   ("/sandbox", "沙箱状态",
+                  "当前后端（mock / 真容器）、隔离状态与命令白名单"),
+    "approvals": ("/approvals", "审批单",
+                  "Agent 想执行但还没执行的写操作，等人工确认"),
+    "audit":     ("/audit?limit=30", "审计日志",
+                  "谁、何时、哪条告警、判成什么风险、做了什么"),
+    "health":    ("/health", "健康检查",
+                  "服务存活与安全层状态（不需要令牌）"),
+}
+
+_VIEW_HTML = """<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AgentDesk · __TITLE__</title>
+<style>
+ *{box-sizing:border-box}
+ body{font-family:-apple-system,"Segoe UI","Microsoft YaHei",sans-serif;
+      max-width:1100px;margin:0 auto;padding:32px 20px 80px;color:#1f2328;
+      line-height:1.65;background:#fff}
+ h1{margin:0 0 4px;font-size:22px}
+ h3{margin:18px 0 8px;font-size:14px;color:#59636e}
+ .sub{color:#59636e;margin-bottom:16px;font-size:14px}
+ .bar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:14px 0}
+ .bar input{flex:0 1 340px;padding:8px 10px;border:1px solid #d0d7de;
+            border-radius:6px;font-size:13px}
+ button{padding:8px 14px;background:#1f883d;color:#fff;border:0;
+        border-radius:6px;font-size:13px;font-weight:600;cursor:pointer}
+ button:hover{background:#1a7f37}
+ button.ghost{background:#f6f8fa;color:#24292f;border:1px solid #d0d7de;
+              font-weight:400}
+ button.ghost:hover{background:#eef1f4}
+ .card{border:1px solid #e6e8eb;border-radius:10px;padding:14px 16px;
+       margin:10px 0;background:#fff}
+ table{width:100%;border-collapse:collapse;font-size:13px}
+ td,th{padding:7px 9px;border-bottom:1px solid #f0f1f3;text-align:left;
+       vertical-align:top;word-break:break-all}
+ th{color:#59636e;font-weight:600;background:#fafbfc;white-space:nowrap}
+ code{background:#f4f5f7;padding:1px 5px;border-radius:4px;
+      font-family:ui-monospace,Consolas,monospace;font-size:12px}
+ .hint{font-size:12.5px;color:#59636e}
+ .err{background:#ffebe9;border-left:3px solid #cf222e;padding:10px 14px;
+      border-radius:0 6px 6px 0;margin:10px 0;font-size:14px}
+ .tblbar{display:flex;justify-content:space-between;align-items:center;
+         margin-bottom:8px}
+ .tblbar span{font-size:12.5px;color:#59636e}
+ .scroll{overflow-x:auto}
+__BASE_CSS__
+</style></head><body>
+
+<h1>__TITLE__</h1>
+<div class="sub">__DESC__</div>
+
+<div class="bar">
+  <input id="token" type="password" placeholder="访问令牌（开了鉴权才需要；存本机浏览器）">
+  <button class="ghost" onclick="saveTok()">保存令牌</button>
+  <button class="ghost" onclick="forgetTok()">清除</button>
+  <span style="flex:1"></span>
+  <button class="ghost" onclick="load()">刷新</button>
+  <button onclick="exportJson()">导出 JSON</button>
+</div>
+<div class="hint" id="stamp">__TOKEN_HINT__</div>
+<div id="content"><p class="hint">载入中…</p></div>
+
+<script>
+var NEEDS_TOKEN = __NEEDS_TOKEN__;
+var API = '__API_PATH__';
+var VNAME = '__VNAME__';
+var KEY = 'agentdesk_token';
+var RAW = null;
+
+function $(id) { return document.getElementById(id); }
+function esc(s) {
+  return String(s == null ? '' : s)
+    .split('&').join('&amp;').split('<').join('&lt;')
+    .split('>').join('&gt;').split('"').join('&quot;');
+}
+function err(msg) { return '<div class="err"><b>' + msg + '</b></div>'; }
+
+function saveTok() {
+  localStorage.setItem(KEY, $('token').value.trim());
+  load();
+}
+function forgetTok() {
+  localStorage.removeItem(KEY);
+  $('token').value = '';
+  load();
+}
+
+async function load() {
+  var token = localStorage.getItem(KEY) || '';
+  $('token').value = token;
+  $('content').innerHTML = '<p class="hint">载入中…</p>';
+  var headers = {};
+  if (token) { headers['X-API-Key'] = token; }
+  var r;
+  try {
+    r = await fetch(API, { headers: headers });
+  } catch (e) {
+    $('content').innerHTML = err('网络错误：' + esc(e.message) +
+      '。确认服务已启动（uvicorn app.main:app）。');
+    return;
+  }
+  if (r.status === 401) {
+    $('content').innerHTML = err('这个接口需要访问令牌（HTTP 401）。' +
+      '在上方填入服务器 .env 里 AGENT_TOKEN 的值，点「保存令牌」。');
+    return;
+  }
+  if (r.status === 429) {
+    $('content').innerHTML = err('触发限流（HTTP 429）。等一下再点刷新。');
+    return;
+  }
+  var text = await r.text();
+  if (!r.ok) {
+    $('content').innerHTML = err('HTTP ' + r.status) +
+      '<pre>' + esc(text.slice(0, 600)) + '</pre>';
+    return;
+  }
+  var data;
+  try { data = JSON.parse(text); }
+  catch (e) {
+    $('content').innerHTML = err('返回不是合法 JSON。') +
+      '<pre>' + esc(text.slice(0, 600)) + '</pre>';
+    return;
+  }
+  RAW = data;
+  $('stamp').textContent = '载入于 ' + new Date().toLocaleTimeString() +
+    ' · 数据源 ' + API;
+  $('content').innerHTML = renderAny(data, '');
+}
+
+/* ---------- 通用渲染：JSON 转表格 / 卡片 ---------- */
+
+function cell(v) {
+  if (v === null || v === undefined || v === '') { return ''; }
+  if (typeof v === 'object') {
+    var s = JSON.stringify(v);
+    return '<code>' + esc(s.slice(0, 110)) + (s.length > 110 ? '…' : '') + '</code>';
+  }
+  return esc(String(v));
+}
+function isArrOfObj(a) {
+  return Array.isArray(a) && a.length > 0 &&
+    a.every(function (x) { return x && typeof x === 'object' && !Array.isArray(x); });
+}
+
+function renderAny(v, path) {
+  if (isArrOfObj(v)) { return tableHTML(v, path); }
+  if (Array.isArray(v)) {
+    return '<div class="card"><span class="hint">数组 ' + v.length +
+      ' 项（内容不是同构对象，逐项展示）</span><pre>' +
+      esc(JSON.stringify(v, null, 2)).slice(0, 2500) + '</pre></div>';
+  }
+  if (v && typeof v === 'object') {
+    var scalars = '', h = '';
+    Object.keys(v).forEach(function (k) {
+      var val = v[k];
+      if (val === null || typeof val !== 'object') {
+        scalars += '<tr><td style="width:190px;color:#59636e">' + esc(k) +
+          '</td><td>' + cell(val) + '</td></tr>';
+      }
+    });
+    if (scalars) {
+      h += '<div class="card"><table><tr><th>字段</th><th>值</th></tr>' +
+        scalars + '</table></div>';
+    }
+    Object.keys(v).forEach(function (k) {
+      var val = v[k];
+      if (val && typeof val === 'object') {
+        h += '<h3>' + esc(k) + '</h3>' + renderAny(val, path ? path + '.' + k : k);
+      }
+    });
+    return h || '<p class="hint">（空对象）</p>';
+  }
+  return '<div class="card">' + cell(v) + '</div>';
+}
+
+function tableHTML(arr, path) {
+  var cols = [];
+  arr.slice(0, 80).forEach(function (o) {
+    Object.keys(o).forEach(function (k) {
+      if (cols.indexOf(k) < 0) { cols.push(k); }
+    });
+  });
+  var h = '<div class="card"><div class="tblbar"><span>' + arr.length +
+    ' 行</span><button class="ghost" onclick="exportCsv(this)" data-path="' +
+    esc(path) + '">导出 CSV</button></div><div class="scroll"><table><tr>';
+  cols.forEach(function (c) { h += '<th>' + esc(c) + '</th>'; });
+  h += '</tr>';
+  arr.forEach(function (o) {
+    h += '<tr>';
+    cols.forEach(function (c) { h += '<td>' + cell(o[c]) + '</td>'; });
+    h += '</tr>';
+  });
+  return h + '</table></div></div>';
+}
+
+/* ---------- 导出 ---------- */
+
+function download(name, mime, content) {
+  var b = new Blob([content], { type: mime });
+  var a = document.createElement('a');
+  a.href = URL.createObjectURL(b);
+  a.download = name;
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(function () { URL.revokeObjectURL(a.href); a.remove(); }, 0);
+}
+function exportJson() {
+  if (RAW === null) { return; }
+  download(VNAME + '.json', 'application/json', JSON.stringify(RAW, null, 2));
+}
+function csvOf(arr) {
+  var CR = String.fromCharCode(13), LF = String.fromCharCode(10);
+  var cols = [];
+  arr.slice(0, 80).forEach(function (o) {
+    Object.keys(o).forEach(function (k) {
+      if (cols.indexOf(k) < 0) { cols.push(k); }
+    });
+  });
+  var lines = [cols.join(',')];
+  arr.forEach(function (o) {
+    lines.push(cols.map(function (k) {
+      var v = o[k];
+      if (v === null || v === undefined) { v = ''; }
+      if (typeof v === 'object') { v = JSON.stringify(v); }
+      return '"' + String(v).split('"').join('""') + '"';
+    }).join(','));
+  });
+  return lines.join(CR + LF);
+}
+function exportCsv(btn) {
+  var path = btn.getAttribute('data-path');
+  var arr = path
+    ? path.split('.').reduce(function (o, k) { return o ? o[k] : null; }, RAW)
+    : RAW;
+  if (!arr) { return; }
+  // BOM 前缀：让 Excel 识别 UTF-8，中文不乱码
+  var bom = String.fromCharCode(0xFEFF);
+  var fname = VNAME + (path ? '.' + path.split('.').join('_') : '') + '.csv';
+  download(fname, 'text/csv;charset=utf-8', bom + csvOf(arr));
+}
+</script>
+</body></html>"""
+
+@app.get("/view/{name}", response_class=HTMLResponse, include_in_schema=False)
+def view_page(name: str, response: Response):
+    """JSON 接口的可视化皮。数据仍从原接口出（一个事实源，两种皮）。"""
+    if name not in _DATA_VIEWS:
+        raise HTTPException(status_code=404, detail="未知的数据视图，可选："
+                            + "、".join(sorted(_DATA_VIEWS)))
+    api_path, title, desc = _DATA_VIEWS[name]
+    needs_token = security.AUTH_ENABLED
+    html = _VIEW_HTML
+    for k, v in (
+        ("__TITLE__", f"AgentDesk · {title}"),
+        ("__DESC__", desc),
+        ("__API_PATH__", api_path),
+        ("__VNAME__", name),
+        ("__NEEDS_TOKEN__", "true" if needs_token else "false"),
+        ("__TOKEN_HINT__", (
+            "这个服务开启了鉴权：先填令牌，点「保存令牌」后数据自动载入。"
+            if needs_token else
+            "当前未开启鉴权（本地开发模式），令牌可留空。"
+            "接口本身是 " + api_path + "，本页只是它的可视化皮。")),
+        ("__BASE_CSS__", _BASE_CSS),
+    ):
+        html = html.replace(k, v)
+    response.headers["Cache-Control"] = "no-store, must-revalidate"
+    return HTMLResponse(html)
+
+
+
 @app.get("/dashboard", response_class=HTMLResponse, include_in_schema=False)
 def dashboard_page(response: Response):
     """把 /metrics/summary、/traces、/approvals 渲染成一个可读的页面。
