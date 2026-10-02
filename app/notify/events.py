@@ -187,7 +187,11 @@ def incident(report: dict, incident_id: str = "", members: int = 1, *,
         f"　级别：{report.get('severity', '?')}",
     ]
     if incident_id:
-        lines.append(f"- 事件：`{incident_id}`（同源告警 {members} 条）")
+        # ★ 措辞刻意写成"本次为第 N 条"而不是"同源告警 N 条"：
+        #   通知是在**第一条**告警处理完就发出去的，此刻后面那些同源告警还没进来。
+        #   写"同源告警 1 条"虽然当时为真，但读的人会以为整个事件只有一条告警 ——
+        #   而实际上它通常会继续并入几十条。**数字要说清楚它是哪个时刻的数字。**
+        lines.append(f"- 事件：`{incident_id}`（同源告警并入本事件，本次为第 {members} 条）")
     if report.get("reason"):
         lines.append(f"- 判定：{report['reason']}")
     if report.get("answer"):
