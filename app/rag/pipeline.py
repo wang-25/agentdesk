@@ -195,8 +195,14 @@ def _percentile(ordered: list, pct: float) -> float:
 
 
 def evaluate(top_k: int = 3, modes=("vector", "bm25", "hybrid"),
-             qa_set_path=None, verbose: bool = True) -> dict:
+             qa_set_path=None, verbose: bool = True, store=None) -> dict:
     """计算 Top-K 召回率，并对比三种检索模式 × 两类问题。
+
+    参数 `store`：传了就评测**这一个** store，不传就用进程内缓存的那个。
+    ★ 为什么要留这个口子：M5d 要对比"本地哈希后端"与"真语义后端"，
+      而进程内的 store 是**单例缓存**（`load_store` 只认一个）。
+      与其在对比脚本里把评测逻辑再抄一遍（两处实现必然漂移），
+      不如让同一份实现接受一个 store —— 对比与门禁跑的**完全同一套代码**。
 
     【什么叫 Top-K 召回率】
     每个测试问题都标注了「标准答案出自哪篇文档」。
@@ -218,7 +224,7 @@ def evaluate(top_k: int = 3, modes=("vector", "bm25", "hybrid"),
 
     ★ 这张对比表回答了「RAG 效果怎么测」这个问题。
     """
-    store = load_store()
+    store = store if store is not None else load_store()
     qa_set = load_qa_set(qa_set_path)
 
     report = {"top_k": top_k, "total": len(qa_set),

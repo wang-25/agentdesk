@@ -208,12 +208,22 @@ class VectorStore:
         now = store.embedder.describe()
         if saved and (saved.get("dim") != now["dim"]
                       or saved.get("backend") != now["backend"]):
+            # ★ 这条报错是"配了 API Key 之后"最可能撞上的一条，所以它必须
+            #   把**下一步该敲什么**写出来，而不是只说"必须重建"：
+            #   人在这个时刻正在配环境，最不需要的就是再去翻文档找命令。
+            #   顺带说清"为什么"——否则很容易被理解成索引坏了。
             raise RuntimeError(
                 "索引与当前 embedding 后端不匹配，必须重建索引。\n"
                 f"  索引里是：{saved}\n"
                 f"  当前是：  {now}\n"
                 "原因：换了 embedding 后端，向量空间就不同了，"
-                "旧的向量没法用来查询。")
+                "旧的向量没法用来查询（维度都可能不一样）。\n"
+                "最常见的触发方式：刚在 .env 里配上 DASHSCOPE_API_KEY —— "
+                "后端会从 local 自动切成 dashscope。\n"
+                "修复（重建索引，几分钟）：\n"
+                "  .venv\\Scripts\\python.exe -m app.rag.pipeline build\n"
+                "只想先跑起来、暂时不配 Key：把 .env 里的 DASHSCOPE_API_KEY "
+                "清空即可（会退回 local-hash 后端，索引也就不用重建）。")
 
         store.chunks = [Chunk.from_dict(d) for d in payload["chunks"]]
         store.tokenized = [tokenize(c.text) for c in store.chunks]
