@@ -28,6 +28,23 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+# ★ 必须在这里先把 .env 载进来。
+#
+#   本项目加载 .env 的地方是 app/llm.py、app/security.py、app/rag/embedder.py、
+#   app/tools/ops.py —— 都在 **import 时**执行；而通知层**刻意不自己载**
+#   （`dispatcher.py` 里写明了理由：由调用方把一份配置快照递进来）。
+#   这个脚本刻意只 import 通知层、不 import 整个 app，所以必须自己载一次。
+#
+#   不载的后果是最误导人的那种输出：**"我明明在 .env 里配了通知，工具却说没配"**。
+#   拿真实机器人第一次实测就踩到了：脚本报"未启用（完全不出站）"，
+#   而 .env 里的 URL 写得好好的 —— 工具说了假话，而且长得像"你没配"。
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv(PROJECT_ROOT / ".env")
+except ImportError:                                   # pragma: no cover
+    pass
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="出站通知自检")

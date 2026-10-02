@@ -97,11 +97,29 @@ class FeishuNotifier(Notifier):
         return "\n".join(lines)
 
     def _business_error(self, status: int, data: dict, raw: str) -> str:
-        """code != 0 → 失败。字段缺失按成功处理（理由同钉钉：兼容自建转发器）。"""
+        """`code != 0` → 失败；**没有 `code` 时退回看 `StatusCode`**。
+
+        ★ 这两个字段的关系来自一次真实响应（拿真机器人实测时抓到的原始 body）：
+
+            {"StatusCode": 0, "StatusMessage": "success",
+             "code": 0, "msg": "success", "data": {}}
+
+          `code`/`msg` 是现在的字段，`StatusCode`/`StatusMessage` 是旧字段，
+          飞书**两个都回**。原实现只看 `code`，缺了就当成功 ——
+          对只回旧字段的端点（自建转发器、老版本网关）来说，
+          那会把"一条都没发出去"记成成功，而这正是本项目最警惕的失败形态：
+          **主链路一切正常，只是没人收到通知。**
+
+          顺序仍然是"先看 `code`"：新字段优先，旧字段只在它缺失时兜底，
+          这样两种端点都能判对。
+        """
         if not data:
             return ""
         code = data.get("code")
+        if code is None:
+            code = data.get("StatusCode")
         if code in (None, 0, "0"):
             return ""
-        msg = data.get("msg") or data.get("message") or raw
+        msg = (data.get("msg") or data.get("message")
+               or data.get("StatusMessage") or raw)
         return f"code={code} msg={msg}"

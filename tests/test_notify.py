@@ -396,6 +396,44 @@ def test_飞书_code为0算成功(http):
     assert FeishuNotifier("https://open.feishu.cn/hook/x").send("t", "b").ok is True
 
 
+def test_飞书_真实成功响应的完整形状(http):
+    """★ 这条用的是**真实机器人返回的原样 body**（实测抓的，不是编的）：
+
+        {"StatusCode": 0, "StatusMessage": "success", "code": 0, "msg": "success",
+         "data": {}}
+
+    飞书新旧字段**都回**。用例拿真形状跑一遍，确保我们判成功不会因为它们
+    多回了几个字段而出错 —— 只有真实响应才知道真实响应长什么样。
+    """
+    http(FakeResponse(200, {"StatusCode": 0, "StatusMessage": "success",
+                            "code": 0, "msg": "success", "data": {}}))
+    res = FeishuNotifier("https://open.feishu.cn/hook/x").send("t", "b")
+    assert res.ok is True and res.error == ""
+
+
+def test_飞书_只回旧字段StatusCode非0也要判失败(http):
+    """★ 只回旧字段 `StatusCode` 的端点（自建转发器 / 老版本网关）：
+
+        {"StatusCode": 9499, "StatusMessage": "sign match fail"}
+
+    原实现只看 `code`，缺了就按成功处理 —— 于是**"一条都没发出去"被记成成功**，
+    而主链路一切正常、只有值班的人什么都没收到（本项目最警惕的失败形态）。
+    实测到真实响应里两个字段并存之后，这里补上旧字段兜底。
+    """
+    http(FakeResponse(200, {"StatusCode": 9499, "StatusMessage": "sign match fail"}))
+    res = FeishuNotifier("https://open.feishu.cn/hook/x").send("t", "b")
+    assert res.ok is False
+    assert "9499" in res.error and "sign match fail" in res.error
+
+
+def test_飞书_新旧字段冲突时以新字段code为准(http):
+    """两个都非 0 时报 `code`（新字段优先，旧字段只在缺失时兜底）。"""
+    http(FakeResponse(200, {"code": 19021, "msg": "sign match fail",
+                            "StatusCode": 9499, "StatusMessage": "legacy"}))
+    res = FeishuNotifier("https://open.feishu.cn/hook/x").send("t", "b")
+    assert res.ok is False and "19021" in res.error
+
+
 def test_业务码缺失时按成功处理(http):
     """兼容"用户填的其实是个自建转发器"：它可能只回 200 空体。
     我们唯一确知的事实是"对端收下了"，把它当失败会造成大面积误报。"""

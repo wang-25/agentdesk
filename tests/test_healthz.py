@@ -59,20 +59,37 @@ def test_disk_space_low_is_unhealthy(tmp_path, monkeypatch):
 
 def test_notify_unconfigured_is_healthy(monkeypatch):
     """没配通知**不是故障** —— 默认就是不出站，那是有意的选择。"""
+    from app.notify import events
+
     monkeypatch.delenv("NOTIFY_CHANNELS", raising=False)
-    got = selfcheck.check_notify_config()
-    assert got["ok"] is True and "默认不出站" in got["detail"]
+    events.reset()                      # 通知层会缓存装配结果，改环境必须重置
+    try:
+        got = selfcheck.check_notify_config()
+        assert got["ok"] is True and "默认不出站" in got["detail"]
+    finally:
+        events.reset()
 
 
 def test_notify_channel_named_but_url_missing_is_unhealthy(monkeypatch):
     """★ 点了渠道名却没配 URL：这是配置错了，必须报出来。
 
     这类错误最容易骗人：日志里一切正常，只是**通知永远发不出去**。
+
+    ★ 两条测试卫生要求（第一版都没做，于是本地 .env 一配上飞书就红了）：
+      · 清掉**所有**渠道的 URL，让用例不受本机 .env 影响
+      · `events.reset()` —— 通知层缓存装配结果，不重置就还在测上一次的配置
     """
+    from app.notify import events
+
     monkeypatch.setenv("NOTIFY_CHANNELS", "dingtalk")
-    monkeypatch.delenv("NOTIFY_DINGTALK_URL", raising=False)
-    got = selfcheck.check_notify_config()
-    assert got["ok"] is False and "没有" in got["detail"]
+    for var in ("NOTIFY_DINGTALK_URL", "NOTIFY_FEISHU_URL", "NOTIFY_WEBHOOK_URL"):
+        monkeypatch.delenv(var, raising=False)
+    events.reset()
+    try:
+        got = selfcheck.check_notify_config()
+        assert got["ok"] is False and "没有" in got["detail"]
+    finally:
+        events.reset()                  # 别把打桩环境装出来的 dispatcher 留给后面的用例
 
 
 def test_index_loadable_reports_missing_index(monkeypatch, tmp_path):

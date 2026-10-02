@@ -99,21 +99,34 @@ def check_incidents_readable() -> dict:
 def check_notify_config() -> dict:
     """通知配置能不能解析。**不发请求** —— 那是 notify_check.py 的事。
 
-    注意：**没配通知不算不健康**（默认就是不出站，那是有意选择，
-    不是故障）。这里只在"点名了渠道却没配上 URL"时才算问题。
+    判定顺序（以**装配结果**为准，环境变量只用来解释"为什么没启用"）：
+
+      ① 装配成功 → 健康（列出渠道）
+      ② 没装配成功、但 `NOTIFY_CHANNELS` 点了名 → **不健康**（点了名却没 URL，配置错了）
+      ③ 没装配成功、也没点名 → 健康（默认就是不出站，那是有意的选择）
+
+    ★ 顺序不能反。原先我把 ③ 放在最前面（"环境变量为空就直接报健康"），
+      结果是"本地 .env 配了飞书"这件事一发生，`NOTIFY_CHANNELS=dingtalk`
+      这种配置错误就被 ③ 提前短路掉了 —— 用例当场变红。
+      更重要的是：`describe()` 反映的是**通知层已经装配好的东西**，
+      那才是"到底会不会发出去"的权威答案；环境变量只是输入。
+
+    ★ 测试须知：通知层会缓存装配结果（刻意的，见 `events.dispatcher` 的 docstring），
+      用例改完环境变量必须调 `events.reset()`，否则测的还是上一次的装配结果。
     """
     from app.notify import events
 
-    raw = (os.getenv("NOTIFY_CHANNELS") or "").strip()
     info = events.describe()
-    if not raw:
-        return {"ok": True, "detail": "未配置通知（默认不出站）"}
+    raw = (os.getenv("NOTIFY_CHANNELS") or "").strip()
+
     if info["enabled"]:
         return {"ok": True,
                 "detail": f"渠道 {'、'.join(info['channels'])}"
                           f"　脱敏 {'开' if info['mask'] else '关'}"}
-    return {"ok": False,
-            "detail": f"NOTIFY_CHANNELS={raw!r} 点名了渠道，但没有一个配了 URL"}
+    if raw:
+        return {"ok": False,
+                "detail": f"NOTIFY_CHANNELS={raw!r} 点名了渠道，但没有一个配了 URL"}
+    return {"ok": True, "detail": "未配置通知（默认不出站）"}
 
 
 def check_model_recent() -> dict:
