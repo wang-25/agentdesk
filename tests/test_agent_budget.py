@@ -197,8 +197,9 @@ def test_deadline_is_per_request_not_baked_into_the_cached_graph(monkeypatch):
     monkeypatch.setattr(g, "chat_step", fake_chat_step)
 
     # 同一个 (max_steps, tool_names) 键 → 拿到**同一个**编译对象
-    first = g.build_graph(5, None)
-    second = g.build_graph(5, None)
+    # （`tool_names=None` 表示"全部工具"，这里必须传 None 才能命中同一个缓存键）
+    first = g.build_graph(5, None)          # type: ignore[arg-type]
+    second = g.build_graph(5, None)         # type: ignore[arg-type]
     assert first is second, "这个前提不成立的话，本用例就测不到东西"
 
     tight = g.run("查磁盘", max_steps=5, deadline=time.time() - 1)

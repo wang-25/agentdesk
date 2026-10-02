@@ -22,6 +22,8 @@ from app.llm import PROJECT_ROOT
 
 _spec = importlib.util.spec_from_file_location(
     "eval_baseline_under_test", PROJECT_ROOT / "scripts" / "eval_baseline.py")
+assert _spec is not None and _spec.loader is not None, \
+    "门禁脚本必须存在且可导入 —— 找不到就说明路径变了"
 eb = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(eb)
 
