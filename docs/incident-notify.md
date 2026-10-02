@@ -159,6 +159,9 @@ NOTIFY_MASK=1             # 出站脱敏（默认开，见下）
 
 **没收到通知时的排查顺序**：
 
+0. **先跑一次自检**：`python scripts/notify_check.py` —— 它会按当前配置真发一条，
+   并把每个渠道的 HTTP 状态与**业务错误码**打出来（钉钉 `errcode` / 飞书 `code`）。
+   **HTTP 200 不等于发送成功**，这一步专治那种"看起来发出去了"的假象。
 1. `NOTIFY_CHANNELS` 是不是空的？（空 = 完全不出站，这是默认值）
 2. 渠道名拼错了？（`dingding` / `lark` / `wechat` 是高频拼错，会打印明确警告并跳过）
 3. 看 `notifications` 里的 `error`：签名错误、关键词不匹配、限流都在里面

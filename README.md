@@ -343,6 +343,7 @@ curl -H "X-API-Key: <你的令牌>" \
 .venv\Scripts\python.exe -m ruff check tests              # lint（当前只强制 tests/）
 .venv\Scripts\python.exe scripts\security_check.py        # 公网安全层 23 项
 .venv\Scripts\python.exe scripts\mcp_check.py             # MCP 协议层 9/9
+.venv\Scripts\python.exe scripts\notify_check.py          # 出站通知自检（没配通知时给配置指引）
 .venv\Scripts\python.exe scripts\eval_baseline.py         # 检索基线门禁（退化超容差即失败）
 ```
 
