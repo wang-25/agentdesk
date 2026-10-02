@@ -1,0 +1,23 @@
+{
+  "_comment": "检索基线。由 scripts/eval_baseline.py --update 生成。embedder 变了（例如从 local-hash 换成真 embedding）就该重新标定，否则门禁会拿旧后端的成绩去卡新后端。",
+  "generated_at": "2026-10-02T14:59:20",
+  "tolerance": 0.05,
+  "top_k": 8,
+  "total_questions": 32,
+  "embedder": {
+    "backend": "local",
+    "model": "local-hash",
+    "dim": 512
+  },
+  "metrics": {
+    "vector.recall": 0.9688,
+    "vector.recall.lexical": 0.9615,
+    "vector.recall.semantic": 1.0,
+    "bm25.recall": 1.0,
+    "bm25.recall.lexical": 1.0,
+    "bm25.recall.semantic": 1.0,
+    "hybrid.recall": 1.0,
+    "hybrid.recall.lexical": 1.0,
+    "hybrid.recall.semantic": 1.0
+  }
+}
