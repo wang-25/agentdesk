@@ -1,0 +1,51 @@
+{
+  "name": "service-down",
+  "title": "服务不可用（进程不在 / 端口不通）",
+  "description": "先确认服务是否真的挂了、挂在哪一层，再决定是否重启；重启是需要审批的写操作，并写明了它退不回什么。",
+  "applies_to": ["ServiceDown", "InstanceDown", "服务不可用"],
+  "steps": [
+    {
+      "id": "check_active",
+      "kind": "probe",
+      "run": "systemctl is-active nginx",
+      "expect": "输出不是 active",
+      "note": "is-active 的退出码本身就是答案，最适合机器判定；status 用来看细节（下一步）"
+    },
+    {
+      "id": "check_status",
+      "kind": "probe",
+      "run": "systemctl status nginx",
+      "note": "★ 注意：systemctl status 对已退出的服务返回非 0，这是它的正常行为，不代表本次探测失败"
+    },
+    {
+      "id": "check_journal",
+      "kind": "probe",
+      "run": "journalctl -u nginx -n 100",
+      "note": "看退出原因。这一步常常直接给出根因：端口被占 / 配置语法错 / 依赖服务没起来"
+    },
+    {
+      "id": "check_memory",
+      "kind": "probe",
+      "run": "free -m",
+      "expect": "可用内存低于总量的 10%",
+      "note": "OOM 杀进程是『服务自己消失』最常见的原因。不先看内存就重启，大概率会再挂一次"
+    },
+    {
+      "id": "approve_restart",
+      "kind": "action",
+      "run": "systemctl restart nginx",
+      "note": "★ 重启会短暂中断服务，所以它走审批：这一步必须有人点确认，剧本不会自动执行它",
+      "rollback": {
+        "none": true,
+        "reason": "重启失败时无法自动回退到重启前的运行状态（策略里也没有 systemctl start 这条命令）。若服务起不来，需要人工按 check_journal 查到的原因处理：改配置 / 释放端口 / 扩容"
+      }
+    },
+    {
+      "id": "verify",
+      "kind": "probe",
+      "run": "systemctl is-active nginx",
+      "expect": "输出是 active",
+      "note": "变更后复核：服务真的起来了才算处置完成"
+    }
+  ]
+}

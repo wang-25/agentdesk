@@ -1,0 +1,36 @@
+{
+  "name": "high-load",
+  "title": "负载异常升高（load average 高）",
+  "description": "全程只读的排查流程。定位到具体进程之后的处置不在剧本里 —— 那需要人根据业务判断，写死成步骤反而危险。",
+  "applies_to": ["LoadHigh", "HighLoad", "负载过高"],
+  "steps": [
+    {
+      "id": "check_load",
+      "kind": "probe",
+      "run": "uptime",
+      "expect": "15 分钟负载明显高于平时",
+      "on_pass": "check_memory",
+      "on_fail": "check_memory",
+      "note": "load 要和核数比才有意义。手边没有白名单里的取核数命令，所以这里只记录原始值供人判断"
+    },
+    {
+      "id": "check_memory",
+      "kind": "probe",
+      "run": "free -m",
+      "expect": "可用内存低于总量的 10%",
+      "note": "内存不足会引起换页，表现同样是负载高 —— 值得先排除"
+    },
+    {
+      "id": "check_disk",
+      "kind": "probe",
+      "run": "df -h",
+      "note": "磁盘写满或 IO 打满也会推高负载"
+    },
+    {
+      "id": "check_logs",
+      "kind": "probe",
+      "run": "du -sh /var/log",
+      "note": "★ 到这里为止全是只读。定位到具体进程之后的处置（重启 / 限流 / 扩容）**刻意不写进剧本** —— 那需要人结合业务判断；写死了反而会在不该重启的时候被人照着执行"
+    }
+  ]
+}

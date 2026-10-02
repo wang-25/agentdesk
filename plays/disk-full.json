@@ -1,0 +1,50 @@
+{
+  "name": "disk-full",
+  "title": "磁盘写满（No space left on device）",
+  "description": "先判断是『真的写满了』还是『空间被删掉的文件占着』——这两条路的处置完全不同，所以这里必须有分叉。",
+  "applies_to": ["DiskSpaceLow", "NoSpaceLeft", "磁盘使用率过高"],
+  "steps": [
+    {
+      "id": "check_usage",
+      "kind": "probe",
+      "run": "df -h",
+      "expect": "有分区的已用比例 ≥ 90%",
+      "on_pass": "find_big_dir",
+      "on_fail": "check_deleted",
+      "note": "★ 这个分叉是这张剧本存在的理由：容量看着不高却报 No space left，是另一种故障（见 check_deleted）"
+    },
+    {
+      "id": "find_big_dir",
+      "kind": "probe",
+      "run": "du -sh /var/log",
+      "expect": "/var/log 占用超过 1GB",
+      "on_pass": "propose_truncate",
+      "on_fail": "check_deleted",
+      "note": "★ 这个判定不是走形式：只有日志真的是大头，截断它才有意义。否则去查另一种可能（空间被删掉的文件占着）"
+    },
+    {
+      "id": "propose_truncate",
+      "kind": "action",
+      "run": "truncate -s 0 /var/log/nginx/error.log",
+      "note": "★ 用 truncate 而不是 rm：rm 被策略禁止（删除不可恢复）；而且删掉正在写的日志后，进程会继续往已删除的 inode 写，空间根本不会释放 —— 这一点正是下面 check_deleted 那条路在查的",
+      "rollback": {
+        "none": true,
+        "reason": "被截断的日志内容无法恢复。执行前应先确认该日志已归档或不再需要；要保留就先复制出去再截断"
+      }
+    },
+    {
+      "id": "check_deleted",
+      "kind": "probe",
+      "run": "lsof +L1",
+      "expect": "列出了已删除但仍被进程占用的文件",
+      "note": "★ 经典陷阱：`rm` 掉一个被进程打开着的大日志，`df` 看起来没变化，但空间一直不释放。**处置办法是重启持有它的进程**（或让它重开日志）—— 那属于写操作，交人工判断，不写进剧本"
+    },
+    {
+      "id": "verify",
+      "kind": "probe",
+      "run": "df -h",
+      "expect": "使用率降到 80% 以下",
+      "note": "没有复核的处置不算完成"
+    }
+  ]
+}
