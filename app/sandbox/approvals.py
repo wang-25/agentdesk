@@ -65,6 +65,7 @@ import os
 import secrets
 import threading
 import time
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -78,7 +79,93 @@ CONSUMED = "consumed"      # 已执行完毕（**一次性，不能重放**）
 EXPIRED = "expired"        # 超时未处理
 
 DEFAULT_TTL_SECONDS = 30 * 60      # 30 分钟。够一个人看到，又不至于挂一整天
-MAX_RECORDS = 500                  # 内存里最多保留多少条（防止日志无限增长拖慢启动）
+MAX_RECORDS = None                 # 已废弃：见下面模块级的说明
+
+# ★ 关于内存上限（这个常量以前是**骗人的**）
+#
+#   这里原本写着 `MAX_RECORDS = 500`，注释声称"内存里最多保留多少条
+#   （防止日志无限增长拖慢启动）"—— 但**全仓库零引用**。
+#   也就是说：注释承诺了一个上限，代码里根本没有这个上限，
+#   审批单的内存是随着历史单调增长的。
+#
+#   **一个说了不做的常量比没有这个常量更糟**：读代码的人会据此认为
+#   "内存是有界的"，于是不去做轮转、不去看增长。
+#   所以现在如实留成 None 并写明事实：
+#
+#     · 审批单内存 = O(全部历史)。审批是**审计物**，截断会让历史单查不到，
+#       所以正确的做法不是"在内存里丢旧的"，而是**轮转 logs/approvals.jsonl**
+#       （由运维侧按保留期处理，与 traces/audit 同一套办法）。
+#     · 真正需要"有界"的是告警去重表（那是高频写入，
+#       见 app/alerting/aggregator.py 的 TTL + 容量上限）。
+#   `MAX_RECORDS` 这个名字保留下来只为兼容既有引用，值恒为 None。
+
+
+class _FileLock:
+    """跨进程互斥锁：用 `O_CREAT|O_EXCL` 抢一个锁文件。
+
+    【为什么不用 fcntl.flock 或 msvcrt.locking】
+    这个项目**开发在 Windows、部署在 Linux**：
+      · `fcntl` 在 Windows 上不存在；
+      · `msvcrt.locking` 只在 Windows 上有，而且锁的是字节区间，语义窄。
+    `os.open(..., O_CREAT|O_EXCL)` 两边都是**原子**的，用它抢锁是同一个语义，
+    而且**不需要引入任何新依赖**（requirements.txt 要保持 9 个）。
+
+    【为什么必须处理"陈旧锁"】
+    "抢锁的进程崩了"是必然会发生的事（kill -9、断电、容器被 OOM 杀掉）。
+    如果不认陈旧锁，那个锁文件会**永久**挡住后续所有审批 ——
+    一个会把系统锁死的保护机制，比没有保护更糟。
+    所以锁文件超过 `stale_after` 秒没被动过，就视为陈旧、允许接管。
+
+    【代价说清楚】
+    `stale_after` 必须显著大于临界区耗时（这里临界区只有"重读日志 + 追加一行"，
+    毫秒级），否则会把一个正在干活的进程的锁抢走 —— 那正好会造成我们
+    想避免的双执行。取 60s 是"慢机器也够、又不会真的卡住一小时"的折中。
+    """
+
+    def __init__(self, path: Path, stale_after: float = 60.0,
+                 timeout: float = 10.0, poll: float = 0.05):
+        self.path = Path(path)
+        self.stale_after = stale_after
+        self.timeout = timeout
+        self.poll = poll
+
+    def _is_stale(self) -> bool:
+        try:
+            return (time.time() - self.path.stat().st_mtime) > self.stale_after
+        except OSError:
+            return False
+
+    def _break(self) -> None:
+        try:
+            self.path.unlink()
+        except OSError:
+            pass
+
+    def __enter__(self):
+        deadline = time.time() + self.timeout
+        while True:
+            try:
+                fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                try:
+                    os.write(fd, f"{os.getpid()} {time.time()}".encode("ascii"))
+                finally:
+                    os.close(fd)
+                return self
+            except FileExistsError:
+                if self._is_stale():
+                    self._break()          # 接管陈旧锁
+                    continue
+                if time.time() >= deadline:
+                    # from None：把 FileExistsError 从因果链里摘掉 ——
+                    # 对调用方有意义的是"存储被占用"，而不是"os.open 撞了 EEXIST"。
+                    raise ApprovalError(
+                        "审批单存储正被另一个进程占用（可能是另一个实例在处理），"
+                        "请稍后重试") from None
+                time.sleep(self.poll)
+
+    def __exit__(self, *exc):
+        self._break()
+        return False
 
 
 def _now() -> str:
@@ -105,7 +192,13 @@ class ApprovalStore:
     def __init__(self, path: Path = None):
         self.path = Path(path) if path else (PROJECT_ROOT / "logs" / "approvals.jsonl")
         self._lock = threading.RLock()
+        # 跨进程锁：与线程锁是两件事，都要有。
+        #   线程锁管住"同一进程内的并发请求"（FastAPI 同步接口跑在线程池里）；
+        #   文件锁管住"两个进程各持一张 APPROVED 各执行一次"——
+        #   **后者是审计里 C2 那条真实缺陷**，光有线程锁挡不住。
+        self._file_lock = _FileLock(self.path.with_suffix(self.path.suffix + ".lock"))
         self._records = {}          # id -> record（折叠后的当前状态）
+        self._stamp = None          # 上次读到的 (mtime_ns, size)，用于"别的进程改过就重读"
         self._load()
 
     # ---------- 持久化 ----------
@@ -119,6 +212,7 @@ class ApprovalStore:
           挂着一堆早就该死的单子，值班的人看到的是脏数据。
         """
         if not self.path.exists():
+            self._stamp = None
             return
         try:
             with open(self.path, encoding="utf-8") as f:
@@ -132,9 +226,49 @@ class ApprovalStore:
                         # 只跳过坏的那一行，不要因为一行坏了丢掉整份历史
                         continue
                     self._apply(ev)
+            self._stamp = self._stat_stamp()
         except OSError:
             pass
         self._expire_locked()
+
+    # ---------- 跨进程一致性 ----------
+    def _stat_stamp(self):
+        """日志的 (mtime_ns, size)。用来判断"别的进程改过没有"。"""
+        try:
+            st = self.path.stat()
+            return (st.st_mtime_ns, st.st_size)
+        except OSError:
+            return None
+
+    def _reload_if_changed(self) -> bool:
+        """日志被**别的进程**改过就重新折叠一遍。
+
+        ★ 这是 C2 的另一半。光有文件锁不够 ——
+          锁只保证"同一时刻只有一个人写"，但如果我内存里的状态是
+          **昨天折叠**的，我今天拿着它做判断，照样会把一张已被别的进程
+          消费过的单子再消费一次。**判定必须基于最新的事实。**
+        """
+        stamp = self._stat_stamp()
+        if stamp is None or stamp == self._stamp:
+            return False
+        with self._lock:
+            self._records.clear()
+            self._load()
+        return True
+
+    @contextmanager
+    def _mutating(self):
+        """所有会改状态的入口都走这里：**先拿跨进程锁，再重新折叠，再判定+写入**。
+
+        顺序不能变：
+          拿锁 → 重读最新事实 → 判定 → 追加 → 放锁
+        中间任何一步挪到锁外面，就等于把"检查"和"使用"分开了 ——
+        那正是 TOCTOU 的定义。
+        """
+        with self._file_lock:
+            self._reload_if_changed()
+            with self._lock:
+                yield
 
     def _append(self, event: dict) -> None:
         """追加一条事件。先落盘再更新内存 —— 顺序反了的话，
@@ -151,11 +285,18 @@ class ApprovalStore:
           表现是：接口返回的 `created_at: null`、`list()` 按 `created_at or ""`
           排序时同一批单子顺序随机；一重启就"自愈"，所以极难复现。
           **同一份数据有两个来源时，两个来源必须拿到同一个值。**
+
+        ★ `flush + fsync`：写文件的"成功返回"只代表进了内核缓冲，
+          不代表落了盘。审批这件事上"以为记下了、其实没有"的代价是
+          **重放保护失效**（重启后那条 consumed 不见了），所以这里明确落盘。
         """
         self.path.parent.mkdir(parents=True, exist_ok=True)
         event.setdefault("ts", _now())
         with open(self.path, "a", encoding="utf-8") as f:
             f.write(json.dumps(event, ensure_ascii=False) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        self._stamp = self._stat_stamp()
 
     def _apply(self, ev: dict) -> None:
         """一条事件 folding 进状态。"""
@@ -184,8 +325,14 @@ class ApprovalStore:
             # consumed / rejected / expired 是终态。
             # **终态必须不可逆**，否则"已执行的单子又被驳回"这种人话说不通的状态
             # 就会出现，而且审计上是灾难。
+            #
+            # ★ 例外：`executed` 不是状态迁移，而是对一条**已消费**记录的
+            #   "补充事实"。终态锁住的是**状态**，不是**事实** ——
+            #   执行结果只能在执行之后才知道，如果这里把它挡掉，
+            #   审批记录就会永远停在那个乐观的 result_ok=True 上（审计里的 C4）。
             if rec["status"] not in (PENDING, APPROVED):
-                return
+                if not (kind == "executed" and rec["status"] == CONSUMED):
+                    return
             if kind == "approved":
                 rec["status"] = APPROVED
                 rec["approved_by"] = ev.get("by")
@@ -200,9 +347,21 @@ class ApprovalStore:
                 rec["status"] = CONSUMED
                 rec["consumed_at"] = ev.get("ts")
                 rec["consumed_by"] = ev.get("by")
+                # 这是**乐观占位**（写于执行之前），真正的结果由后面的
+                # executed 事件覆盖。字段名不变，语义见 record_result 的说明。
                 rec["result_ok"] = ev.get("ok")
+                rec["result_provisional"] = True
+            elif kind == "executed":
+                rec["executed_at"] = ev.get("ts")
+                rec["result_ok"] = ev.get("ok")
+                rec["result_provisional"] = False
+                rec["exit_code"] = ev.get("exit_code")
+                rec["elapsed_ms"] = ev.get("elapsed_ms")
+                rec["result_error"] = ev.get("error", "")
             elif kind == "expired":
                 rec["status"] = EXPIRED
+                rec["expired_at"] = ev.get("ts")
+                rec["expired_reason"] = ev.get("reason", "")
             else:
                 return
             rec["history"].append({"ts": ev.get("ts"), "event": kind,
@@ -213,7 +372,7 @@ class ApprovalStore:
                isolation: str, reason: str, source: str = "agent",
                question: str = "", tool: str = "run_command",
                ttl: int = DEFAULT_TTL_SECONDS) -> dict:
-        with self._lock:
+        with self._mutating():
             rid = "ap-" + secrets.token_hex(4)
             expires_at = (datetime.now() + timedelta(seconds=ttl)
                           ).isoformat(timespec="seconds")
@@ -263,14 +422,15 @@ class ApprovalStore:
             try:
                 if datetime.fromisoformat(rec["expires_at"]) < now:
                     rec["status"] = EXPIRED
-                    self._append({"event": "expired", "id": rec["id"]})
+                    self._append({"event": "expired", "id": rec["id"],
+                                  "reason": "无人处理，超过有效期自动过期"})
                     n += 1
             except (ValueError, TypeError):
                 continue
         return n
 
     def approve(self, rid: str, by: str, note: str = "") -> dict:
-        with self._lock:
+        with self._mutating():
             rec = self.get(rid)
             if rec["status"] != PENDING:
                 raise ApprovalError(
@@ -285,7 +445,7 @@ class ApprovalStore:
             return dict(self._records[rid])
 
     def reject(self, rid: str, by: str, note: str = "") -> dict:
-        with self._lock:
+        with self._mutating():
             rec = self.get(rid)
             if rec["status"] != PENDING:
                 raise ApprovalError(
@@ -300,7 +460,7 @@ class ApprovalStore:
                 by: str = "system", ok: bool = True) -> dict:
         """消费（执行）一张已批准的审批单。**单次使用。**
 
-        ★ 这里做两件防重放 / 防篡改的事：
+        ★ 这里做三件防重放 / 防篡改的事：
 
           1. **指纹比对**。执行前重新算一遍命令指纹，跟审批时记下的比对。
              不一致 → 拒绝执行 + 报错。这是防 TOCTOU ——
@@ -315,8 +475,13 @@ class ApprovalStore:
              第二条 consume 会撞在 "当前状态是 consumed" 上。
              **"已执行的审批单被重放"是这类系统最典型的漏洞** ——
              一次批准执行一百次，审批就形同虚设了。
+
+          3. **整个判定到写入都在跨进程锁里，且基于最新折叠的状态**（C2）。
+             光有状态机不够：两个进程各持一张 APPROVED 时，
+             状态机在各自的进程里都是"合法的"。
+             真正的互斥只能由**文件锁 + 重新折叠**提供。
         """
-        with self._lock:
+        with self._mutating():
             rec = self.get(rid)
 
             if expected_fingerprint and rec.get("fingerprint") != expected_fingerprint:
@@ -334,7 +499,97 @@ class ApprovalStore:
                 raise ApprovalError(
                     f"审批单状态是 {rec['status']}，必须先批准才能执行")
 
+            # ★ 有效期校验放在**状态机里**，不只放在接口的预检里。
+            #   理由是项目反复出现的那条原则：**约束要放在绕不过去的那一层。**
+            #   接口层可以被绕过（写个脚本直接调 store），
+            #   状态机绕不过去。check_executable 只是把同一个判定提前、
+            #   好给调用方一个更友好的错误，它不是唯一的关口。
+            if self._is_expired(rec):
+                expired_ev = {
+                    "event": "expired", "id": rid,
+                    "reason": f"到执行时已超过有效期（{rec.get('expires_at')}）"}
+                self._append(expired_ev)
+                self._apply(expired_ev)
+                raise ApprovalError(
+                    f"这张审批单已超过有效期（{rec.get('expires_at')}），拒绝执行。"
+                    f"需要执行请重新提交审批 —— 一条三天前批准的命令，"
+                    f"今天的环境已经和当时不是同一回事了")
+
             ev = {"event": "consumed", "id": rid, "by": by, "ok": ok}
+            self._append(ev)
+            self._apply(ev)
+            return dict(self._records[rid])
+
+    # ---------- 执行前的完整校验 / 执行后的结果回写（M3 C3、C4） ----------
+    def check_executable(self, rid: str, *, expected_fingerprint: str = None) -> dict:
+        """执行前的**全部**校验：存在 / 已批准 / 未过期 / 指纹一致。
+
+        抽成一个方法是为了让"能执行"这件事只有一个定义 ——
+        接口层不再自己拼一套判断（那边少判一条就是一个漏洞）。
+
+        过期 → 顺带把单子折叠成 `expired` 并留下理由（C3，用户选定方案 A：
+        **过期就拒绝**，需要时重新开票。这正是 TTL 该有的摩擦）。
+        """
+        with self._mutating():
+            rec = self.get(rid)
+
+            if rec["status"] == EXPIRED:
+                raise ApprovalError(
+                    f"这张审批单已过期（{rec.get('expires_at')}），不能执行。"
+                    f"过期原因：{rec.get('expired_reason') or '超过有效期'}")
+            if rec["status"] == CONSUMED:
+                raise ApprovalError(
+                    f"这张审批单已经执行过了（{rec.get('consumed_at')}），"
+                    f"不能重复执行")
+            if rec["status"] != APPROVED:
+                raise ApprovalError(
+                    f"审批单状态是 {rec['status']}，必须先批准才能执行")
+
+            if self._is_expired(rec):
+                ev = {"event": "expired", "id": rid,
+                      "reason": f"到执行时已超过有效期（{rec.get('expires_at')}）"}
+                self._append(ev)
+                self._apply(ev)
+                raise ApprovalError(
+                    f"这张审批单已超过有效期（{rec.get('expires_at')}），拒绝执行。"
+                    f"需要执行请重新提交审批 —— 一条三天前批准的命令，"
+                    f"今天的环境已经和当时不是同一回事了")
+
+            if expected_fingerprint and rec.get("fingerprint") != expected_fingerprint:
+                raise ApprovalError(
+                    f"命令指纹不匹配，拒绝执行。"
+                    f"审批时是 {rec.get('fingerprint')}，"
+                    f"现在要执行的是 {expected_fingerprint}。")
+            return rec
+
+    @staticmethod
+    def _is_expired(rec: dict) -> bool:
+        try:
+            return datetime.fromisoformat(rec["expires_at"]) < datetime.now()
+        except (KeyError, TypeError, ValueError):
+            # 时间戳坏了 → **不当作过期**：宁可多执行一次人工已批准的命令，
+            # 也不要因为一个坏字段把正常审批卡死（那是可用性事故）。
+            return False
+
+    def record_result(self, rid: str, *, ok: bool, exit_code=None,
+                      elapsed_ms=None, error: str = "",
+                      by: str = "system") -> dict:
+        """执行完成后**回写真实结果**（C4）。
+
+        ★ 为什么不在 consume 时写：
+          `consume` 是防重放的闸门，**必须发生在执行之前**
+          （反过来的话"执行成功但消费失败"会导致重复执行 —— 那个代价更大）。
+          所以那条路写下的 `ok` 只是**乐观占位**，它不知道执行结果。
+
+          代价就是审计里那条 C4：`approvals.jsonl` 里的 `result_ok`
+          可能写着成功而实际失败。修法不是颠倒顺序（那会打开重放的洞），
+          而是执行完再追加一条 `executed` 事件把真值补上，折叠时以最后一条为准。
+        """
+        with self._mutating():
+            self.get(rid)          # 存在性检查：不存在的单子不该被写成"执行过"
+            ev = {"event": "executed", "id": rid, "by": by, "ok": bool(ok),
+                  "exit_code": exit_code, "elapsed_ms": elapsed_ms,
+                  "error": error}
             self._append(ev)
             self._apply(ev)
             return dict(self._records[rid])
