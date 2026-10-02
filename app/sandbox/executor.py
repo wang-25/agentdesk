@@ -34,10 +34,11 @@ auto 模式下如果探测不到 docker，**默认落到 mock，绝不悄悄降�
 所以这里宁可功能不可用，也不静默降级。
 """
 
-import json
 import os
 import shutil
+import signal
 import subprocess
+import tempfile
 import time
 from dataclasses import dataclass, field
 
@@ -56,6 +57,17 @@ from app.sandbox.policy import (
 _BACKEND_ENV = (os.getenv("SANDBOX_BACKEND") or "auto").strip().lower()
 SANDBOX_IMAGE = (os.getenv("SANDBOX_IMAGE") or "alpine:3.20").strip()
 DOCKER_BIN = (os.getenv("SANDBOX_DOCKER_BIN") or "docker").strip()
+
+# ---- 超时回收（C6）用的常量 ----
+TASKKILL_BIN = "taskkill"
+# Windows 上 signal 模块**没有 SIGKILL 这个属性**，取不到就退回 9。
+# Windows 分支根本不用它（走 taskkill /T /F），留着只是让 POSIX 分支
+# 在所有平台上都能被读到（也让它能被单测直接引用）。
+SIGKILL = getattr(signal, "SIGKILL", 9)
+# 回收动作自己的超时。回收是为了"能停下来"，它自己不能反过来把执行挂住。
+RECLAIM_TIMEOUT = 10
+# 容器通道的 cidfile 前缀（临时文件，超时回收靠它拿容器 id）
+CIDFILE_PREFIX = "agentdesk-cid-"
 
 
 def _docker_available() -> bool:
@@ -158,7 +170,7 @@ def _clip(text: str) -> tuple:
 # ============================================================
 # 这份模板是**代码里的常量**，跟模型无关。
 # 模型能决定的只有最后那一段 argv —— 而那一段已经过白名单校验。
-def docker_argv(decision: Decision, image: str = None) -> list:
+def docker_argv(decision: Decision, image: str = None, cidfile: str = None) -> list:
     """把一条决策翻译成 docker run 参数。
 
     每一行限制都在挡一类具体的事，不是凑数的：
@@ -177,6 +189,10 @@ def docker_argv(decision: Decision, image: str = None) -> list:
       --security-opt no-new-privileges  禁止提权（setuid 程序也提不上去）
       --user 65534:65534        用 nobody 跑，不是 root
       --workdir /tmp            进到唯一可写的地方
+
+      --cidfile <文件>          让 docker 把容器 id 写进这个文件（只有传了才加）。
+                                超时回收要靠它：杀掉 docker CLI **不等于**容器没了，
+                                得凭这个 id 去 `docker rm -f`（见下面"三·A"一节）。
 
     ★ 这些参数的存在，就是为了保证**即使命令是恶意的，破坏范围也有上界**。
       沙箱的目标从来不是"挡住所有攻击"，是"让最坏情况可控"。
@@ -199,6 +215,8 @@ def docker_argv(decision: Decision, image: str = None) -> list:
         "--security-opt", "no-new-privileges",
         "--user", "65534:65534",
         "--workdir", "/tmp",
+        # ---- 超时回收：容器 id 落盘，超时后才找得到那个容器 ----
+        *(["--cidfile", cidfile] if cidfile else []),
         # ---- 挂载（由策略决定，不由调用方决定）----
         *mounts,
         # ---- 镜像与命令 ----
@@ -207,40 +225,284 @@ def docker_argv(decision: Decision, image: str = None) -> list:
     ]
 
 
-def _run_docker(decision: Decision) -> ExecResult:
-    argv = docker_argv(decision)
-    started = time.time()
-    try:
-        proc = subprocess.run(
-            argv, shell=False, timeout=decision.timeout,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, encoding="utf-8", errors="replace",
-        )
-    except subprocess.TimeoutExpired:
-        return ExecResult(
-            ok=False, backend="docker", isolated=True, command=decision.command,
-            argv=decision.argv, container_argv=argv,
-            elapsed_ms=int((time.time() - started) * 1000),
-            error=f"容器执行超时（{decision.timeout}s），已强制终止",
-        )
-    except FileNotFoundError:
-        return ExecResult(
-            ok=False, backend="docker", isolated=True, command=decision.command,
-            argv=decision.argv, container_argv=argv,
-            error=f"找不到 {DOCKER_BIN} —— 装了 Docker 之后再试",
-        )
+# ============================================================
+# 三·A、超时回收（C6）：把"停下来"这件事**做完**
+# ============================================================
+# 【为什么原来的超时不算"停下来了"】
+# 超时只杀掉**直接子进程**（或 docker CLI）时，真实情况往往是：
+#
+#     $ sh -c "sleep 600 &"        ← 被超时杀掉的是最外层那一个
+#     $ ps -ef | grep sleep        ← 真正占资源的孙进程还活着
+#
+#     $ docker run ...             ← docker CLI 被杀了
+#     $ docker ps                  ← 容器还在跑（CLI 死了它并不跟着死）
+#
+# 更糟的是**没有任何信号**告诉调用方"还有东西在跑"：ExecResult 上写着
+# "已终止"，机器上却留着进程和容器。这跟 fail-open 是同一类错误 ——
+# 看起来做了，实际没做，而且看不出来。
+#
+# ★ 所以"回收"要完整地做两件事：
+#     ① 杀**整个进程组**（不是单个进程）—— 前提是子进程自成一组
+#        （Popen(start_new_session=True)），否则 getpgid(pid) 拿到的
+#        很可能是**我们自己**的进程组，killpg 等于自杀
+#     ② **等它真的死掉**（wait()）—— 否则留下僵尸，pid 也回收不了
+#   容器通道同理：杀 docker CLI ≠ 容器没了，得凭 cidfile 里的 id
+#   `docker rm -f` 把它删掉，而且**顺序是先删容器、再杀 CLI**。
+def _on_windows() -> bool:
+    """当前是不是 Windows。
 
-    out, t1 = _clip(proc.stdout)
-    err, t2 = _clip(proc.stderr)
-    return ExecResult(
-        ok=proc.returncode == 0, backend="docker", isolated=True,
-        command=decision.command, argv=decision.argv, container_argv=argv,
-        exit_code=proc.returncode, stdout=out, stderr=err,
-        elapsed_ms=int((time.time() - started) * 1000),
-        truncated=t1 or t2,
-        error="" if proc.returncode == 0
-              else f"命令以退出码 {proc.returncode} 结束",
-    )
+    单独抽成函数，是为了让**两条回收路径都能被测到**：否则在 Windows 上
+    永远测不到 killpg 那条、在 Linux 上永远测不到 taskkill 那条 ——
+    而两条路径出事的代价是一样的（真出事时才发现没测过）。
+    """
+    return os.name == "nt"
+
+
+def _terminate(proc) -> None:
+    """兜底：杀单个进程（拿不到进程组、或进程组已经消失时用）。"""
+    try:
+        proc.kill()
+    except Exception:
+        pass
+
+
+def _helper_env() -> dict:
+    """**回收类辅助命令**（taskkill / docker rm -f）用的环境。
+
+    ★ 它们跟"被沙箱执行的命令"不是一回事：被执行的命令属于**沙箱对象**，
+      所以环境必须最小（见 `_run_host`）；而杀进程、删容器是**我们自己的工具**，
+      作用对象是宿主机。所以这里在最小环境之上只补一个操作系统必需的键，
+      而不是把父进程环境整个合并回来：
+
+        · Windows 的 `SystemRoot` —— 实测少了它 `taskkill` **根本起不来**：
+              ERROR: The specified module could not be found.
+          回收会静默失败（更糟的是后面 wait() 永远等不到，见 `_reap`）。
+          这是操作系统要的变量，不是我们要的。
+    """
+    env = policy.command_env()
+    if _on_windows():
+        env["SystemRoot"] = (os.environ.get("SystemRoot")
+                             or os.environ.get("windir") or r"C:\Windows")
+    return env
+
+
+def _kill_process_group(proc) -> None:
+    """杀掉**整个进程组**，含子孙进程。
+
+    ★ 这个函数的正确性与 `start_new_session=True` 是绑在一起的：
+      没建新会话时，子进程的 pgid 通常就是父进程（我们自己）的 pgid，
+      `killpg` 会把我们自己也杀掉。调用点都是 Popen(start_new_session=True)。
+    """
+    pid = getattr(proc, "pid", None)
+    if not pid:
+        _terminate(proc)
+        return
+
+    if _on_windows():
+        # Windows 没有"给进程组发信号"这回事：taskkill /T 连子孙一起，
+        # /F 强杀。/PID 指到直接子进程，它就是整棵树的根。
+        try:
+            subprocess.run(
+                [TASKKILL_BIN, "/T", "/F", "/PID", str(pid)],
+                shell=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=RECLAIM_TIMEOUT, check=False, env=_helper_env(),
+            )
+        except Exception:
+            _terminate(proc)
+        return
+
+    try:
+        os.killpg(os.getpgid(pid), SIGKILL)
+    except OSError:
+        # 进程组已经不在了（自己退出了）或没有权限。
+        # ★ 这里**不能**让异常炸出去：超时本身已经是失败路径，
+        #   再抛一个异常会把"超时"变成"崩了"，调用方连失败原因都拿不到。
+        _terminate(proc)
+
+
+def _reap(proc) -> bool:
+    """等被杀掉的子进程真正结束（wait），避免留下僵尸。返回是否确认收到了尸。
+
+    ★ **必须带超时。** 回收是为了"能停下来"；如果杀不掉还无限 `wait()`，
+      就变成了另一种"停不下来" —— 而且比原来更糟：原来只是资源泄漏，
+      现在连调用方都一起挂死。
+      实测过：Windows 上 `taskkill` 环境不对时它立刻返回失败，
+      此时**无超时的 `wait()` 会把执行进程永远挂住**。
+
+      等不到就退回直接 kill 再等一次；还是等不到就如实返回 False，
+      由调用方把"没确认退出"写进错误信息（不假装回收成功）。
+    """
+    try:
+        proc.wait(timeout=RECLAIM_TIMEOUT)
+        return True
+    except subprocess.TimeoutExpired:
+        _terminate(proc)
+        try:
+            proc.wait(timeout=RECLAIM_TIMEOUT)
+            return True
+        except Exception:
+            return False
+    except Exception:
+        return False
+
+
+def _close_pipes(proc) -> None:
+    """关掉管道。超时路径不再读输出了，留着 fd 会一路泄漏到进程结束。"""
+    for name in ("stdin", "stdout", "stderr"):
+        stream = getattr(proc, name, None)
+        try:
+            if stream is not None:
+                stream.close()
+        except Exception:
+            pass
+
+
+def _new_cidfile_path() -> str:
+    """给 `docker run --cidfile` 造一个**尚不存在**的独占路径。
+
+    为什么先建再删：`--cidfile` 指向的文件必须还不存在
+    （Docker 见到已存在的 cidfile 会拒绝启动 —— 那是它防止"认错容器"的机制）。
+    而 `mkstemp` 保证名字唯一、不撞车；建完删掉，路径依然是独占的。
+    """
+    fd, path = tempfile.mkstemp(prefix=CIDFILE_PREFIX, suffix=".cid")
+    os.close(fd)
+    os.unlink(path)
+    return path
+
+
+def _discard_cidfile(path: str) -> None:
+    """删掉 cidfile。成功、超时、异常 —— 三条路都要删（放在 finally 里）。"""
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def _read_cidfile(path: str) -> str:
+    """读 cidfile 里的容器 id。读不到（容器还没起来）就返回空串。"""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            cid = fh.read().strip()
+    except OSError:
+        return ""
+
+    # ★ 校验不是形式主义：这个值会被放到 `docker rm -f <值>` 的**参数位**上。
+    #   cidfile 是我们自己造的临时文件，但"内容来自文件"就该拦一道 ——
+    #   一个以 `-` 开头的值会被 docker 当成**选项**而不是容器 id
+    #   （这就是参数注入的经典形态：问题不是"拼字符串"，是数据被当成了指令）。
+    if not cid or len(cid) > 128 or cid.startswith("-") or any(c.isspace() for c in cid):
+        return ""
+    return cid
+
+
+def _remove_container(container_id: str) -> bool:
+    """超时后强制删掉容器：`docker rm -f <id>`。
+
+    返回是否成功 —— 回收失败必须**说出来**，而不是假装回收了
+    （这正是 C6 的教训：看起来做了、实际没做，且看不出来）。
+    """
+    try:
+        done = subprocess.run(
+            [DOCKER_BIN, "rm", "-f", container_id],
+            shell=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=RECLAIM_TIMEOUT, check=False, env=_helper_env(),
+        )
+    except Exception:
+        return False
+    return getattr(done, "returncode", 0) == 0
+
+
+def _run_docker(decision: Decision) -> ExecResult:
+    """容器通道执行。
+
+    超时的回收顺序是**先删容器、再杀 CLI**：
+    反过来的话，CLI 一死就没人再告诉我们容器 id（cidfile 是 docker 在
+    容器启动那一刻写的），容器会成为孤儿一直跑下去 —— 那正是 C6 描述的现象。
+
+    ★ 为什么这里**不**把 `decision.argv[0]` 也解析成宿主机的绝对路径（C1）：
+      容器里那条命令是由**镜像自己的 PATH** 解析的，宿主机的 PATH 与它无关；
+      把宿主机的 `/usr/bin/truncate` 塞进容器，换个镜像就可能根本不存在 ——
+      那是把隔离改坏，不是改好。这个通道里**真正由宿主机 PATH 解析**的是
+      docker CLI 自己（`DOCKER_BIN`）：它的固定化不在本次范围内，
+      因为它会让"开发在 Windows、部署在 Linux"里的 Windows 开发机直接
+      失去容器通道（POSIX 固定目录里找不到 docker.exe）。
+    """
+    started = time.time()
+    cid_path = _new_cidfile_path()
+    argv = docker_argv(decision, cidfile=cid_path)
+
+    try:
+        try:
+            proc = subprocess.Popen(
+                argv, shell=False,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, encoding="utf-8", errors="replace",
+                env=policy.command_env(),
+                # 自成一组，超时才能整组回收（见 _kill_process_group）。
+                # 它只影响 docker CLI 自己的会话，不影响容器里的进程
+                # （我们没有用 -i / -t，CLI 不需要终端）。
+                start_new_session=True,
+            )
+        except FileNotFoundError:
+            return ExecResult(
+                ok=False, backend="docker", isolated=True, command=decision.command,
+                argv=decision.argv, container_argv=argv,
+                elapsed_ms=int((time.time() - started) * 1000),
+                error=f"找不到 {DOCKER_BIN} —— 装了 Docker 之后再试",
+            )
+        except OSError as e:
+            return ExecResult(
+                ok=False, backend="docker", isolated=True, command=decision.command,
+                argv=decision.argv, container_argv=argv,
+                elapsed_ms=int((time.time() - started) * 1000),
+                error=f"启动 {DOCKER_BIN} 失败：{e}",
+            )
+
+        try:
+            stdout, stderr = proc.communicate(timeout=decision.timeout)
+        except subprocess.TimeoutExpired:
+            # ---- 超时回收（C6）----
+            container_id = _read_cidfile(cid_path)
+            removed = _remove_container(container_id) if container_id else False
+
+            _kill_process_group(proc)
+            reaped = _reap(proc)
+            _close_pipes(proc)
+
+            if not container_id:
+                detail = "cidfile 里还没有容器 id（容器可能没起来），已终止 docker CLI"
+            elif removed:
+                detail = f"已 `{DOCKER_BIN} rm -f {container_id}` 删掉容器，并终止 docker CLI"
+            else:
+                detail = (f"`{DOCKER_BIN} rm -f {container_id}` 返回失败，"
+                          f"容器可能仍在运行，请人工核实 `{DOCKER_BIN} ps -a`；"
+                          f"docker CLI 已终止")
+            if not reaped:
+                # ★ 不假装回收成功：wait 没等到就如实说，让人去核实
+                detail += "；⚠️ 未能在限时内确认 docker CLI 已退出，可能仍有残留"
+
+            return ExecResult(
+                ok=False, backend="docker", isolated=True, command=decision.command,
+                argv=decision.argv, container_argv=argv,
+                elapsed_ms=int((time.time() - started) * 1000),
+                error=(f"容器执行超时（timeout={decision.timeout}s），"
+                       f"已回收（reclaim）：{detail}；临时 cidfile 已清理。"),
+            )
+
+        out, t1 = _clip(stdout)
+        err, t2 = _clip(stderr)
+        return ExecResult(
+            ok=proc.returncode == 0, backend="docker", isolated=True,
+            command=decision.command, argv=decision.argv, container_argv=argv,
+            exit_code=proc.returncode, stdout=out, stderr=err,
+            elapsed_ms=int((time.time() - started) * 1000),
+            truncated=t1 or t2,
+            error="" if proc.returncode == 0
+                  else f"命令以退出码 {proc.returncode} 结束",
+        )
+    finally:
+        # ★ 无论成功、超时、还是中途抛异常，临时 cidfile 都要删掉。
+        _discard_cidfile(cid_path)
 
 
 # ============================================================
@@ -264,29 +526,86 @@ def _run_host(decision: Decision) -> ExecResult:
 
     **诚实地说清楚"这里没有隔离"，比含糊地暗示"有隔离"重要。**
     运维工具最怕的就是给人虚假的安全感。
+
+    ★ 第五层兜底（C1）：**要执行哪个程序，由代码里的固定目录决定，不看 PATH。**
+      白名单只比对命令名（并显式拒绝带 `/` 的名字），如果执行时靠继承的
+      `PATH` 去找程序，那么**谁能控制 PATH，谁就能放一个假的 `systemctl`
+      绕过整张白名单表** —— 白名单再严也没用，因为它把"到底执行哪个程序"
+      这个决定交给了环境变量。所以：
+        ① 先用 `policy.resolve_binary()` 解析成固定目录里的绝对路径；
+        ② 解析不到就**拒绝执行**（绝不退回裸名 —— 那等于把刚堵上的洞又打开）；
+        ③ 子进程环境用 `policy.command_env()`，**不继承父进程的环境**
+           （PATH 固定、LD_PRELOAD / BASH_ENV 这类注入变量一并清掉）。
+      `Decision` 里给人看的字段（`command`）一个字都不改 ——
+      审批界面显示什么，执行的就必须是什么。
     """
     started = time.time()
-    try:
-        proc = subprocess.run(
-            decision.argv, shell=False, timeout=decision.timeout,
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, encoding="utf-8", errors="replace",
-        )
-    except subprocess.TimeoutExpired:
+
+    # ---- ① 解析可执行文件：只在固定目录里找 ----
+    resolved = policy.resolve_binary(decision.argv[0])
+    if resolved is None:
         return ExecResult(
             ok=False, backend="subprocess", isolated=False,
             command=decision.command, argv=decision.argv,
             elapsed_ms=int((time.time() - started) * 1000),
-            error=f"执行超时（{decision.timeout}s），已强制终止",
+            error=(f"在固定目录里找不到这个可执行文件：{decision.argv[0]!r}"
+                   f"（只找 {'、'.join(policy.BINARY_DIRS)}）。拒绝执行 —— "
+                   f"不退回裸名：按 PATH 找程序等于把白名单交给环境变量，"
+                   f"谁能控制 PATH 谁就能放一个假的 {decision.argv[0]} 绕过整张白名单表。"),
+        )
+    argv = [resolved, *decision.argv[1:]]
+
+    try:
+        proc = subprocess.Popen(
+            argv, shell=False,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, encoding="utf-8", errors="replace",
+            # ③ 最小环境：**不** os.environ.copy()，也不把父进程环境合并回来
+            env=policy.command_env(),
+            # 自成一组：超时后 killpg 才能一次性收走它和它的子孙进程。
+            # 没有这一句，getpgid(pid) 拿到的是我们自己的组，killpg 会打到我们自己。
+            start_new_session=True,
         )
     except FileNotFoundError:
         return ExecResult(
             ok=False, backend="subprocess", isolated=False,
             command=decision.command, argv=decision.argv,
-            error=f"目标主机上没有 `{decision.argv[0]}` 这个命令",
+            elapsed_ms=int((time.time() - started) * 1000),
+            error=(f"在固定目录里解析到的 {resolved} 在执行前消失了"
+                   f"（`{decision.argv[0]}` 未被启动）"),
+        )
+    except OSError as e:
+        return ExecResult(
+            ok=False, backend="subprocess", isolated=False,
+            command=decision.command, argv=decision.argv,
+            elapsed_ms=int((time.time() - started) * 1000),
+            error=f"启动 {resolved} 失败：{e}",
         )
 
-    out, t = _clip(proc.stdout)
+    try:
+        stdout, _ = proc.communicate(timeout=decision.timeout)
+    except subprocess.TimeoutExpired:
+        # ---- ② 超时回收（C6）：杀**整个进程组**，再 wait 收尸 ----
+        # 只杀直接子进程的话，`sh -c "... &"` 留下的孙进程会继续跑；
+        # 而且命令的 stdout 我们已经不打算要了（超时路径本来就没有输出），
+        # 所以直接把管道关掉，别为了读残余输出把一个停不下来的进程等下去。
+        _kill_process_group(proc)
+        reaped = _reap(proc)
+        _close_pipes(proc)
+        if reaped:
+            detail = "杀掉了整个进程组（含子进程与孙进程），并 wait() 回收，不留僵尸"
+        else:
+            # ★ 不假装回收成功：没等到就是没等到，如实写出来让人去核实
+            detail = ("已对整个进程组下杀，但**未能在限时内确认进程退出**"
+                      "（可能仍有残留，请人工用 ps / tasklist 核实）")
+        return ExecResult(
+            ok=False, backend="subprocess", isolated=False,
+            command=decision.command, argv=decision.argv,
+            elapsed_ms=int((time.time() - started) * 1000),
+            error=f"执行超时（timeout={decision.timeout}s），已回收（reclaim）：{detail}。",
+        )
+
+    out, t = _clip(stdout)
     return ExecResult(
         ok=proc.returncode == 0, backend="subprocess", isolated=False,
         command=decision.command, argv=decision.argv,
@@ -404,7 +723,7 @@ def _run_mock(decision: Decision) -> ExecResult:
             return ExecResult(
                 ok=True, backend="mock", isolated=False, command=cmd,
                 argv=decision.argv, exit_code=0,
-                stdout=f"active\n（mock 后端：仿真输出）",
+                stdout="active\n（mock 后端：仿真输出）",
             )
         return ExecResult(
             ok=True, backend="mock", isolated=False, command=cmd,
