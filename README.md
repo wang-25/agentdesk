@@ -68,6 +68,9 @@ python -m app.rag.pipeline eval --top-k 8     # 检索召回率（纯检索，�
 - **🧰 工具层** —— 7 个运维工具（6 个只读 + 1 个白名单执行），参数过正则白名单（`"web-01; rm -rf /"` 直接拒），**绝不拼 shell**。
 - **🛡️ 沙箱 + 人工确认** —— 写操作不自动执行：命令白名单 → 审批单（指纹防重放）→ 一次性容器。沙箱不可用时 **fail-closed**，拒绝执行而非降级。
 - **📊 全链路可观测** —— 每次运行留下 trace（span 树）、成本归因（按 Agent/动作双维）、审计日志。
+- **🚨 事件闭环 + 出站通知** —— 告警按「主机+服务」聚合成**一个事件**（50 条同源告警只跑 1 次诊断），
+  支持维护窗口抑制；诊断结论/待审批/执行结果**推给值班的人**（通用 webhook / 钉钉 / 飞书，含加签、去重、重试）。
+  ⚠️ 默认**不出站**（`NOTIFY_CHANNELS` 留空即完全关闭）；开了之后出站正文默认脱敏。
 - **🔌 MCP 协议出口** —— 同一批工具以标准 MCP 暴露，Cursor / Claude Desktop 可直接调用。
 - **🔐 公网安全层** —— 白名单鉴权 + 三层限流 + 每日额度。上线 20 分钟拦下 57 次未授权扫描。    
   ⚠️ 限流与每日额度是**单进程内存态**：服务重启后当日额度归零，开多 worker 时各进程各算各的（实际额度会翻倍）。部署上固定 `--workers 1`；要多实例需把计数器换成 Redis。
@@ -231,8 +234,7 @@ Agent 只知道 `web-01` 这样的**逻辑名**，它不知道、也不该知道
 
 ## 接口
 
-31 个路由（26 个进 OpenAPI 文档），按功能分组（本地起服务后打开 <http://127.0.0.1:8000/docs> 即可）：
-
+35 个路由（30 个进 OpenAPI 文档），按功能分组（本地起服务后打开 <http://127.0.0.1:8000/docs> 即可）：
 <details>
 
 <summary><b>Agent 与检索</b></summary>
@@ -274,6 +276,22 @@ Agent 只知道 `web-01` 这样的**逻辑名**，它不知道、也不该知道
 | POST | `/approvals/{id}/approve` | 批准（必须填审批人）    |
 | POST | `/approvals/{id}/reject`  | 驳回            |
 | POST | `/approvals/{id}/execute` | 执行已批准的命令（一次性） |
+
+</details>
+
+<details>
+
+<summary><b>事件（一个故障一个对象）</b></summary>
+
+| 方法   | 路径                         | 说明                     |
+| ---- | -------------------------- | ---------------------- |
+| GET  | `/incidents`               | 事件列表（含聚合模式与通知状态）       |
+| GET  | `/incidents/{id}`          | 单个事件详情（完整时间线 + 成员告警）   |
+| POST | `/incidents/{id}/ack`      | 认领（**必须填 `by`**：谁在处理）  |
+| POST | `/incidents/{id}/resolve`  | 结单（**必须填 `by`**：谁结的、为什么结） |
+
+告警进来时按「主机 + 服务」聚合：50 条同源告警 → **1 个事件、1 次诊断、1 条通知**。
+被抑制的告警不会被丢弃 —— 响应里会带上它并入了哪个事件。
 
 </details>
 
@@ -355,12 +373,15 @@ CI 见 [`.github/workflows/ci.yml`](.github/workflows/ci.yml)：
 agentdesk/
 ├── app/
 │   ├── llm.py              模型调用统一入口
-│   ├── main.py             FastAPI 服务入口（31 个路由）
+│   ├── main.py             FastAPI 服务入口（35 个路由）
 │   ├── security.py         公网安全层：白名单鉴权 + 三层限流 + 每日额度
 │   ├── rag/                检索层：切分 / 向量化 / 存储 / 混合检索管线
 │   ├── tools/              工具层：7 个运维工具（6 只读 + 1 执行）+ 参数白名单
 │   ├── agents/             编排层：手写 ReAct / LangGraph / Supervisor
 │   ├── sandbox/            沙箱：策略 / 执行器 / 审批单
+│   ├── alerting/           告警入口：归一化 / 聚合（有界 TTL 表）/ 维护窗口抑制
+│   ├── incident/           事件：一个故障一个对象（追加日志 + 折叠）
+│   ├── notify/             出站通知：webhook / 钉钉 / 飞书 + 重试 + 脱敏
 │   ├── observability/      trace / 成本归因 / Langfuse 导出
 │   ├── evaluation/         评测判定器
 │   └── mcp_server/         MCP 协议出口
@@ -413,6 +434,7 @@ agentdesk/
 | [技术栈](docs/tech-stack.md)                    | 想看选型理由与替代方案             |
 | [多 Agent 编排](docs/multi-agent.md)            | 拆分理由、校验 Agent 设计、踩过的五个坑 |
 | [沙箱与人工确认](docs/sandbox-hitl.md)              | 三层职责、五个坑、常见追问           |
+| [事件与出站通知](docs/incident-notify.md)             | 告警怎么聚合成事件、通知怎么配、没收到怎么排障 |
 | [可观测](docs/observability.md)                 | Trace 与成本归因的设计          |
 | [评测](docs/evaluation.md)                     | 六维度设计、判定器自证、误报排查        |
 | [MCP Server](docs/mcp-server.md)             | 协议原理、四个真实坑、客户端配置        |

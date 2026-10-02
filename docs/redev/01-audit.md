@@ -291,7 +291,7 @@ Test-Path tests, .github, pyproject.toml                   # False
 |---|---|---|---|---|
 | N1 | **审批单时间戳只写盘、不回填给调用方** | `approvals.py` 的 `_append` 里 `event = {"ts": _now(), **event}` 改的是**局部变量**，紧跟其后的 `self._apply(ev)` 拿到的 `ev` 里没有 `ts` | 同一进程内新建/批准/执行的审批单，`created_at` / `approved_at` / `consumed_at` 全是 `null`；`list()` 按 `created_at or ""` 排序时同批单子顺序随机。**一重启就"自愈"**（盘上有 ts），所以极难复现 | 已修（`_append` 改 `setdefault` 原地回填），并加用例：`test_in_memory_record_matches_what_was_persisted` 把"内存与盘必须一致"钉住 |
 | N2 | **`/metrics/summary` 会因 trace 文件放在项目外而 500** | `main.py` 里 `obs.TRACE_PATH.relative_to(PROJECT_ROOT)` 直接抛 `ValueError` | 挂载卷 / 自定义部署路径下，**只读成本看板直接挂掉**；也让"把落盘位置改到临时目录"的测试根本没法写 | 已修（新增 `_display_path`：取不到相对路径就退回绝对路径） |
-| N3 | **lint 债：`app/` + `scripts/` 共 55 处** | `ruff check app scripts`：F541 16 / F841 16 / F401 9 / B904 18 … | 一次性大扫除会把真实改动淹没在 diff 里 | M1 **只对 `tests/` 强制 lint**；这条债在此显式登记，按里程碑逐目录纳入（**登记了才不许它悄悄消失**） |
+| N3 | **lint 债：`app/` + `scripts/` 共 66 处** | `ruff check app scripts --statistics`：B904 18 / F541 16 / F841 10 / F401 8 / B905 6 / E731 3 / B007 3 / E741 1 / B025 1 | 一次性大扫除会把真实改动淹没在 diff 里 | M1 **只对 `tests/` 强制 lint**；M2 新增的三个子包（`app/alerting`、`app/incident`、`app/notify`）**零新增债**，且顺手清掉了 `main.py` 里 7 处历史 E402（app+scripts 从 69 降到 66）。这条债在此显式登记，按里程碑逐目录纳入（**登记了才不许它悄悄消失**） |
 | N4 | **`requirements-dev.txt` 首版带中文注释 → `pip` 直接崩** | `UnicodeDecodeError: 'gbk' codec can't decode byte 0x89` | pip 按系统区域编码（中文 Windows 上是 GBK）读 requirements 文件 | 已改为纯 ASCII。**这正是 `requirements.txt:7-9` 早就写明的规矩** —— 说明"写在注释里的约定"挡不住人，得靠 CI 兜 |
 
 **方法学教训（也记下来）**：测试"公开清单里的路径都是真实路由"时，一开始用 OpenAPI 的
@@ -350,3 +350,57 @@ Test-Path tests, .github, pyproject.toml                   # False
 > 但它意味着"测试写脏数据"的代价不只是噪声 ——
 > **它会把对外宣称的可观测性数字变成假的**，而且假得很安静（数字看起来照样合理）。
 > 这也解释了为什么 conftest 里的隔离装置和禁网守卫是必需品，而不是讲究。
+
+---
+
+## 7. M2 实施记录：事件与通知落地后，闭环补上了哪几环
+
+### 7.1 缺口清单里被关掉的部分
+
+| 原编号 | 内容 | 处理 |
+|---|---|---|
+| **E1** | 无任何出站通知（"凌晨三点没人被叫醒"） | **已实现**：通用 webhook + 钉钉 + 飞书三个渠道，含加签、去重、重试退避、失败留痕 |
+| **E2** | 无事件（Incident）实体 | **已实现**：`app/incident/`（追加日志 + 折叠），状态机 `open→ack→resolved`、`resolved→reopened`，4 个接口 |
+| **E3** | 去重是精确键 + 固定窗口，且 `_ALERT_LAST_SEEN` 无界增长 | **已实现**：`app/alerting/aggregator.py` 按「主机+服务」聚合，带 TTL 与容量上限（2000 条互异告警压测后表大小 ≤ 上限） |
+| **E4** | 告警入口同步阻塞 | **已留开关**：`ALERT_ASYNC`（默认 0 = 保持现有同步形态，兼容优先；置 1 走后台） |
+| **D6** | `{"alerts": []}` 被当成一条凭空捏造的 `UnknownAlert` | **已修**（归一化层按"有没有 alerts 键"分支；入口返回 `received: 0`，不建事件、不调模型） |
+| **D12** | 审批无到期提醒 | **已实现**：审批单创建即推通知（含过期时间与批准入口） |
+| 部分 **D10** | 无脱敏 | **已实现**：出站正文默认过 `mask()`（`NOTIFY_MASK` 默认 **1**），凭据/`password=`/长哈希被折叠，主机名与路径原样保留 |
+
+### 7.2 验收证据（全部可复跑、零成本）
+
+| 门禁 | 结果 |
+|---|---|
+| `pytest` | **509 条全绿**（M1 为 359 条；M2 新增 150 条） |
+| `ruff check tests` | All checks passed |
+| `mypy` | Success: no issues found in 13 source files |
+| `scripts/security_check.py` | 21 + 2 项全通 |
+| `scripts/mcp_check.py` | 9/9 |
+| `scripts/eval_baseline.py` | 无退化 |
+| **50 条同源告警 → 1 个事件 + 1 次诊断 + 1 条通知** | `tests/test_m2_wiring.py` 端到端断言（诊断引擎打桩计数） |
+| **没有配置通知时零出站** | 同一文件；未配置时行为与加这一层之前一致 |
+| 外发内容脱敏 | 固定密钥/固定时间戳的签名确定性用例 + `mask()` 正反例 |
+
+### 7.3 M2 期间发现的新问题（已登记）
+
+| 编号 | 问题 | 证据 | 处理 |
+|---|---|---|---|
+| M2-1 | **`MAX_RECORDS = 500` 是死常量**：注释声称"内存里最多保留多少条（防止日志无限增长拖慢启动）"，全仓零引用 → 审批单内存实际**无界增长** | `app/sandbox/approvals.py:81` | 登记。incident 侧没有复制这个写法（并明确写出"真正的有界性要求在去重表上"） |
+| M2-2 | 审批记录 `result_ok` 在执行**之前**写入（原 C4） | `main.py` 的 `execute_approval` | 未改顺序（有意取舍），但**通知把真值送到人手上**：执行结果通知里带 `ok`/退出码/错误 |
+| M2-3 | 通知层初版把 `NOTIFY_MASK` 默认设为关 | `app/notify/base.py` | **复核时翻成默认开**：出站内容离开信任边界，两个方向的代价不对称（少一段文字 vs 凭据进第三方聊天记录），用例同步翻转并写明理由 |
+| M2-4 | 通知 dispatcher 初版**持锁发送**（一条卡死的 webhook 会堵死所有渠道） | `app/notify/dispatcher.py` | 实现方自查后改为"锁只保护去重状态"，代价是同毫秒两条同源可能都发 —— 宁可多发一条，不可整层被堵死 |
+
+### 7.4 M2 之后的闭环
+
+```
+告警 ──► 抑制(维护窗口) ──► 聚合(主机+服务) ──► 频控
+                                  │
+                                  ├─► 事件(incident) ──► 通知值班人（钉钉/飞书/自建 webhook）
+                                  │        │
+                                  │        └─► 时间线：谁认领、谁结单、诊断结论、通知成败
+                                  └─► 诊断（可选，默认关）──► 结论写回事件 ──► 再通知
+                                        └─► 写操作 ──► 审批单 ──► 通知 ──► 人批准 ──► 沙箱执行 ──► 结果通知
+```
+
+**仍然没做的**（按路线图留给后续里程碑）：处置剧本与自动回滚（I-9）、复盘知识回流（I-6）、
+工单系统集成、真机钉钉/飞书机器人实测（需要用户提供机器人地址）、`ALERT_ASYNC=1` 的后台任务实现（开关已留，同步路径已验收）。
