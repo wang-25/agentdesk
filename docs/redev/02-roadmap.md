@@ -151,8 +151,51 @@
 
 ---
 
-## 6. 待确认事项（进入编码前的最后一道关）
+## 6. 已确认的范围与节奏（2026-10-02）
 
-1. **改造范围**：M1–M4 全做，还是先做其中一段？M5 的能力深度按哪个取向？
-2. **节奏**：每个增量前是否先出详细方案待确认，还是做完一个里程碑再汇报？
-3. **验证尺度**：允许真实模型调用（花钱）吗？是否允许提交 git commit？
+| 项 | 确认结果 |
+|---|---|
+| 改造范围 | **M1 + M2**（可信度地基 + AIOps 闭环） |
+| 节奏 | **每个增量前先出详细方案，等确认再动手** |
+| 验证尺度 | 允许真实模型调用（花钱）；允许 git 提交 |
+| 遗留 README 改动 | 先原样提交为 `chore:`（已完成） |
+
+---
+
+## 7. M1 实施结果（**已完成并验收**）
+
+### 7.1 验收证据（全部可复跑）
+
+| 门禁 | 命令 | 结果 |
+|---|---|---|
+| 单元 + 接口层测试 | `python -m pytest -q` | **360 条全绿** |
+| lint | `python -m ruff check tests` | All checks passed |
+| 类型检查 | `python -m mypy` | Success: no issues found in 9 source files |
+| 公网安全层 | `python scripts/security_check.py` | **21 + 2 项全通**，退出码 0 |
+| MCP 协议 | `python scripts/mcp_check.py` | **9/9**，退出码 0 |
+| 检索基线门禁 | `python scripts/eval_baseline.py --top-k 8` | 无指标退化超容差，退出码 0 |
+| 九层自检（严格档，服务在跑） | `python scripts/smoke_test.py --strict` | **退出码 0**，接口层 17/17 |
+| 九层自检（服务未启动） | `python scripts/smoke_test.py --strict` | **退出码 2**（未验证不再伪装成通过） |
+| 门禁自证 | 注入历史上真实出现过的白名单缺陷（`/` 回表 + 前缀比较退回 `d.rstrip("/") + "/"`） | **测试变红**，诊断精准：`assert 'allow' == 'deny'`（`du -sh /root`） |
+
+### 7.2 与方案的三处偏差（都是有意调整，不是缩水）
+
+| 项 | 方案原定 | 实际做法 | 原因 |
+|---|---|---|---|
+| CI 必需档是否跑 `smoke_test.py --strict` | 跑 | **不跑**；接口层改由 `tests/test_api_smoke.py` 在进程内验证 | smoke_test 的快速档本身包含真实模型调用（第 2 层、RAG 问答、`POST /chat`、`/rag/ask`、`/webhook/alert`），**无密钥环境必然失败**。零成本档需要的是一套不需要密钥的接口验证 —— TestClient 正好满足，而且比"起服务再探活"更稳。`--strict` 仍保留给本地与可选档使用 |
+| lint 覆盖范围 | 全仓 | **只强制 `tests/`** | `app/` + `scripts/` 有 55 处历史 lint 债（F541 16 / F841 16 / F401 9 / B904 18 …），一次性大扫除会把真实改动淹没在 diff 里。已显式登记（见 7.3），按里程碑纳入 |
+| mypy 覆盖范围 | `tests/` | `tests/` + `follow_imports = "silent"` | 不设 silent 时，仅 `import app.main` 就会带出近百条老代码的历史类型错误 —— 那只会让人学会无视 mypy |
+
+### 7.3 本里程碑发现并处理的缺陷
+
+- **已修**：审批单时间戳只写盘不回填（同进程内 `created_at`/`approved_at` 全为 `null`，重启后自愈）；
+  `/metrics/summary` 在 trace 文件位于项目外时 500；
+  模型返回裸 `null` 时意图校验抛 `TypeError` → HTTP 500 且不写审计。
+- **已登记待办**：D2–D7、成本归集的两条（成环吞钱、兜底价低估）、55 处 lint 债。
+  详见 [`01-audit.md`](01-audit.md) §6.2 与 §6.3 —— **登记在案才不许它悄悄消失**。
+
+### 7.4 一条必须记住的教训
+
+新测试一度把假 trace 写进真实 `logs/traces.jsonl`，结果是**对外成本指标从 ¥0.9253 掉到 ¥0.0774**（被压低 12 倍）。
+已用非破坏性方式清理（标记 `source=selftest`，行数不变 1374）。
+→ **测试污染不是"日志多几行"，而是让可观测性数字变成假的。** conftest 的隔离装置是必需品，不是讲究。
