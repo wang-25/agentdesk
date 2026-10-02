@@ -69,7 +69,10 @@ AgentDesk 服务入口
 """
 
 import json
+import logging
 import os
+import re
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -77,11 +80,13 @@ from typing import Optional
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Response
 from fastapi.openapi.utils import get_openapi
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
-from app import security
+from app import security, selfcheck
 from app.alerting import AlertAggregator, Silence
+from app.observability import jsonl as obs_jsonl
+from app.observability import logsetup, metrics as obs_metrics
 from app.alerting import alert_to_question, normalize_alerts   # noqa: F401  ← 对外 re-export
 from app.incident.model import IncidentError
 from app.llm import PROJECT_ROOT, ModelError
@@ -106,6 +111,89 @@ app = FastAPI(
 # 公网安全层：token 鉴权 + 限流 + 每日额度。
 # AUTH_ENABLED=0（默认）时完全放行，本地开发行为不变。
 security.install_security(app)
+
+# ============================================================
+# 可观测：日志格式 + 请求 ID + HTTP 指标（M4）
+# ============================================================
+# ★ 这三件事必须在**任何请求进来之前**配好，所以放在模块导入期。
+#   注意它们都不改变默认行为：
+#     · LOG_FORMAT 默认 text（观感与改动前一致，只补上请求 ID）
+#     · 请求 ID 只是多一个响应头与日志字段
+#     · HTTP 指标只做内存计数（基数有上限，见 metrics 的丢弃计数）
+_LOG_SETUP = logsetup.setup_logging()
+_STARTED_AT = time.time()
+
+# ★ 压掉几个"话很多"的第三方 logger。
+#
+#   为什么必须显式压：在这之前**根本没有 logging 配置**，root 没有 handler，
+#   Python 只用"最后手段"打印 WARNING 及以上 —— 所以 httpx 那些
+#   `HTTP Request: GET ...` 的 INFO 行是不出现的。
+#   一旦配上 handler 与 INFO 级别，它们就会涌进容器日志，
+#   默认观感与改动前不一致（而且真正有用的那几行被淹掉）。
+#
+#   **策略放在这里，机制留在 logsetup**：logsetup 负责"格式、级别、请求 ID"，
+#   "哪些第三方的 INFO 不该进我们的日志"是本文件的判断。
+for _noisy in ("httpx", "httpx2", "httpcore", "httpcore2", "urllib3",
+               "jieba", "asyncio", "multipart"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
+
+
+def _metric_path(path: str) -> str:
+    """把路径里的 ID 归一成 `{id}`，避免标签基数爆炸。
+
+    ★ 为什么必须做：`/traces/<id>`、`/approvals/<id>`、`/incidents/<id>` 每次请求
+      路径都不同 —— 直接拿原始路径当标签，指标序列数会随请求数线性增长，
+      最后是**监控端先被自己打挂**（Prometheus 侧基数爆炸）。
+      metrics 模块里还有一层"每指标最多 N 个序列"的兜底，但源头归一更干净。
+
+    ★ 判定规则要按**真实的 ID 形态**来，不能只认自己记得的那几个前缀：
+      本项目里 ID 是"短前缀 + 十六进制"（`tr-` trace、`sp-` span、
+      `ap-` 审批单、`inc-` 事件），所以规则写成"前缀-hex"这一通用形态 ——
+      只写 `ap-`/`inc-` 的话 `/traces/tr-a1b2…` 就漏了（我第一版正是这样，
+      被用例抓出来的）。纯数字段与特别长的段也一并归一。
+    """
+    parts = []
+    for seg in path.split("/"):
+        if not seg:
+            continue
+        if _ID_SEGMENT_RE.match(seg):
+            parts.append("{id}")
+        else:
+            parts.append(seg)
+    return "/" + "/".join(parts)
+
+
+# 形如 `tr-a1b2c3d4e5f6` / `ap-1a2b` / `42` / 很长的十六进制串
+_ID_SEGMENT_RE = re.compile(r"^(?:[a-z]{1,6}-[0-9a-f]{4,}|\d+|[0-9a-f]{16,})$")
+
+
+@app.middleware("http")
+async def _observability_middleware(request, call_next):
+    """给每个请求分配 ID，并记一条 HTTP 指标。
+
+    顺序上它在安全中间件**之后**注册 → 实际执行时在安全层**之内**，
+    所以被鉴权/限流挡掉的请求不会走到这里。
+    那些拒绝由安全层自己计数（`agentdesk_security_rejections_total`），
+    两边的口径合起来才是完整的。
+    """
+    rid = logsetup.new_request_id()
+    logsetup.set_request_id(rid)
+    started = time.perf_counter()
+    status = 500
+    try:
+        response = await call_next(request)
+        status = response.status_code
+        response.headers["X-Request-ID"] = rid
+        return response
+    finally:
+        elapsed = time.perf_counter() - started
+        path = _metric_path(request.url.path)
+        obs_metrics.counter("agentdesk_http_requests_total",
+                            {"path": path, "method": request.method,
+                             "status": str(status)})
+        obs_metrics.observe("agentdesk_http_request_duration_seconds",
+                            elapsed, {"path": path})
+        logsetup.clear_request_id()
 
 
 # ============================================================
@@ -161,19 +249,39 @@ app.openapi = _custom_openapi
 # 用 JSONL（每行一个 JSON）而不是一个大 JSON 数组，是因为追加写入更安全：
 # 写到一半进程挂了，前面几行仍然是完整的。
 AUDIT_LOG = PROJECT_ROOT / "logs" / "audit.jsonl"
+# 审计写入的锁。
+#
+# ★ 为什么别的写入都有锁、唯独这里漏了：
+#   `tracer` 有 Lock、`approvals` 有 RLock，而 `write_audit` 一直是裸的 ——
+#   因为它的写入是"小的单行追加"，看起来原子。但**审计是并发最狠的那条路径**
+#   （每个接口、每次工具调用、每次通知都写），单行追加在文件层是原子的，
+#   而 `json.dumps` 与后续可能的轮转不是。M4 给审计加了轮转之后必须补锁 ——
+#   轮转是"改名 + 重新打开"，和另一个线程的追加撞在一起就是丢数据。
+_audit_lock = threading.Lock()
 
 
 def write_audit(event: str, detail: dict) -> dict:
-    """追加一条审计记录，返回写入的内容。"""
-    AUDIT_LOG.parent.mkdir(parents=True, exist_ok=True)
+    """追加一条审计记录，返回写入的内容。
+
+    ★ 带上 `request_id`（如果当前在某个请求里）。
+      没有它，日志与审计是两条平行的、对不上的线：
+      "这次请求的日志"和"它写了哪几条审计"只能靠时间去猜。
+      请求之外的审计（后台任务、启动期）没有这个字段 —— **不补空串**，
+      免得让"没有请求上下文"和"请求 ID 恰好是空"混成一种样子。
+    """
     record = {
         "ts": datetime.now().isoformat(timespec="seconds"),
         "event": event,
         **detail,
     }
-    # 用 "a" 模式追加，每条一行
-    with open(AUDIT_LOG, "a", encoding="utf-8") as f:
-        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    rid = logsetup.get_request_id()
+    if rid:
+        record["request_id"] = rid
+    with _audit_lock:
+        # 交给公共写入层：它负责"先看要不要轮转，再追加"。
+        # 审计**要 fsync**：它是"谁在何时做了什么"的唯一证据，
+        # 而写入频率远低于 trace（每次动作一条，不是每次请求几条）。
+        obs_jsonl.append_jsonl(AUDIT_LOG, record, fsync=True)
     return record
 
 
@@ -2155,28 +2263,109 @@ async def health():
 
 
 # ============================================================
+# 接口 1·B：深度健康检查 与 Prometheus 指标（M4）
+# ============================================================
+def _refresh_gauges() -> None:
+    """把"只有抓取时才算得出来"的东西刷进指标。
+
+    ★ 为什么在抓取时现算，而不是在每个写入点维护：
+      gauge 的语义是"当前值"。写在写入点就要求**每一条状态迁移都记得更新它** ——
+      漏一处就永远差一个数，而且很难发现（数字看起来是合理的）。
+      抓取时现算只有一个事实源。代价是每次抓取读一次小文件（事件表几 KB），
+      Prometheus 15–60 秒抓一次，可以接受。
+    """
+    obs_metrics.gauge("agentdesk_process_uptime_seconds", time.time() - _STARTED_AT)
+    # ★ 如实标出"这些状态是进程内的"（审计里的阻断级风险，M4 的处理是**可见 + 可拦**）
+    for kind in ("rate_limit", "daily_quota", "alert_dedup"):
+        obs_metrics.gauge("agentdesk_state_scope", 1,
+                          {"kind": kind, "scope": "process"})
+    try:
+        counts = _incident_store().counts()
+        for status in ("open", "ack", "resolved", "reopened"):
+            obs_metrics.gauge("agentdesk_incidents", counts.get(status, 0),
+                              {"status": status})
+    except Exception:                             # pragma: no cover
+        pass                                      # 指标抓取不能因为存储坏了而 500
+    obs_metrics.gauge("agentdesk_trace_write_failures", obs.write_failures())
+    obs_metrics.gauge("agentdesk_export_failures", obs.export_failures())
+    obs_metrics.gauge("agentdesk_alert_dedup_entries", _ALERT_AGG.size())
+
+
+@app.get("/metrics")
+def metrics_endpoint():
+    """Prometheus 文本格式指标。
+
+    【为什么手写而不引入 prometheus_client】
+      这个项目对外宣称"直接依赖仅 9 个"，CI 里还有一条守卫盯着这个数字。
+      我们真正需要的只有 counter / gauge / histogram 三种最基础的类型，
+      手写约 30 行；风险（格式不合规）由测试里的规范校验兜住 ——
+      **把风险显式管住，而不是用一个依赖换掉它**。
+
+    【为什么不在免鉴权清单里】
+      指标里有成本、错误率、主机名与存储路径。公网裸奔等于把运维内部状况送出去。
+      抓取端加一个 `X-API-Key` 头即可（Prometheus 的 `authorization` 配置支持）。
+      这与"`/health` 公开、`/healthz` 要令牌"是同一条判断：
+      **能秒回、零依赖、不泄露内部信息的那个公开；带明细的要令牌。**
+    """
+    _refresh_gauges()
+    return Response(content=obs_metrics.render(),
+                    media_type="text/plain; version=0.0.4; charset=utf-8")
+
+
+@app.get("/healthz")
+def healthz():
+    """**深度**健康检查：真的去碰一下依赖，坏了会说清是哪一项。
+
+    `/health` 保持原样（公开、秒回、零依赖）—— 容器编排与负载均衡用它；
+    `/healthz` 是给人排障用的：逐项明细（含路径与计数），所以要令牌。
+    返回 `200`（能干活）或 `503`（有依赖不可用，`failing` 里点名）。
+    """
+    result = selfcheck.probe()
+    return JSONResponse(content=result,
+                        status_code=200 if result["ok"] else 503)
+
+
+# ============================================================
 # 接口 2：审计日志查询
 # ============================================================
 @app.get("/audit")
-def read_audit(limit: int = Query(20, ge=1, le=200, description="返回最近多少条")):
+def read_audit(limit: int = Query(20, ge=1, le=200, description="返回最近多少条"),
+               offset: int = Query(0, ge=0, le=5000,
+                                   description="从最新往前的游标：0 = 最新")):
     """读取最近的审计记录。
 
     【这个接口的价值】
     它是「可追溯」的证据。可以这样描述：
     「每一次告警触发的判断和决策都落库了，我能查出来三小时前那次为什么没自动处理。」
     这句话是通用 AI 助手给不了的 —— 它有聊天记录，但没有结构化审计。
-    """
-    if not AUDIT_LOG.exists():
-        return {"total": 0, "items": []}
 
-    lines = [l for l in AUDIT_LOG.read_text(encoding="utf-8").splitlines() if l.strip()]
-    items = []
-    for line in lines[-limit:]:
-        try:
-            items.append(json.loads(line))
-        except json.JSONDecodeError:
-            continue    # 坏行跳过，不要因为一行坏了整个接口报错
-    return {"total": len(lines), "items": items}
+    【M4 的两处改动】
+
+      ① **不再全量读文件**。原先是 `AUDIT_LOG.read_text()` —— 文件多大就读多大；
+         审计只增不减，接口会随着时间越来越慢，而且是那种"没人注意到的变慢"。
+         现在从尾部按块读，并且**跨轮转文件回读**。
+
+      ② **`total` 的语义要说清**：它是"这次窗口里读到了多少条"，
+         不是"全历史总数"。轮转之后全历史散在多个文件里，硬报一个总数
+         只会得到一个**看起来对、其实不对**的数字 —— 那比不给更糟。
+         所以这里把窗口元信息一并返回（读了哪些文件、有没有坏行、有没有被截断）。
+    """
+    # 上限保护：offset 不能被用来"变相读全文件"
+    want = min(limit + offset, 10_000)
+    records, meta = obs_jsonl.read_tail(AUDIT_LOG, want)
+
+    end = len(records) - offset
+    start = max(0, end - limit)
+    items = records[start:end] if end > 0 else []
+
+    return {
+        "total": len(records),          # 窗口内条数（见上面 ② 的说明）
+        "items": items,                 # 旧 → 新，与改动前一致
+        "offset": offset,
+        "window": meta,                 # files / bad_lines / truncated
+        "note": ("total 是**窗口内**条数，不是全历史；"
+                 "window 里如实标出读了哪些文件、有没有坏行或被截断"),
+    }
 
 
 # ============================================================
@@ -2335,6 +2524,8 @@ def webhook_alert(payload: dict, background: BackgroundTasks = None):
                                  f"（{silence_hit['_matched_until']} 前生效），"
                                  f"本次不诊断"),
                       "playbook": []}
+            obs_metrics.counter("agentdesk_alerts_received_total",
+                                {"decision": report["decision"]})
             write_audit("alert.silenced", {
                 **report,
                 "rule": {k: v for k, v in silence_hit.items()
@@ -2371,6 +2562,8 @@ def webhook_alert(payload: dict, background: BackgroundTasks = None):
                       "incident_id": incident_id or None,
                       "members": verdict.members,
                       "playbook": []}
+            obs_metrics.counter("agentdesk_alerts_received_total",
+                                {"decision": report["decision"]})
             write_audit("alert.suppressed", report)
             reports.append(report)
             continue
@@ -2384,6 +2577,8 @@ def webhook_alert(payload: dict, background: BackgroundTasks = None):
             report = {**base, "decision": "rate_limited",
                       "reason": (f"本小时自动诊断已达上限 {ALERT_MAX_PER_HOUR} 次，"
                                  f"本次交给人工。调大 ALERT_MAX_PER_HOUR 可放宽")}
+            obs_metrics.counter("agentdesk_alerts_received_total",
+                                {"decision": report["decision"]})
             write_audit("alert.rate_limited", report)
             reports.append(report)
             continue
@@ -2540,6 +2735,8 @@ def _run_alert_pipeline(state: dict) -> dict:
         _attach_diagnosis_quietly(incident_id, report)
         report["incident_id"] = incident_id
 
+    obs_metrics.counter("agentdesk_alerts_received_total",
+                        {"decision": report["decision"]})
     write_audit("alert.handled", report)
 
     # ★ 这一步是 M2 存在的理由：告警链路的终点原来只有"HTTP 响应 + audit.jsonl"，
@@ -3254,6 +3451,10 @@ def _execute_approved(approval_id: str, req: ApprovalAction):
         raise HTTPException(status_code=503, detail=str(e)) from e
 
     payload = result.to_dict()
+    # 写操作到底在哪执行、成没成 —— 这是「它有没有真的动手」的唯一量化口径
+    obs_metrics.counter("agentdesk_sandbox_executions_total",
+                        {"backend": result.backend,
+                         "ok": "true" if result.ok else "false"})
     write_audit("approval.executed", {
         "approval_id": approval_id, "by": req.by,
         "command": rec["command"], "ok": result.ok,

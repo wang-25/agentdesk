@@ -103,6 +103,25 @@ class NotifyOutcome:
         }
 
 
+def _note_notify_metrics(results) -> None:
+    """把每个渠道的投递结果记进指标（M4）。
+
+    ★ 为什么这一条值得埋点：通知是**唯一"失败了也没人察觉"的出口** ——
+      主链路照常返回成功，只有值班的人"什么都没收到"。
+      指标里按渠道分成功/失败之后，一个 `rate(agentdesk_notify_total{ok="false"}[1h])`
+      就能把"机器人被限流了三天"这种事故从「没人发现」变成「看板上有一条线」。
+    整段兜住异常：指标是旁路，绝不能影响投递结果本身。
+    """
+    try:
+        from app.observability import metrics
+        for r in results or []:
+            metrics.counter("agentdesk_notify_total",
+                            {"channel": getattr(r, "channel", "?"),
+                             "ok": "true" if getattr(r, "ok", False) else "false"})
+    except Exception:                             # pragma: no cover
+        pass
+
+
 class Dispatcher:
     """把一次通知投给所有渠道。线程安全。
 
@@ -154,6 +173,7 @@ class Dispatcher:
             results = []
             for notifier in self.notifiers:
                 results.append(self._send_with_retry(notifier, title, text, payload))
+            _note_notify_metrics(results)
             return NotifyOutcome(results=results)
         except Exception as e:  # pragma: no cover - 兜底，正常路径不会到这里
             # 走到这里说明兜底代码自己坏了。宁可少一次通知，也不能让异常

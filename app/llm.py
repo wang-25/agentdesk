@@ -124,6 +124,36 @@ def _build_stream_payload(cfg, messages, temperature):
 # ============================================================
 # 二、一次性返回（非流式）
 # ============================================================
+def _note_model_metrics(usage: dict, model: str | None = None, ok: bool = True) -> None:
+    """把一次模型调用记进 Prometheus 指标（M4）。
+
+    【为什么要在模型层埋点，而不是在业务层】
+      业务层能看到的是"这次问答花了多久"，看不到 token 与钱的来源。
+      而"钱花在哪个模型上"这个问题只有模型层回答得了 ——
+      它同时还知道**服务端实际返回的模型**（可能和请求的不是同一个）。
+
+    ★ 整段兜住异常：指标是旁路。**指标写不进去不能让模型调用失败。**
+    """
+    try:
+        from app.observability import costs, metrics
+        metrics.counter("agentdesk_llm_calls_total", {"ok": "true" if ok else "false"})
+        if not ok:
+            return
+        usage = usage or {}
+        for kind, key in (("prompt", "prompt_tokens"),
+                          ("completion", "completion_tokens"),
+                          ("cache_hit", "prompt_cache_hit_tokens")):
+            value = usage.get(key)
+            if isinstance(value, (int, float)) and value:
+                metrics.counter("agentdesk_llm_tokens_total", {"kind": kind}, float(value))
+        cny = costs.cost_of(usage, model)
+        if cny:
+            metrics.counter("agentdesk_llm_cost_cny_total",
+                            {"model": costs.resolve_model(model)}, cny)
+    except Exception:                             # pragma: no cover
+        pass
+
+
 def chat(messages, temperature=0.7, timeout=60) -> str:
     """发一次对话请求，等模型把整段话说完再返回。
 
@@ -150,13 +180,16 @@ def chat(messages, temperature=0.7, timeout=60) -> str:
             # 为什么要翻译？因为上层不应该需要知道 httpx 的存在 ——
             # 万一哪天换成别的 HTTP 库，上层代码不用改。
             sp.set_error(e)
+            _note_model_metrics({}, None, ok=False)
             raise ModelError(f"连不上模型服务：{e}") from e
         except httpx.TimeoutException as e:
             sp.set_error("timeout")
+            _note_model_metrics({}, None, ok=False)
             raise ModelError(f"请求超时（{timeout}s）") from e
 
         if resp.status_code != 200:
             sp.set_error(f"HTTP {resp.status_code}")
+            _note_model_metrics({}, None, ok=False)
             raise ModelError(f"请求失败 HTTP {resp.status_code}: {resp.text[:300]}")
 
         data = resp.json()
@@ -166,6 +199,8 @@ def chat(messages, temperature=0.7, timeout=60) -> str:
         #   成本必须按返回的这个算 —— 单价表是按真实模型定价的。
         #   没有活跃 trace 时 _NullSpan 会静默吞掉，无副作用。
         sp.set("model_served", data.get("model") or cfg["model"])
+        _note_model_metrics(data.get("usage") or {},
+                            data.get("model") or cfg["model"])
         return data["choices"][0]["message"]["content"]
 
 

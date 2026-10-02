@@ -161,6 +161,21 @@ def _is_cost_path(path: str) -> bool:
     return path.startswith(COST_PREFIX)
 
 
+def _count_rejection(reason: str) -> None:
+    """把一次拒绝记进 Prometheus 指标。
+
+    ★ 为什么拒绝也要进指标：`/health` 里的计数是"看一眼"的，
+      而监控系统要的是"按原因分的时间序列" —— "今天 401 突然涨了 10 倍"
+      与"服务挂了"是完全不同的两件事，前者要查令牌分发，后者要查进程。
+      指标写入失败绝不能影响拒绝本身，所以整段兜住异常。
+    """
+    try:
+        from app.observability import metrics
+        metrics.counter("agentdesk_security_rejections_total", {"reason": reason})
+    except Exception:                             # pragma: no cover
+        pass
+
+
 def _extract_token(request: Request) -> str:
     """支持两种传法：X-API-Key 头，或 Authorization: Bearer。"""
     key = request.headers.get("x-api-key", "").strip()
@@ -224,6 +239,7 @@ def install_security(app: FastAPI) -> None:
         if not supplied or not secrets.compare_digest(supplied, AGENT_TOKEN):
             with _lock:
                 _rejected["auth"] += 1
+                _count_rejection("auth")
             log.warning("鉴权失败 path=%s ip=%s", path, ip)
             return JSONResponse(
                 status_code=401,
@@ -238,6 +254,7 @@ def install_security(app: FastAPI) -> None:
         if reason:
             with _lock:
                 _rejected["rate"] += 1
+                _count_rejection("rate")
             log.warning("限流拦截 reason=%s path=%s ip=%s", reason, path, ip)
             return JSONResponse(
                 status_code=429,
@@ -256,6 +273,7 @@ def install_security(app: FastAPI) -> None:
             if not ok:
                 with _lock:
                     _rejected["quota"] += 1
+                _count_rejection("quota")
                 log.warning("每日额度用尽 path=%s ip=%s", path, ip)
                 return JSONResponse(
                     status_code=429,
