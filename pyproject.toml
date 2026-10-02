@@ -35,9 +35,12 @@ ignore = [
 [tool.mypy]
 python_version = "3.12"
 # ★ 渐进式：当前只检查 tests/。
-#   老代码（1.3 万行、基本没有类型标注）先进 ignore 名单，
-#   里程碑推进时逐模块加进来 —— 而不是现在生成几千条无意义的报错。
+#   老代码（1.3 万行、基本没有类型标注）先不背债 —— 里程碑推进时逐模块加进来，
+#   而不是现在生成几千条无意义的报错、然后所有人学会无视 mypy。
 files = ["tests"]
+# silent = 仍然跟进 import 以便推断类型，但**不报导入模块内部的错误**。
+#   不设这个的话，光 import app.main 就会带出近百条老代码的历史类型错误。
+follow_imports = "silent"
 ignore_missing_imports = true
 check_untyped_defs = true
 warn_unused_ignores = false

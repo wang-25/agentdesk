@@ -251,7 +251,27 @@ class IntentParseFailed(Exception):
 
 
 def validate_intent(data: dict):
-    """检查意图解析结果。返回 (是否通过, 问题列表)。"""
+    """检查意图解析结果。返回 (是否通过, 问题列表)。
+
+    ★ 第一句必须挡住"根本不是一个对象"的输入。
+
+      模型输出裸 `null`、`[]`、数字都是**合法 JSON**，`app.llm.parse_json_reply`
+      会照原样解析出来并交给这里。而原先这里直接 `if field not in data` ——
+      对 None 会抛
+          TypeError: argument of type 'NoneType' is not iterable
+
+      这个异常的后果比"解析失败"严重得多：`parse_intent` 的 try 只捕获
+      `ModelError`，所以它会穿过 `/parse` 与 `/webhook/alert` 的
+      `except IntentParseFailed`，变成 **HTTP 500**，
+      并且**既不记 parse_failed 审计、也不触发重试** —— 无人值守链路静默中断
+      （凌晨三点那条告警就这么没了，日志里什么都查不到）。
+
+      **校验层的职责是"判定"，不是"把异常抛给调用方"。**
+      挡住之后，它退化成一个正常的"不合格 → 重试 → 到上限报错"路径。
+    """
+    if not isinstance(data, dict):
+        return False, [f"意图解析结果必须是 JSON 对象，收到 {type(data).__name__}"]
+
     problems = []
     for field in REQUIRED_FIELDS:
         if field not in data:

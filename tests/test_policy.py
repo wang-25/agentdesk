@@ -87,7 +87,9 @@ def test_attack_surface_is_denied(command):
 
 def test_none_command_is_denied_not_crash():
     """`decide` 永不抛异常 —— 调用方是模型，它需要的是理由而不是 traceback。"""
-    d = policy.decide(None)
+    # 故意传 None：运行时容错是这里要测的行为，类型标注上的"不该这么传"
+    # 正是这条用例的意义，所以定点豁免而不是关掉整个 arg-type 检查。
+    d = policy.decide(None)  # type: ignore[arg-type]
     assert d.decision == policy.DENY
 
 
@@ -124,13 +126,23 @@ def test_write_paths_are_stricter_than_read(command):
 
 
 def test_du_accepts_inspect_dirs_but_not_root_home():
-    """`du` 的目录准入：排查目录放行，敏感目录拒绝。
+    """`du` 的目录准入：排查目录放行，敏感目录拒绝，根目录单独放行。
 
     历史坑：`_INSPECT_DIRS` 里**混进过 `"/"`**，而校验用的是
     `startswith(d.rstrip("/") + "/")` —— 对 `"/"` 来说前缀退化成 `"/"`，
     于是任何绝对路径都成立，`du -sh /root` 被放行（`policy.py:264-277`）。
+
+    ★ 这条用例做过"门禁自证"：把表里的 `"/"` 和那个表达式**一起**注回去，
+      它必须变红（`assert 'allow' == 'deny'`）。
+      只注入表项是**抓不到**的 —— 因为现在的写法是
+      `target == d or target.startswith(d + "/")`，`"/"` 拼出来是 `"//"`，
+      对 `/root` 不成立。**修复是结构性的，不只是"把那行删掉"** ——
+      这条用例守的是结构，不是那一行字面值。
     """
     assert policy.decide("du -sh /var/lib/docker").decision != policy.DENY
+    # 根目录本身必须放行：`du -h -d1 /` 是定位"根分区被什么占满"的标准起点
+    assert policy.decide("du -sh /").decision != policy.DENY
+    assert policy.decide("du -h -d1 /").decision != policy.DENY
     for sensitive in ("/root", "/etc", "/boot"):
         assert policy.decide(f"du -sh {sensitive}").decision == policy.DENY, sensitive
 

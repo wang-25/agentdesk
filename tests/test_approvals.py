@@ -56,7 +56,7 @@ def test_create_records_what_will_actually_be_executed(new_approval):
 
 def test_created_approval_is_written_to_the_log_file(new_approval, approval_store):
     """先落盘再更新内存 —— 反过来的话，内存说"批准了"而盘上没有，重启就丢。"""
-    rec = new_approval()
+    new_approval()
     lines = approval_store.path.read_text(encoding="utf-8").strip().splitlines()
     assert len(lines) == 1
     assert json.loads(lines[0])["event"] == "created"
@@ -193,7 +193,7 @@ def test_expired_cannot_be_approved(approval_store, new_approval):
 
 def test_expiry_is_evaluated_on_access(new_approval, approval_store):
     """过期检查不能只在"有人访问"时才做 —— 值班的人不该看到早就该死的单子。"""
-    rec = new_approval(ttl=0)
+    new_approval(ttl=0)
     counts = approval_store.counts()
     assert counts.get(approvals.EXPIRED, 0) >= 1
 
