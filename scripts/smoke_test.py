@@ -17,11 +17,22 @@
     .venv\\Scripts\\python.exe scripts\\smoke_test.py --full    # 完整（含真实 Agent 调用 + MCP 协议自检）
 
 【注意】
-    - 第 6 层需要服务已在运行。没运行会自动跳过，并提示启动命令。
+    - 第 9 层需要服务已在运行。没运行会自动跳过，并提示启动命令。
     - 默认会真实调用模型 3 次（约 ¥0.001）；--full 再加一次 Agent 调用（约 ¥0.02）。
-    - 「跳过」和「失败」是两回事：服务没启动只会标 ⏭，退出码仍是 0。
 
-【退出码】0 = 已检查项全通；1 = 有真失败项
+【「跳过」分三类 —— 这不是抠字眼，是"别把没验证说成验证过了"】
+    env    环境未就绪（服务没起来）。**这是"该验证却没验证"** → --strict 下算失败
+    opt    你主动选择不跑（未加 --full，要花钱）。这是选择，不是缺陷
+    data   当前没有可验证的数据（还没有 trace / 还没有审批单）。不是缺陷
+
+    早先这三种混在一起，后果是：服务根本没启动，脚本照样 exit 0，
+    汇总还打印「已检查的项目全部通过」—— 看的人会以为九层都验证过了。
+    **"没检查"和"检查通过"必须能被区分开**，否则这个脚本会骗自己。
+
+【退出码】
+    0 = 已检查项全通（可能有 opt / data 跳过）
+    1 = 有真失败项
+    2 = --strict 且存在 env 型跳过（该验证的环境没就绪）
 """
 
 import asyncio
@@ -46,17 +57,33 @@ if str(PROJECT_ROOT) not in sys.path:
 
 BASE_URL = "http://127.0.0.1:8000"
 
-# 每一项检查结果：(层, 项目, 是否通过, 说明, 是否跳过)
+# 每一项检查结果：(层, 项目, 是否通过, 说明, 是否跳过, 跳过类型)
 # 「跳过」和「失败」必须区分：服务没启动就不该让脚本以失败退出，
 # 否则这个脚本没法放进自动化流程（一看退出码 1 就以为代码坏了）。
+#
+# 但「跳过」内部还要再分三类（env / opt / data）—— 原因见模块开头的说明：
+# 把"该验证却没验证"和"主动选择不跑"混在一起，exit 0 就会变成一句假话。
 results = []
+
+# 跳过类型
+SKIP_ENV = "env"      # 环境未就绪 → 该验证却没验证
+SKIP_OPT = "opt"      # 主动不跑（未加 --full）
+SKIP_DATA = "data"    # 没有可验证的数据
 
 
 def record(layer: str, item: str, ok: bool, note: str = "",
-           skipped: bool = False):
-    """记一条检查结果，并立刻打印。"""
-    results.append((layer, item, ok, note, skipped))
-    mark = "⏭ " if skipped else ("✅" if ok else "❌")
+           skipped: bool = False, kind: str = SKIP_OPT):
+    """记一条检查结果，并立刻打印。
+
+    kind 只在 skipped=True 时有意义，取值见上面的 SKIP_* 常量。
+    """
+    results.append((layer, item, ok, note, skipped, kind))
+    if not skipped:
+        mark = "✅" if ok else "❌"
+    elif kind == SKIP_ENV:
+        mark = "⚠️ "        # 未就绪，与"主动跳过"用不同的标记，避免看串
+    else:
+        mark = "⏭ "
     tail = f"   {note}" if note else ""
     print(f"  {mark} {item}{tail}")
 
@@ -824,9 +851,9 @@ def check_http(full: bool = False):
     try:
         httpx.get(f"{BASE_URL}/health", timeout=5)
     except Exception:
-        record("服务", "服务未启动（本层跳过）", False,
+        record("服务", "服务未启动（本层未验证）", False,
                "先执行：.venv\\Scripts\\python.exe -m uvicorn app.main:app --port 8000",
-               skipped=True)
+               skipped=True, kind=SKIP_ENV)
         return
 
     record("服务", "服务在线", True, BASE_URL)
@@ -1027,7 +1054,7 @@ def check_http(full: bool = False):
     else:
         record("接口", "GET  /traces/{id}（无 trace 可查）", False,
                "还没有任何 trace，先跑一次 /chat 或 /agent/ask",
-               skipped=True)
+               skipped=True, kind=SKIP_DATA)
 
     # GET /approvals + GET /approvals/{id}
     approval_id = None
@@ -1056,7 +1083,8 @@ def check_http(full: bool = False):
             record("接口", "GET  /approvals/{id}", False, brief(e))
     else:
         record("接口", "GET  /approvals/{id}（无审批单可查）", False,
-               "还没有审批单，先让 Agent 提一次写操作", skipped=True)
+               "还没有审批单，先让 Agent 提一次写操作", skipped=True,
+               kind=SKIP_DATA)
 
     # POST /agent/ask —— 真跑一轮 Agent，比较贵，只在 --full 时跑
     if full:
@@ -1084,15 +1112,31 @@ def check_http(full: bool = False):
     ok_n = len([r for r in probed if r[2] and not r[4]])
     skip_n = len([r for r in probed if r[4]])
     print(f"      → 本层实际探测 {len(probed)} 个：通过 {ok_n}，跳过 {skip_n}")
-    print("        OpenAPI 共 22 个，未覆盖的是**需要副作用的写操作**"
-          "（/rag/index 与 approvals 的 approve / reject / execute）——")
-    print("        它们在 security_check.py 的 23 项用例里单独验证，不在本层重复跑。")
+
+    # ★ OpenAPI 的操作总数**现场数出来**，不写死。
+    #   这里曾经写死「22 个」，而实测是 26 个 —— 正是本文件开头警告过的
+    #   "标题和事实对不上"。凡是能由脚本自己算出来的数字，就不该靠人记得改。
+    try:
+        spec = httpx.get(f"{BASE_URL}/openapi.json", timeout=10).json()
+        total = sum(len(v) for v in (spec.get("paths") or {}).values())
+        print(f"        OpenAPI 共 {total} 个操作（现场统计）；未覆盖的是"
+              "**需要副作用的写操作**")
+        print("        （/rag/index 与 approvals 的 approve / reject / execute）——"
+              "它们在 security_check.py 的 23 项用例里单独验证，不在本层重复跑。")
+    except Exception as e:
+        print(f"        OpenAPI 操作数：未能取到（{brief(e)}）")
 
 
 # ============================================================
 # 汇总
 # ============================================================
-def summarize():
+def summarize(strict: bool = False) -> int:
+    """打印汇总并返回退出码。
+
+    strict=True 时，env 型跳过（环境未就绪）视为失败 → 退出码 2。
+    理由：`--strict` 的语义是「**不允许该验证的层没被验证**」，
+    而 opt（没加 --full）和 data（没数据）都不是"漏验"，不参与判定。
+    """
     print("\n" + "=" * 62)
     print("  自检汇总")
     print("=" * 62)
@@ -1106,27 +1150,49 @@ def summarize():
         ok = sum(1 for r in rows if r[2] and not r[4])
         checked = len(rows) - skipped
         if skipped and checked == 0:
-            print(f"  {layer:4s} ⏭ 跳过　{len(rows)} 项")
+            env_n = sum(1 for r in rows if r[4] and r[5] == SKIP_ENV)
+            tag = "⚠️  未验证" if env_n else "⏭ 跳过"
+            print(f"  {layer:4s} {tag}　{len(rows)} 项")
             continue
         bar = "█" * ok + "░" * (checked - ok)
         tail = f"　(另跳过 {skipped} 项)" if skipped else ""
         print(f"  {layer:4s} {bar}  {ok}/{checked}{tail}")
 
     failed = [r for r in results if not r[2] and not r[4]]
-    skipped = [r for r in results if r[4]]
+    env_skips = [r for r in results if r[4] and r[5] == SKIP_ENV]
+    opt_skips = [r for r in results if r[4] and r[5] == SKIP_OPT]
+    data_skips = [r for r in results if r[4] and r[5] == SKIP_DATA]
+
     print()
     if failed:
         print(f"  ❌ {len(failed)} 项未通过：")
-        for layer, item, _, note, _ in failed:
+        for layer, item, _, note, *_ in failed:
             print(f"     · [{layer}] {item}　{note}")
         print("\n  → 从最下面的失败层往上修，上面那层通常是它的连带后果。")
-    elif skipped:
-        print("  ✅ 已检查的项目全部通过。")
-        print(f"  ⏭  有 {len(skipped)} 项被跳过（服务没在跑 / 未加 --full），可复跑。")
     else:
-        print("  ✅ 全部通过。九层技术栈都在工作。")
+        print("  ✅ 已检查的项目全部通过。")
+
+    # ---- 把"没验证"的东西单独摆出来，不许它藏在 ✅ 后面 ----
+    if env_skips:
+        print(f"\n  ⚠️  {len(env_skips)} 项**没有被验证**（环境未就绪 ≠ 通过）：")
+        for layer, item, _, note, *_ in env_skips:
+            print(f"     · [{layer}] {item}　{note}")
+    if opt_skips:
+        print(f"\n  ⏭  {len(opt_skips)} 项主动跳过（未加 --full，要花钱）。")
+    if data_skips:
+        print(f"  ⏭  {len(data_skips)} 项无数据可验证（不是缺陷）。")
+    if not (env_skips or opt_skips or data_skips):
+        print("\n  ✅ 全部通过。九层技术栈都在工作。")
+
+    code = 0
+    if failed:
+        code = 1
+    elif strict and env_skips:
+        code = 2
+        print(f"\n  ❌ --strict：{len(env_skips)} 项因环境未就绪而未被验证，"
+              "严格档下按失败处理（退出码 2）。")
     print("=" * 62)
-    return 1 if failed else 0
+    return code
 
 
 def main():
@@ -1136,12 +1202,15 @@ def main():
         description="AgentDesk 全链路自检（九层：环境/模型/检索/Agent/沙箱/观测/评测/MCP/接口）")
     parser.add_argument("--full", action="store_true",
                         help="额外跑一次真实 Agent 调用（约 7k token，默认跳过）")
+    parser.add_argument("--strict", action="store_true",
+                        help="环境未就绪导致的未验证项算失败（退出码 2）—— CI 里用这个")
     args = parser.parse_args()
 
     print("=" * 62)
     print("  AgentDesk 全链路自检")
     print(f"  项目目录：{PROJECT_ROOT}")
-    print(f"  模式：{'完整（含真实 Agent 调用）' if args.full else '快速（跳过花钱项）'}")
+    mode = "完整（含真实 Agent 调用）" if args.full else "快速（跳过花钱项）"
+    print(f"  模式：{mode}{'　·　严格档（未验证 = 失败）' if args.strict else ''}")
     print("=" * 62)
 
     steps = [lambda: check_env(),
@@ -1160,7 +1229,7 @@ def main():
             # 单个步骤意外崩了，不该拖垮整份报告
             record("脚本", "某一步", False, brief(e))
 
-    sys.exit(summarize())
+    sys.exit(summarize(strict=args.strict))
 
 
 if __name__ == "__main__":
