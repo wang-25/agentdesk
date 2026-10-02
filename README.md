@@ -303,15 +303,37 @@ curl -H "X-API-Key: <你的令牌>" \
 
 ---
 
-## 自检
+## 自检与测试
 
-一条命令跑完九层，退出码 0 = 全通，可接进 CI：
+**两件事要分清**：`smoke_test.py` 是**环境自检**（回答"这台机器上九层技术栈通不通"），
+`pytest` 是**回归测试**（回答"这次改动有没有弄坏既有行为"）。
+前者需要密钥、会花钱；后者零成本、不碰网络、每次提交都能跑。
 
 ```bash
-.venv\Scripts\python.exe scripts\smoke_test.py            # 快速（不花钱）
+# ---- 环境自检（会真实调用模型：快速档约 ¥0.001，--full 再加一次 Agent 调用约 ¥0.02）----
+.venv\Scripts\python.exe scripts\smoke_test.py            # 快速（跳过花钱项）
 .venv\Scripts\python.exe scripts\smoke_test.py --full     # 含真实 Agent 调用
+.venv\Scripts\python.exe scripts\smoke_test.py --strict   # 环境未就绪即算失败（退出码 2）
+
+# ---- 回归测试与门禁（零成本、无网络）----
+.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+.venv\Scripts\python.exe -m pytest -q                     # 单元 + 接口层（进程内 TestClient）
+.venv\Scripts\python.exe -m ruff check tests              # lint（当前只强制 tests/）
 .venv\Scripts\python.exe scripts\security_check.py        # 公网安全层 23 项
+.venv\Scripts\python.exe scripts\mcp_check.py             # MCP 协议层 9/9
+.venv\Scripts\python.exe scripts\eval_baseline.py         # 检索基线门禁（退化超容差即失败）
 ```
+
+**退出码**：`0` = 已检查项全通 · `1` = 有真失败项 · `2` = `--strict` 且存在"环境未就绪导致的未验证项"。
+
+**"跳过"分三类，汇总里分开列**：环境未就绪（该验证却没验证，`--strict` 下算失败）／
+主动不跑（未加 `--full`，要花钱）／无数据可验证（还没有 trace 或审批单）。
+如此区分的原因很直接：**"没检查"和"检查通过"必须能被区分开** ——
+早先三种混在一起时，服务根本没启动也照样 `exit 0` 并打印"已检查的项目全部通过"。
+
+CI 见 [`.github/workflows/ci.yml`](.github/workflows/ci.yml)：
+必需档**零成本**（pytest + ruff + mypy + 安全层 + MCP + 检索基线），
+真实模型端到端档手动触发（需要仓库配置 `DEEPSEEK_API_KEY`）。
 
 | 层         | 覆盖内容                     |
 | --------- | ------------------------ |
@@ -323,7 +345,7 @@ curl -H "X-API-Key: <你的令牌>" \
 | 6 · 观测    | trace 嵌套顺序、成本归因口径        |
 | 7 · 评测    | 评测资产本身的自证（判定器不自欺）        |
 | 8 · MCP   | schema 漂移校验、协议层握手        |
-| 9 · 接口    | 22 个 HTTP 接口的存活与鉴权边界     |
+| 9 · 接口    | OpenAPI 操作里抽测（入口标题不写死条数，条数由脚本现场统计） |
 
 ---
 
@@ -345,12 +367,16 @@ agentdesk/
 ├── data/
 │   ├── knowledge/          运维知识库语料（10 篇）
 │   └── index/              构建产物（可重建，不进仓库）
-├── docs/                   10 份专题文档（见下）
-├── eval/                   评测集与报告
+├── docs/                   专题文档（见下）+ redev/ 二次创作尽调与路线图
+├── eval/                   评测集、报告与检索基线（baseline.json）
 ├── scripts/                自检 / 评测 / 演示脚本
+├── tests/                  pytest 回归测试（零成本、无网络，见 conftest.py）
+├── .github/workflows/      CI：必需档零成本 + 真实模型档手动触发
+├── pyproject.toml          工具链配置（ruff / pytest / mypy；**不是**打包配置）
 ├── Dockerfile              生产镜像（非 root + 健康检查 + workers=1）
 ├── docker-compose.yml      生产编排（内存硬上限 + 端口只绑回环）
-└── requirements.txt        直接依赖仅 9 个
+├── requirements.txt        直接依赖仅 9 个
+└── requirements-dev.txt    开发依赖 3 个（pytest / ruff / mypy）
 ```
 
 ---

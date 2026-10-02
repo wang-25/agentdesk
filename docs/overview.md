@@ -96,16 +96,28 @@ https://agent.simosheng.fun/docs   # 线上（先点右上角 Authorize 填令�
 .venv\Scripts\python.exe -m app.mcp_server.server --check   # 工具清单 + schema 校验
 ```
 
-### ④ 一条命令自检 —— 改完代码先跑这个
+### ④ 自检与回归测试 —— 改完代码先跑这个
 
 ```bash
-.venv\Scripts\python.exe scripts\smoke_test.py            # 九层快速自检（不花钱）
+# 环境自检（九层；会真实调用模型，快速档约 ¥0.001）
+.venv\Scripts\python.exe scripts\smoke_test.py            # 快速（跳过花钱项）
 .venv\Scripts\python.exe scripts\smoke_test.py --full     # 含真实 Agent 调用
+.venv\Scripts\python.exe scripts\smoke_test.py --strict   # 环境未就绪即算失败
+
+# 回归测试与门禁（零成本、无网络，CI 必需档跑的就是这些）
+.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+.venv\Scripts\python.exe -m pytest -q
 .venv\Scripts\python.exe scripts\security_check.py        # 公网安全层 23 项
+.venv\Scripts\python.exe scripts\eval_baseline.py         # 检索基线门禁
 ```
 
 **九层**：环境 → 模型 → 检索 → Agent → 沙箱 → 观测 → 评测 → MCP → HTTP 接口。
-退出码 0 = 全通，可以接进自动化。
+
+**退出码**：`0` = 已检查项全通 · `1` = 有真失败 · `2` = `--strict` 且存在"环境未就绪导致的未验证项"。
+跳过分三类（环境未就绪 / 主动不跑 / 无数据可验证），汇总里分开列 ——
+早先三种混在一起时，**服务没启动也照样 exit 0 并打印"已检查的项目全部通过"**。
+自检能说明"这台机器上通不通"，但**它不能替代回归测试**：CI 的零成本档用的是
+`pytest`（单元 + 进程内接口层）+ 上面那几个脚本，见 `.github/workflows/ci.yml`。
 
 ### ⑤ 现场演示
 
