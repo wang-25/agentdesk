@@ -148,18 +148,27 @@ def test_empty_payload_does_not_crash_and_yields_one_placeholder():
     assert got["status"] == "firing"
 
 
-def test_empty_alerts_array_falls_back_to_the_payload_itself():
-    """★ 注意 `alerts: []` 的语义：`or` 把它当成"没有数组"，于是回退成整包一条。
+def test_empty_alerts_array_is_an_empty_batch_not_an_alert():
+    """★ `alerts: []` 是"本次没有告警"，**不再**回退成凭空一条 `UnknownAlert`（M2 修复）。
 
-    这是**已知的语义含混**：`[]`（明确说了"这次没有告警"）与
-    `{}`（没给任何信息）在当前实现里产出完全一样的一条 `UnknownAlert`。
-    后果：Alertmanager 推送一次空批次，也会触发一轮"UnknownAlert 诊断"
-    （若开启了自动诊断，就是一次白花的模型调用）。
-    这里固化当前行为；若改成"空数组返回空列表"，这条要跟着改。
+    原先的实现是 `payload.get("alerts") or [payload]` —— 空列表是假值，
+    于是回退成"把整个 payload 当成一条告警"，产出一条 `UnknownAlert`。
+    后果：Alertmanager 推一次空批次（恢复通知、维护窗口内的空推送），
+    在 `ALERT_AUTO_DIAGNOSE=1` 时会白跑一整轮模型 ——
+    而且**产出的是一个捏造出来的故障结论**，比白花钱更糟。
+
+    现在按"有没有 alerts 这个键"分支：
+      `{"alerts": []}` → 空列表（明确的无告警）
+      `{}`             → 才回退成单条告警（旧行为保留，见下一条用例）
     """
-    assert m.normalize_alerts({"alerts": []}) == m.normalize_alerts({})
-    assert [a["alertname"] for a in m.normalize_alerts({"alerts": []})] == \
-        ["UnknownAlert"]
+    assert m.normalize_alerts({"alerts": []}) == []
+    assert m.normalize_alerts({"alerts": [], "status": "firing"}) == []
+
+
+def test_missing_alerts_key_still_falls_back_to_a_single_alert():
+    """没有 alerts 键时才回退 —— 扁平格式（脚本直接 POST）必须继续能用。"""
+    got = m.normalize_alerts({})
+    assert [a["alertname"] for a in got] == ["UnknownAlert"]
 
 
 @pytest.mark.parametrize("raw", [
