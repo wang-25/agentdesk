@@ -36,6 +36,7 @@ READONLY_GETS = [
     "/agent/graph",
     "/sandbox",
     "/approvals",
+    "/incidents",
     "/traces",
     "/metrics/summary",
     "/audit",
@@ -52,6 +53,7 @@ PROTECTED_PATHS = [
     "/traces",
     "/audit",
     "/approvals",
+    "/incidents",
     "/metrics/summary",
     "/sandbox",
     "/agent/tools",
@@ -72,6 +74,8 @@ REQUIRED_WRITE_OPS = [
     ("/approvals/{approval_id}/approve", "post"),
     ("/approvals/{approval_id}/reject", "post"),
     ("/approvals/{approval_id}/execute", "post"),
+    ("/incidents/{incident_id}/ack", "post"),
+    ("/incidents/{incident_id}/resolve", "post"),
 ]
 
 
@@ -84,10 +88,27 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setattr(approvals, "_STORE",
                         approvals.ApprovalStore(path=tmp_path / "approvals.jsonl"))
     monkeypatch.setattr(tracer, "TRACE_PATH", tmp_path / "traces.jsonl")
+    _isolate_incidents(tmp_path, monkeypatch)
     # 令牌与数据源与测试无关，这里显式保证是"本地开发"档
     monkeypatch.setattr(security, "AUTH_ENABLED", False)
     with TestClient(main.app) as c:
         yield c
+
+
+def _isolate_incidents(tmp_path, monkeypatch):
+    """事件存储也要隔离 —— 否则敲一下 `/incidents` 就会往真实 logs/ 写。
+
+    ★ 这条是冲着一次真实事故加的：M1 期间就有一条漏加隔离装置的用例
+      把假 trace 写进了真实 logs/traces.jsonl，把对外成本口径压低了 12 倍。
+      **新加会落盘的功能时，隔离装置必须同步加上**，而不是等出事了再补。
+    """
+    try:
+        import app.incident.store as incident_store_mod
+    except ImportError:                       # 事件模块尚未接线时不阻塞其它用例
+        return
+    fresh = incident_store_mod.IncidentStore(path=tmp_path / "incidents.jsonl")
+    monkeypatch.setattr(incident_store_mod, "store", lambda: fresh)
+    monkeypatch.setattr(incident_store_mod, "_STORE", fresh, raising=False)
 
 
 @pytest.fixture
@@ -255,3 +276,34 @@ def test_sandbox_status_exposes_the_whitelist_summary(client):
     assert "fail" in text.lower() or "closed" in text.lower() or "closed" in text
     # 白名单的真实条数必须能在响应里对上（别让接口报一个手写的数字）
     assert len(policy.catalog()) == len(policy.COMMANDS)
+
+
+# ============================================================
+# 六、事件（Incident）接口的行为
+# ============================================================
+def test_incident_list_is_empty_before_anything_happens(client):
+    body = client.get("/incidents").json()
+    assert body.get("items") == []
+    assert body.get("counts", {}).get("total", 0) == 0
+
+
+def test_incident_unknown_id_returns_404(client):
+    assert client.get("/incidents/inc-nope").status_code == 404
+
+
+def test_incident_ack_requires_a_person(client):
+    """认领事件必须写清是谁 —— 与"批准必须填审批人"同一条原则。"""
+    for payload in ({}, {"by": ""}, {"by": "   "}):
+        r = client.post("/incidents/inc-nope/ack", json=payload)
+        assert r.status_code in (400, 404, 422), payload
+
+
+def test_incident_resolve_requires_a_person(client):
+    for payload in ({}, {"by": ""}):
+        r = client.post("/incidents/inc-nope/resolve", json=payload)
+        assert r.status_code in (400, 404, 422), payload
+
+
+def test_incident_status_filter_is_honoured(client):
+    body = client.get("/incidents", params={"status": "open"}).json()
+    assert body.get("items") == []

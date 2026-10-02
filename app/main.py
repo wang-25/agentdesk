@@ -80,15 +80,19 @@ from fastapi.openapi.utils import get_openapi
 from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
+from app import security
+from app.alerting import AlertAggregator, Silence
+from app.alerting import alert_to_question, normalize_alerts   # noqa: F401  ← 对外 re-export
+from app.incident.model import IncidentError
 from app.llm import PROJECT_ROOT, ModelError
+from app.llm import chat as llm_chat
+from app.llm import chat_json, chat_stream_async
+from app.notify import events as notify_events
 from app.observability import costs as obs_costs
 from app.observability import langfuse_export, tracer as obs
 
 # 配了 LANGFUSE_* 环境变量才生效；没配就是本地记录模式，功能不受影响
 langfuse_export.install()
-from app import security
-from app.llm import chat as llm_chat
-from app.llm import chat_json, chat_stream_async
 
 # ============================================================
 # 应用实例
@@ -171,6 +175,12 @@ def write_audit(event: str, detail: dict) -> dict:
     with open(AUDIT_LOG, "a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
     return record
+
+
+# 通知层的审计出口：app/notify 刻意不 import 本模块（否则循环导入），
+# 它通过这个钩子拿到写审计的函数。**通知的痕迹必须落在审计里** ——
+# 否则"以为在通知、其实一直失败"会静默很久。
+notify_events.set_audit_hook(write_audit)
 
 
 def _display_path(path) -> str:
@@ -330,30 +340,53 @@ def parse_intent(question: str):
 
 
 # ============================================================
-# 告警归一化与处置预案
+# 告警链路：配置与状态
 # ============================================================
-# 不同告警系统推过来的格式不一样。统一成同一种结构，
-# 后面的逻辑就不用关心数据是从哪来的 —— 这叫「归一化」。
+# 归一化（normalize_alerts）与提问拼装（alert_to_question）已经搬去
+# app/alerting/normalize.py —— 这样它们能被单独测试，不用 import 整个服务入口。
+# 本文件顶部 re-export 了这两个名字，既有调用方与测试一行都不用改。
+#
+# 聚合与抑制（app/alerting/）解决的是"调模型**之前**"该做的事：
+#   聚合：一场风暴里 50 条同源告警是一个故障，不是 50 个 → 只诊断一次
+#   抑制：计划内维护窗口里的告警不该叫人起床
 
 # ★ 是否让告警**真的**触发一轮 Agent 诊断。**默认关闭。**
 #
 #   为什么默认关：开启后每条告警都要跑一次完整的模型链路（实测 6–20 秒、
 #   几分钱）。"自动"是有价的 —— 凌晨网络抖一下推 500 条告警，
-#   就是 500 次诊断。所以在能力打开的同时，必须带上下面两道闸：
+#   就是 500 次诊断。所以在能力打开的同时，必须带上下面三道闸：
 #
-#     ① 去重：同名 + 同机的告警，窗口内只处理一次
-#     ② 频控：每小时最多自动诊断 N 次，超了转人工
+#     ① 去重/聚合：同源告警窗口内只处理一次，其余并入同一个事件
+#     ② 抑制：维护窗口内的告警直接跳过
+#     ③ 频控：每小时最多自动诊断 N 次，超了转人工
 #
-#   **这两道闸必须挡在调模型之前**，否则被抑制的那部分告警也在悄悄烧钱，
+#   **这三道闸必须挡在调模型之前**，否则被抑制的那部分告警也在悄悄烧钱，
 #   那才是真正的"告警风暴"。
 ALERT_AUTO_DIAGNOSE = (os.getenv("ALERT_AUTO_DIAGNOSE", "0").strip() == "1")
 ALERT_DEDUP_SECONDS = int(os.getenv("ALERT_DEDUP_SECONDS", "600"))
 ALERT_MAX_PER_HOUR = int(os.getenv("ALERT_MAX_PER_HOUR", "10"))
 
-# 去重与频控的计数（进程内内存态，与限流层同一种取舍：重启即清零）。
-# 单进程部署下准确；多实例需要换成 Redis —— 已知边界，不隐藏。
-_ALERT_LAST_SEEN = {}                      # (alertname, host) -> 上次处理的时间戳
+# 聚合开关（默认开）：
+#   1 = 按「主机 + 服务」聚合：50 条同源告警 → 1 个事件、1 次诊断
+#   0 = 退回旧的「告警名 + 主机」精确去重语义，行为与加这个开关之前完全一致
+ALERT_AGGREGATE = (os.getenv("ALERT_AGGREGATE", "1").strip() == "1")
+ALERT_AGG_MAX_ENTRIES = int(os.getenv("ALERT_AGG_MAX_ENTRIES", "5000"))
+
+# 告警入口是否异步（默认同步，与既有响应形态一致）
+ALERT_ASYNC = (os.getenv("ALERT_ASYNC", "0").strip() == "1")
+
+# ★ 去重/聚合表。它替代了原先那个 `_ALERT_LAST_SEEN = {}` ——
+#   旧实现只增不减：长期运行内存单调增长，而且不报错、不告警，
+#   只是一天天变大（那种"谁也不会注意到"的泄漏）。
+#   新实现带 TTL 与容量上限，超了先清过期、再淘汰最旧的。
+_ALERT_AGG = AlertAggregator(
+    window_seconds=ALERT_DEDUP_SECONDS,
+    aggregate=ALERT_AGGREGATE,
+    max_entries=ALERT_AGG_MAX_ENTRIES,
+)
+_ALERT_SILENCE = Silence()
 _ALERT_HOUR = {"hour": "", "count": 0}
+
 DIAGNOSE_PLAYBOOK = {
     "nginx": ["systemctl status nginx", "tail -100 /var/log/nginx/error.log",
               "df -h", "ss -lntp | grep :80"],
@@ -367,61 +400,9 @@ DIAGNOSE_PLAYBOOK = {
 DEFAULT_PLAYBOOK = ["uptime", "df -h", "free -m", "systemctl --failed"]
 
 
-def normalize_alerts(payload: dict) -> list:
-    """把告警统一成同一种结构。
-
-    兼容两种输入：
-      1. Alertmanager 标准格式（顶层有 alerts 数组，每个元素带 labels / annotations）
-      2. 最简单的扁平格式（直接给 alertname / host / summary）
-    """
-    raw_list = payload.get("alerts") or [payload]
-    result = []
-    for raw in raw_list:
-        labels = raw.get("labels") or {}
-        annotations = raw.get("annotations") or {}
-
-        # instance 常带端口（web-01:9100），主机名只取冒号前面那段
-        instance = (labels.get("instance") or raw.get("host")
-                    or raw.get("instance") or "")
-        host = instance.split(":")[0] if instance else None
-
-        result.append({
-            "alertname": (labels.get("alertname") or raw.get("alertname")
-                          or "UnknownAlert"),
-            "severity": (labels.get("severity") or raw.get("severity")
-                         or "unknown"),
-            "instance": instance,
-            "host": host,
-            "service": labels.get("service") or raw.get("service"),
-            "summary": annotations.get("summary") or raw.get("summary") or "",
-            "description": (annotations.get("description")
-                            or raw.get("description") or ""),
-            "status": raw.get("status") or payload.get("status") or "firing",
-        })
-    return result
-
-
-def alert_to_question(alert: dict) -> str:
-    """把告警拼成一句自然语言，交给意图解析器去理解。
-
-    【为什么不直接按字段规则判断，而要绕一圈用模型？】
-    规则判断只能处理你预先想到的情况。而告警名是千奇百怪的
-    （NginxHighErrorRate、DiskSpaceLow、ServiceDown……），
-    写规则永远补不完。让模型理解语义，是把「穷举」换成「理解」。
-    """
-    parts = [f"收到告警：{alert['alertname']}"]
-    if alert.get("host"):
-        parts.append(f"主机：{alert['host']}")
-    if alert.get("service"):
-        parts.append(f"服务：{alert['service']}")
-    if alert.get("severity") and alert["severity"] != "unknown":
-        parts.append(f"级别：{alert['severity']}")
-    if alert.get("summary"):
-        parts.append(f"摘要：{alert['summary']}")
-    if alert.get("description"):
-        parts.append(f"详情：{alert['description']}")
-    parts.append("请判断应该采取什么动作，以及风险等级。")
-    return "；".join(parts)
+# `normalize_alerts` / `alert_to_question` 已搬到 app/alerting/normalize.py，
+# 本文件顶部 re-export（`m.normalize_alerts` 这类既有引用照常可用）。
+# 搬家的理由：它们与告警聚合/抑制是一件事，放一起才能单独测。
 
 
 # ============================================================
@@ -2309,6 +2290,14 @@ def webhook_alert(payload: dict):
     alerts = normalize_alerts(payload)
     reports = []
 
+    # ★ 空批次不是告警。
+    #   归一化层已经不再把 `{"alerts": []}` 变成一条凭空捏造的 UnknownAlert（D6），
+    #   这里再把"确实收到 0 条"如实说清楚 —— 而不是返回一个看不出发生过什么的响应。
+    if not alerts:
+        write_audit("alert.empty_batch", {"keys": sorted((payload or {}).keys())})
+        return {"received": 0, "reports": [],
+                "message": "空告警批次（alerts 为空）：未建事件、未触发任何诊断"}
+
     for alert in alerts:
         question = alert_to_question(alert)
         base = {
@@ -2317,23 +2306,64 @@ def webhook_alert(payload: dict):
             "severity": alert["severity"],
         }
 
-        # ---- 第 0 步：去重 + 频控，两道闸都挡在"花钱"之前 ----
+        # ---- 第 0 步：抑制 / 聚合 / 频控，三道闸都挡在"花钱"之前 ----
         # ★ 顺序是关键：必须在 parse_intent（调模型）**之前**判。
         #   放在之后的话，被抑制的那部分告警也已经为每个 token 付过钱了 ——
         #   抑制的意义在于不花钱，不在于不返回。
-        key = (alert["alertname"], alert.get("host"))
-        now = time.time()
-        last = _ALERT_LAST_SEEN.get(key)
-        if last is not None and (now - last) < ALERT_DEDUP_SECONDS:
-            report = {**base, "decision": "suppressed_duplicate",
-                      "reason": (f"{ALERT_DEDUP_SECONDS}s 内已处理过同名同机的告警，"
-                                 f"本次跳过（不重复花钱）")}
+
+        # 闸 1：维护窗口。
+        #   计划内变更（磁盘扩容 / 发版 / 主从切换）本来就会触发一堆告警。
+        #   不抑制的话，Agent 会认真地为你自己的维护动作做诊断并推通知 ——
+        #   几次之后值班的人就开始无视通知了，**那才是真正的事故**。
+        silence_hit = _ALERT_SILENCE.match(alert)
+        if silence_hit:
+            report = {**base, "decision": "silenced",
+                      "reason": (f"命中维护窗口：{silence_hit.get('note') or '（无备注）'}"
+                                 f"（{silence_hit['_matched_until']} 前生效），"
+                                 f"本次不诊断"),
+                      "playbook": []}
+            write_audit("alert.silenced", {
+                **report,
+                "rule": {k: v for k, v in silence_hit.items()
+                         if not k.startswith("_")},
+            })
+            reports.append(report)
+            continue
+
+        # 闸 2：去重 / 聚合。
+        #   窗口内同源告警只处理一次，其余作为成员并入**同一个事件**。
+        #   **被抑制 ≠ 被丢弃** —— 下面会给它一个 incident_id，
+        #   值班的人能看到"这条告警去哪了"，而不是凭空少了一条。
+        verdict = _ALERT_AGG.ingest(alert)
+        if not verdict.is_new:
+            incident_id = verdict.prev_incident_id
+            if incident_id:
+                _link_alert_quietly(incident_id, alert)
+            if ALERT_AGGREGATE:
+                decision = ("merged_into_incident" if incident_id
+                            else "suppressed_duplicate")
+                reason = (f"{ALERT_DEDUP_SECONDS}s 内已处理过同源告警"
+                          f"（{verdict.key}），本次并入事件后跳过诊断"
+                          f"（不重复花钱）；这是窗口内第 {verdict.members} 条")
+            else:
+                # 聚合关掉时**保持改动前的字段值与原文案** —— "可以一键回退"
+                # 如果连 decision 的取值都变了，回退就不是回退。
+                # 事件归并仍然发生，但只体现在新增字段 incident_id 上。
+                decision = "suppressed_duplicate"
+                reason = (f"{ALERT_DEDUP_SECONDS}s 内已处理过同名同机的告警，"
+                          f"本次跳过（不重复花钱）")
+            report = {**base,
+                      "decision": decision,
+                      "reason": reason,
+                      "incident_id": incident_id or None,
+                      "members": verdict.members,
+                      "playbook": []}
             write_audit("alert.suppressed", report)
             reports.append(report)
             continue
-        _ALERT_LAST_SEEN[key] = now
 
-        hour = time.strftime("%Y%m%d%H", time.localtime(now))
+        # 闸 3：频控
+        hour = time.strftime("%Y%m%d%H", time.localtime())
         if _ALERT_HOUR["hour"] != hour:
             _ALERT_HOUR["hour"] = hour
             _ALERT_HOUR["count"] = 0
@@ -2345,6 +2375,15 @@ def webhook_alert(payload: dict):
             reports.append(report)
             continue
         _ALERT_HOUR["count"] += 1
+
+        # ---- 事件：把这条告警挂到一个"故障"上，而不是散着 ----
+        #   这一步刻意放在三道闸**之后**：被抑制/被频控的告警不该凭空开一个事件。
+        #   建事件失败不阻断诊断（事件是"记账"，不是"诊断的前提"）。
+        incident = _open_incident(alert)
+        incident_id = incident.get("id", "")
+        if incident_id:
+            _ALERT_AGG.bind_incident(verdict.key, incident_id)
+            _link_alert_quietly(incident_id, alert)
 
         # ---- 第一步：理解告警 ----
         try:
@@ -2434,10 +2473,92 @@ def webhook_alert(payload: dict):
                                "要让它真去查，把 ALERT_AUTO_DIAGNOSE=1 打开"
                                "（每条告警会跑一次模型，有去重与频控兜底）")}
 
+        # ---- 归宿：把结论写回事件，并把结论推到"人真正会看的地方" ----
+        if incident_id:
+            _attach_diagnosis_quietly(incident_id, report)
+            report["incident_id"] = incident_id
+
         write_audit("alert.handled", report)
+
+        # ★ 这一步是 M2 存在的理由：告警链路的终点原来只有"HTTP 响应 + audit.jsonl"，
+        #   凌晨三点**没有任何人会被叫醒**。诊断做得再对，送不到人手上就等于没做。
+        #   通知是旁路：events.send 永不抛异常，推不出去只留一条失败记录。
+        _notify_incident(report, incident_id, verdict.members)
+
         reports.append(report)
 
     return {"received": len(alerts), "reports": reports}
+
+
+# ============================================================
+# 事件与通知：把"一次告警处理"落到一个可追踪的故障上
+# ============================================================
+def _incident_store():
+    """拿到事件存储。
+
+    ★ 必须在**请求时**取单例，不能顶层绑定。
+      测试用 monkeypatch 替换 `app.incident.store.store` 来把落盘改到临时目录；
+      顶层 `from ... import store` 会把函数对象绑死，隔离装置就失效了 ——
+      那正是 M1 那次"假 trace 写进真实 logs"的事故形态（成本口径被压低 12 倍）。
+    """
+    from app.incident import store as incident_store
+    return incident_store.store()
+
+
+def _open_incident(alert: dict) -> dict:
+    """为一条告警建立事件。失败只记审计，不阻断诊断。"""
+    try:
+        return _incident_store().create(
+            source="alert",
+            host=alert.get("host") or "",
+            service=alert.get("service") or "",
+            severity=alert.get("severity") or "unknown",
+            summary=alert.get("summary") or "",
+        )
+    except Exception as e:
+        write_audit("incident.create_failed", {
+            "alertname": alert.get("alertname"),
+            "error": f"{type(e).__name__}: {e}"})
+        return {}
+
+
+def _link_alert_quietly(incident_id: str, alert: dict) -> None:
+    """把一条告警并入事件的成员列表。失败不阻断（少记一条成员不影响处置）。"""
+    try:
+        _incident_store().link_alert(incident_id, alert)
+    except Exception:
+        pass
+
+
+def _attach_diagnosis_quietly(incident_id: str, report: dict) -> None:
+    """把诊断结论写回事件。过不了校验/失败的结论也如实记（ok=False）。"""
+    answer = report.get("answer")
+    if not answer:
+        return
+    try:
+        _incident_store().attach_diagnosis(
+            incident_id, str(answer),
+            trace_id=report.get("trace_id"),
+            ok=report.get("decision") != "diagnose_failed")
+    except Exception:
+        pass
+
+
+def _notify_incident(report: dict, incident_id: str, members: int) -> None:
+    """推通知，并把投递结果记回事件（送达与失败都记，**失败不许谎报成功**）。"""
+    outcome = notify_events.incident(report, incident_id=incident_id, members=members)
+    if outcome is None or not incident_id:
+        return
+    results = getattr(outcome, "results", []) or []
+    ok = bool(getattr(outcome, "ok", False)) and not getattr(outcome, "deduped", False)
+    err = "" if ok else "; ".join(
+        f"{r.channel}: {r.error}" for r in results if not r.ok) or "已去重"
+    try:
+        _incident_store().mark_notified(
+            incident_id, ",".join(getattr(r, "channel", "?") for r in results) or "none",
+            ok, err)
+    except Exception:
+        pass
 
 
 # ============================================================
@@ -3048,7 +3169,106 @@ def _execute_approved(approval_id: str, req: ApprovalAction):
         "isolated": result.isolated, "backend": result.backend,
         "exit_code": result.exit_code, "elapsed_ms": result.elapsed_ms,
     })
+
+    # ★ 执行结果推给值班的人。失败的**更要推**：
+    #   approvals.jsonl 里那条 result_ok 是在执行**之前**写下的（见 audit 报告 C4），
+    #   所以"审批记录说成功、实际失败"这件事只能靠通知把真值送到人手上。
+    notify_events.approval_executed(rec, payload)
+
     return {"approval": st.get(approval_id), "result": payload}
+
+
+# ============================================================
+# 十二·B、事件（Incident）—— 一个故障一个对象
+# ============================================================
+# 为什么要有这一层：告警是**现象**，事件是**一次故障**。
+# 凌晨一次磁盘写满可能打出 50 条告警，它们是同一个故障的不同侧面。
+# 没有事件这一层，就会出现三件事：
+#     ① 值班的人收到 50 条通知，然后学会无视通知（告警疲劳）
+#     ② 模型被调用 50 次，花 50 份钱，得出 50 个互相矛盾的结论
+#     ③ 复盘时没有任何地方能回答"这次故障是谁处理的"
+class IncidentAction(BaseModel):
+    """事件的认领/结单请求。
+
+    `by` 必填 —— 与审批单"批准必须填审批人"同一条原则：
+    **每一次状态变化都要有人负责**。事故复盘时"系统自己结的"不是一个能交差的回答。
+    """
+
+    by: str = Field(..., min_length=1, max_length=80,
+                    description="操作人（必填）")
+    note: str = Field("", max_length=500, description="备注")
+
+
+def _require_incident(incident_id: str) -> dict:
+    """取事件；不存在就 404（而不是把 store 的异常直接漏成 500）。"""
+    try:
+        return _incident_store().get(incident_id)
+    except IncidentError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+
+
+@app.get("/incidents")
+def list_incidents(
+    status: Optional[str] = Query(
+        None, description="按状态过滤：open / ack / resolved / reopened"),
+    limit: int = Query(50, ge=1, le=200, description="返回最近多少条"),
+):
+    """事件列表。
+
+    `aggregate` 字段如实报出当前是"按主机+服务聚合"还是"旧的精确去重" ——
+    免得看的人以为开了聚合、其实配置里关着。
+    """
+    st = _incident_store()
+    return {
+        "items": st.list(status=status, limit=limit),
+        "counts": st.counts(),
+        "aggregate": _ALERT_AGG.describe(),
+        "notify": notify_events.describe(),
+    }
+
+
+@app.get("/incidents/{incident_id}")
+def get_incident(incident_id: str):
+    """单个事件详情（含完整时间线与成员告警）。"""
+    return _require_incident(incident_id)
+
+
+@app.post("/incidents/{incident_id}/ack")
+def ack_incident(incident_id: str, req: IncidentAction):
+    """认领事件：**谁在处理**这件事必须有名字。
+
+    先取一次（404 判定），再迁移（状态不合法 → 400）。
+    两步分开是为了让"这个 id 不存在"和"这个操作现在不允许"返回不同的状态码 ——
+    调用方能据此决定是刷新列表还是改操作。
+    """
+    _require_incident(incident_id)
+    try:
+        rec = _incident_store().ack(incident_id, by=req.by, note=req.note)
+    except IncidentError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    write_audit("incident.ack", {"incident_id": incident_id, "by": req.by,
+                                 "note": req.note, "status": rec.get("status")})
+    return rec
+
+
+@app.post("/incidents/{incident_id}/resolve")
+def resolve_incident(incident_id: str, req: IncidentAction):
+    """结单：谁结的 + 为什么结（note 就是复盘的第一手材料）。"""
+    _require_incident(incident_id)
+    try:
+        rec = _incident_store().resolve(incident_id, by=req.by, note=req.note)
+    except IncidentError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    write_audit("incident.resolve", {"incident_id": incident_id, "by": req.by,
+                                     "note": req.note, "status": rec.get("status")})
+    # 结单也通知一声：处置完成是值班场景里最该被看见的一条状态变化
+    notify_events.send(
+        f"[AgentDesk] 事件 {incident_id} 已结单",
+        f"**已结单**\n\n- 事件：`{incident_id}`\n- 处理人：{req.by}\n"
+        f"- 说明：{req.note or '（无）'}",
+        key=f"incident-resolved:{incident_id}",
+        payload={"incident_id": incident_id, "by": req.by})
+    return rec
 
 
 # ============================================================

@@ -933,6 +933,13 @@ def run_command(command: str, purpose: str = "") -> dict:
         base["hint"] = ("已提交人工审批，尚未执行。请在结果里告诉用户："
                         f"需有人确认后才会执行（审批单 {rec['id']}）。"
                         "不要假装已经执行完成。")
+
+        # ★ 审批单是**卡在人身上**的：没人知道它存在，它就会一直躺着，
+        #   30 分钟后过期，而告警那边还在等处置。
+        #   所以"有一张单子在等你"是这套系统里最值得打扰人的一件事。
+        #   通知失败不影响返回（events 内部兜底，永不抛异常）。
+        from app.notify import events as notify_events
+        notify_events.approval_created({**rec, "host": None})
         return base
 
     # ---- 情况三：只读命令，直接执行 ----
