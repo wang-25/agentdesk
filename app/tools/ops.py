@@ -174,9 +174,17 @@ def _audit(event: str, detail: dict) -> None:
 # ============================================================
 # 一、参数校验（防命令注入的第一道墙）
 # ============================================================
-# 只允许小写字母、数字、点、下划线、连字符。长度限死。
+# 只允许字母、数字、点、下划线、连字符、@。**字符集才是防注入的那道墙** ——
 # 这样 "nginx; rm -rf /" 这种输入根本进不来。
-_SERVICE_RE = re.compile(r"^[a-zA-Z0-9_.@-]{1,32}$")
+#
+# ★ 长度上限从 32 提到 64，是为了跟下游对齐，不是放宽安全边界：
+#   · 它是 docker 容器名的上限（64），而 `tail_log` 会用服务名去找同名容器；
+#   · systemd 单元名本来就常常超过 32 ——
+#     `systemd-networkd-wait-online.service` 正好 35 个字符。
+#   原先 33–64 字符的名字在**这一层**就被拒了，表现成"这个服务查不到"，
+#   而真正的原因（名字太长）谁也看不出来。
+#   字符集不变，所以注入面没变；变的是"本来能查的东西现在能查到了"。
+_SERVICE_RE = re.compile(r"^[a-zA-Z0-9_.@-]{1,64}$")
 _HOST_RE = re.compile(r"^[a-zA-Z0-9.-]{1,64}$")
 
 # 已知主机清单。只允许查这几台 —— 模型不能自己编一个主机名去连。
@@ -690,11 +698,27 @@ def _run_logs(host: str, service: str, lines: int) -> dict:
     # ---- 2. 日志文件 ----
     # 路径不交给调用方指定 —— 只在这张表里查。
     # 让外部传路径，就等于给了它读任意文件的权限。
+    #
+    # ★ 这一条原先也绕过了统一准入（C11 的第 2 条来源），现在同样过 policy：
+    #   tail 的路径规则在 policy 里，路径必须落在"确实是日志"的范围里。
+    #   候选表里有 `/var/log/<service>/current` 这类**无扩展名**的名字，
+    #   它们按 M3 收紧后的读规则是被拒的 —— 所以这里**不能静默跳过**：
+    #   被拒的候选要把理由记下来，最后写进提示里。
+    #   （"能少给就少给"是有代价的，代价必须让人看得见，而不是表现为
+    #    "这条来源莫名其妙就是不工作"。）
+    denied = []
     for tpl in _LOG_FILE_CANDIDATES:
         path = tpl.format(service=service)
-        if _exists(host, path):
-            _, out = _exec(["tail", "-n", str(lines), path], host=host)
+        if not _exists(host, path):
+            continue
+        try:
+            rc, out = _exec_through_policy(f"tail -n {int(lines)} {path}", host=host)
+        except ToolError as e:
+            denied.append(f"{path}（{e}）")
+            continue
+        if rc == 0 and out:
             return {"source": path, "lines": out.splitlines()}
+        denied.append(f"{path}（退出码 {rc}）")
 
     # ---- 3. 容器日志 ----
     # ★ 原先这里是 `sh -c "docker logs --tail N <容器名> 2>&1"` 直接执行，
@@ -711,10 +735,14 @@ def _run_logs(host: str, service: str, lines: int) -> dict:
     if rc == 0 and out:
         return {"source": f"docker logs {service}", "lines": out.splitlines()}
 
-    raise ToolError(
-        f"取不到 {service} 的日志。已试过：systemd 单元、"
-        f"常见日志文件（{[t.format(service=service) for t in _LOG_FILE_CANDIDATES]}）、"
-        f"同名容器。若它是容器，请直接用容器名（例如 wp-app、zabbix-server）。")
+    hint = (f"取不到 {service} 的日志。已试过：systemd 单元、"
+            f"常见日志文件（{[t.format(service=service) for t in _LOG_FILE_CANDIDATES]}）、"
+            f"同名容器。若它是容器，请直接用容器名（例如 wp-app、zabbix-server）。")
+    if denied:
+        # 把"哪条来源被策略拒了、为什么"如实带出去 —— 否则运维看到的就是
+        # "日志读不到"，而真正的原因（路径不在允许的日志范围内）无从得知。
+        hint += " 被准入拦下的候选：" + "；".join(denied)
+    raise ToolError(hint)
 
 
 # ---- 负载与内存：远端拿回来的是原文，必须在这里解析 ----

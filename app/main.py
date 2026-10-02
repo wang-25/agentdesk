@@ -75,7 +75,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Query, Response
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Response
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
@@ -2279,7 +2279,7 @@ def parse_endpoint(req: ChatRequest):
 # 接口 6：告警驱动的入口 —— 无人值守
 # ============================================================
 @app.post("/webhook/alert")
-def webhook_alert(payload: dict):
+def webhook_alert(payload: dict, background: BackgroundTasks = None):
     # ★ 无人值守链路也必须有 trace —— 这恰恰是"凌晨三点谁在干活"
     #   唯一的答案来源。里面每个 Agent 节点的 span 由 supervisor 自动挂。
     """接收告警系统推送的事件，自动完成判断并给出处置方案。
@@ -2398,109 +2398,156 @@ def webhook_alert(payload: dict):
             _ALERT_AGG.bind_incident(verdict.key, incident_id)
             _link_alert_quietly(incident_id, alert)
 
-        # ---- 第一步：理解告警 ----
-        try:
-            intent, attempts = parse_intent(question)
-        except IntentParseFailed as e:
-            report = {**base, "decision": "parse_failed",
-                      "reason": str(e), "problems": e.problems}
-            write_audit("alert.parse_failed", report)
-            reports.append(report)
+        state = {"alert": alert, "question": question, "base": base,
+                 "incident_id": incident_id, "members": verdict.members}
+
+        # ---- 异步分岔（可选，`ALERT_ASYNC=1`）----
+        #
+        # ★ 为什么需要它：Alertmanager 这类告警系统对 webhook 有超时约束，
+        #   而一轮诊断要 6–20 秒。同步跑的话，对端会超时重推，
+        #   于是**同一批告警被重复投递**（幂等由聚合表兜住，但请求本身是白跑的）。
+        #
+        # ★ 为什么默认仍然是同步：异步的代价是"结论不在响应里"，
+        #   而且**进程若在后台任务跑完前退出，这次诊断就丢了**
+        #   （没有持久队列 —— 单进程 + 不加依赖是本项目的既定取舍）。
+        #   所以它是个开关，默认关；开了之后审计里有 alert.accepted 可对账，
+        #   事件会停在 open 状态，不会假装诊断过。
+        if ALERT_ASYNC and background is not None:
+            background.add_task(_run_alert_pipeline, state)
+            write_audit("alert.accepted", {
+                "alertname": alert["alertname"], "host": alert.get("host"),
+                "incident_id": incident_id, "async": True,
+                "question": question})
+            reports.append({**base, "decision": "accepted_async",
+                            "incident_id": incident_id,
+                            "members": verdict.members,
+                            "reason": ("已受理，诊断在后台执行（ALERT_ASYNC=1）；"
+                                       "结论请查 /incidents/" + (incident_id or "")),
+                            "playbook": []})
             continue
 
-        action = intent.get("action")
-        service = (intent.get("service") or "").lower()
-        base["intent"] = intent
-        base["parse_attempts"] = attempts
+        reports.append(_run_alert_pipeline(state))
 
-        # ---- 第二步：定风险 ----
-        #
-        # ★ 这里曾经是个**闸门形同虚设**的漏洞：原先只用模型自报的 risk，
-        #   而本文件那份提示词把"重启服务"定义成 medium、闸门只拦 high ——
-        #   实测"mysql 挂了需要立即重启"一路走到 auto_diagnose。
-        #
-        #   更根本的问题是，同一个"重启服务"在本项目里有三处各自定义风险：
-        #     ① 这份提示词            → medium
-        #     ② policy.py 的命令规则  → needs_approval（要人工）
-        #     ③ ops.py 的 run_command → high
-        #   现在三者收敛到 policy.py 一处（ACTION_RISK），判定的规则是：
-        #
-        #     **模型自报的 risk 只能抬高、不能降低**（policy.escalate 取更危险者）。
-        #     它会判错，而它的错会直接把闸门打开；
-        #     反过来，它判得更严时值得尊重 —— 它可能看到了规则表没覆盖的上下文。
-        #     **它可以让我们更谨慎，不能让我们更冒险。**
-        #
-        #   两个值都留在返回里：risk 是实际用于决策的，risk_reported 是模型的原本判断，
-        #   留着对账（哪条告警被抬高了、抬到第几档，审计里要看得到）。
-        from app.sandbox import policy
-        reported = intent.get("risk")
-        risk = policy.escalate(reported, policy.risk_of_action(action))
-        base["risk"] = risk
-        base["risk_reported"] = reported
+    return {"received": len(alerts),
+            "async": bool(ALERT_ASYNC and background is not None),
+            "reports": reports}
 
-        if risk == "high":
-            report = {**base, "decision": "need_human",
-                      "reason": (f"请求要动手改系统（action={action}），未执行任何操作，"
-                                 f"等待人工确认"),
-                      "playbook": []}
-            write_audit("alert.gate_blocked", {
-                "alertname": alert["alertname"], "action": action,
-                "risk": risk, "risk_reported": reported,
-                "reason": report["reason"]})
-        elif ALERT_AUTO_DIAGNOSE:
-            # ---- 第三步 A：真的跑一轮诊断（需显式开启，因为它花钱）----
-            try:
-                from app.agents.supervisor import run as engine_run
-                result = engine_run(question)
-                # 指标字段与 /agent/ask 保持一致（同一套口径，两处复用）——
-                # 这样告警诊断和手动提问在可观测看板上是**可比的一组数**。
-                metrics = {
-                    "rounds": result.get("rounds"),
-                    "tool_calls": result.get("tool_calls"),
-                    "distinct_tools": len(result.get("distinct_tools") or []),
-                    "tokens": (result.get("usage") or {}).get("total_tokens", 0),
-                    "elapsed_ms": result.get("elapsed_ms"),
-                    "stop_reason": result.get("stop_reason"),
-                }
-                report = {**base, "decision": "auto_diagnosed",
-                          "reason": "已自动跑完一轮诊断（只读，未执行任何写操作）",
-                          "answer": result.get("answer"),
-                          "metrics": metrics,
-                          "executed": False}
-                write_audit("alert.diagnosed", {
-                    "alertname": alert["alertname"], "question": question,
-                    **metrics})
-            except Exception as e:
-                report = {**base, "decision": "diagnose_failed",
-                          "reason": f"自动诊断失败：{e}",
-                          "playbook": DIAGNOSE_PLAYBOOK.get(service, DEFAULT_PLAYBOOK)}
-        else:
-            # ---- 第三步 B：只出预案（默认）——它**不是**诊断结果 ----
-            playbook = DIAGNOSE_PLAYBOOK.get(service, DEFAULT_PLAYBOOK)
-            report = {**base, "decision": "playbook_only",
-                      "reason": "只读诊断，已生成处置预案",
-                      "playbook": playbook,
-                      "executed": False,
-                      "note": ("这是一份**写死的命令清单**，不是诊断结论 —— "
-                               "它没查过任何机器。"
-                               "要让它真去查，把 ALERT_AUTO_DIAGNOSE=1 打开"
-                               "（每条告警会跑一次模型，有去重与频控兜底）")}
 
-        # ---- 归宿：把结论写回事件，并把结论推到"人真正会看的地方" ----
-        if incident_id:
-            _attach_diagnosis_quietly(incident_id, report)
-            report["incident_id"] = incident_id
+def _run_alert_pipeline(state: dict) -> dict:
+    """告警的**慢路径**：理解 → 定风险 → 诊断/预案 → 写回事件 → 通知。
 
-        write_audit("alert.handled", report)
+    同步（默认）与异步（`ALERT_ASYNC=1`）两条路都走这里。
+    **逻辑只有一份** —— 否则"异步那条少做了一步"这类错误会长期潜伏，
+    而且只在开了开关的机器上出现（本地默认关，测试也测不到）。
 
-        # ★ 这一步是 M2 存在的理由：告警链路的终点原来只有"HTTP 响应 + audit.jsonl"，
-        #   凌晨三点**没有任何人会被叫醒**。诊断做得再对，送不到人手上就等于没做。
-        #   通知是旁路：events.send 永不抛异常，推不出去只留一条失败记录。
-        _notify_incident(report, incident_id, verdict.members)
+    state 由快路径准备好：alert / question / base / incident_id / members。
+    """
+    alert = state["alert"]
+    question = state["question"]
+    base = state["base"]
+    incident_id = state["incident_id"]
+    members = state["members"]
 
-        reports.append(report)
+    # ---- 第一步：理解告警 ----
+    try:
+        intent, attempts = parse_intent(question)
+    except IntentParseFailed as e:
+        report = {**base, "decision": "parse_failed",
+                  "reason": str(e), "problems": e.problems}
+        write_audit("alert.parse_failed", report)
+        return report
 
-    return {"received": len(alerts), "reports": reports}
+    action = intent.get("action")
+    service = (intent.get("service") or "").lower()
+    base["intent"] = intent
+    base["parse_attempts"] = attempts
+
+    # ---- 第二步：定风险 ----
+    #
+    # ★ 这里曾经是个**闸门形同虚设**的漏洞：原先只用模型自报的 risk，
+    #   而本文件那份提示词把"重启服务"定义成 medium、闸门只拦 high ——
+    #   实测"mysql 挂了需要立即重启"一路走到 auto_diagnose。
+    #
+    #   更根本的问题是，同一个"重启服务"在本项目里有三处各自定义风险：
+    #     ① 这份提示词            → medium
+    #     ② policy.py 的命令规则  → needs_approval（要人工）
+    #     ③ ops.py 的 run_command → high
+    #   现在三者收敛到 policy.py 一处（ACTION_RISK），判定的规则是：
+    #
+    #     **模型自报的 risk 只能抬高、不能降低**（policy.escalate 取更危险者）。
+    #     它会判错，而它的错会直接把闸门打开；
+    #     反过来，它判得更严时值得尊重 —— 它可能看到了规则表没覆盖的上下文。
+    #     **它可以让我们更谨慎，不能让我们更冒险。**
+    #
+    #   两个值都留在返回里：risk 是实际用于决策的，risk_reported 是模型的原本判断，
+    #   留着对账（哪条告警被抬高了、抬到第几档，审计里要看得到）。
+    from app.sandbox import policy
+    reported = intent.get("risk")
+    risk = policy.escalate(reported, policy.risk_of_action(action))
+    base["risk"] = risk
+    base["risk_reported"] = reported
+
+    if risk == "high":
+        report = {**base, "decision": "need_human",
+                  "reason": (f"请求要动手改系统（action={action}），未执行任何操作，"
+                             f"等待人工确认"),
+                  "playbook": []}
+        write_audit("alert.gate_blocked", {
+            "alertname": alert["alertname"], "action": action,
+            "risk": risk, "risk_reported": reported,
+            "reason": report["reason"]})
+    elif ALERT_AUTO_DIAGNOSE:
+        # ---- 第三步 A：真的跑一轮诊断（需显式开启，因为它花钱）----
+        try:
+            from app.agents.supervisor import run as engine_run
+            result = engine_run(question)
+            # 指标字段与 /agent/ask 保持一致（同一套口径，两处复用）——
+            # 这样告警诊断和手动提问在可观测看板上是**可比的一组数**。
+            metrics = {
+                "rounds": result.get("rounds"),
+                "tool_calls": result.get("tool_calls"),
+                "distinct_tools": len(result.get("distinct_tools") or []),
+                "tokens": (result.get("usage") or {}).get("total_tokens", 0),
+                "elapsed_ms": result.get("elapsed_ms"),
+                "stop_reason": result.get("stop_reason"),
+            }
+            report = {**base, "decision": "auto_diagnosed",
+                      "reason": "已自动跑完一轮诊断（只读，未执行任何写操作）",
+                      "answer": result.get("answer"),
+                      "metrics": metrics,
+                      "executed": False}
+            write_audit("alert.diagnosed", {
+                "alertname": alert["alertname"], "question": question,
+                **metrics})
+        except Exception as e:
+            report = {**base, "decision": "diagnose_failed",
+                      "reason": f"自动诊断失败：{e}",
+                      "playbook": DIAGNOSE_PLAYBOOK.get(service, DEFAULT_PLAYBOOK)}
+    else:
+        # ---- 第三步 B：只出预案（默认）——它**不是**诊断结果 ----
+        playbook = DIAGNOSE_PLAYBOOK.get(service, DEFAULT_PLAYBOOK)
+        report = {**base, "decision": "playbook_only",
+                  "reason": "只读诊断，已生成处置预案",
+                  "playbook": playbook,
+                  "executed": False,
+                  "note": ("这是一份**写死的命令清单**，不是诊断结论 —— "
+                           "它没查过任何机器。"
+                           "要让它真去查，把 ALERT_AUTO_DIAGNOSE=1 打开"
+                           "（每条告警会跑一次模型，有去重与频控兜底）")}
+
+    # ---- 归宿：把结论写回事件，并把结论推到"人真正会看的地方" ----
+    if incident_id:
+        _attach_diagnosis_quietly(incident_id, report)
+        report["incident_id"] = incident_id
+
+    write_audit("alert.handled", report)
+
+    # ★ 这一步是 M2 存在的理由：告警链路的终点原来只有"HTTP 响应 + audit.jsonl"，
+    #   凌晨三点**没有任何人会被叫醒**。诊断做得再对，送不到人手上就等于没做。
+    #   通知是旁路：events.send 永不抛异常，推不出去只留一条失败记录。
+    _notify_incident(report, incident_id, members)
+
+    return report
 
 
 # ============================================================

@@ -296,6 +296,32 @@ def test_denied_log_command_never_reaches_executor(sandbox, monkeypatch):
     assert bad["n"] == 0, "被策略拒绝的命令仍然被执行了"
 
 
+def test_service_name_length_matches_the_container_limit(monkeypatch):
+    """★ 服务名上限跟下游对齐（64，与 docker 容器名一致），不是 32。
+
+    `tail_log` 会用服务名去找**同名容器**，也会把它当 systemd 单元名 ——
+    而 systemd 单元名常常超过 32 个字符
+    （`systemd-networkd-wait-online.service` 正好 35）。
+    原先 33–64 的名字在工具层就被拒了，表现成"这个服务查不到"，
+    真正的原因（名字太长）谁也看不出来。
+
+    字符集（防注入的那道墙）一个字没动，所以注入面没变。
+    """
+    long_unit = "systemd-networkd-wait-online.service"      # 35 字符
+    assert len(long_unit) > 32
+    assert ops._check_service(long_unit) == long_unit
+
+    # 边界两侧
+    assert ops._check_service("a" * 64) == "a" * 64
+    with pytest.raises(ops.ToolError):
+        ops._check_service("a" * 65)
+
+    # 字符集仍然拦得住注入（这才是安全边界）
+    for bad in ("nginx; rm -rf /", "nginx && id", "nginx`id`", "nginx|x", "a b"):
+        with pytest.raises(ops.ToolError):
+            ops._check_service(bad)
+
+
 def test_tail_log_return_shape_is_unchanged(sandbox, monkeypatch):
     """收口不能改动 `tail_log` 的返回结构（下游 Agent / MCP 都按它解析）。"""
     monkeypatch.setattr(ops, "_exists", lambda host, path: False)

@@ -185,6 +185,88 @@ def test_旧文案在被抑制时保持一致(env, fake_chat, monkeypatch):
 
 
 # ============================================================
+# 一·B、异步入口（ALERT_ASYNC=1）
+# ============================================================
+def _bg():
+    from starlette.background import BackgroundTasks
+    return BackgroundTasks()
+
+
+def _run_bg(bg):
+    import asyncio
+    asyncio.run(bg())
+
+
+def test_sync_mode_says_so_in_the_response(env, fake_chat):
+    """响应里如实标出这次是同步还是异步 —— 否则调用方不知道结论该去哪找。"""
+    fake_chat.push({"action": "diagnose", "service": "nginx", "host": "web-01",
+                    "risk": "low", "need_confirm": False, "reason": "r"})
+    out = m.webhook_alert(_one_alert())
+    assert out["async"] is False
+    assert out["reports"][0]["decision"] == "playbook_only" or \
+        out["reports"][0]["decision"] == "auto_diagnosed"
+
+
+def test_async_mode_returns_immediately_without_diagnosing(env, fake_chat,
+                                                          monkeypatch):
+    """★ 异步的意义：Alertmanager 有超时约束，不能在请求里等 6–20 秒的诊断。
+
+    所以响应必须**立刻**返回，并且如实说明"结论不在这里、去 /incidents 查"。
+    """
+    monkeypatch.setattr(m, "ALERT_ASYNC", True)
+    fake_chat.push({"action": "diagnose", "service": "nginx", "host": "web-01",
+                    "risk": "low", "need_confirm": False, "reason": "r"})
+    bg = _bg()
+    out = m.webhook_alert(_one_alert(), bg)
+
+    assert out["async"] is True
+    assert out["reports"][0]["decision"] == "accepted_async"
+    assert "在后台执行" in out["reports"][0]["reason"]
+    assert env["diag"] == [], "响应返回时不该已经跑过诊断（否则异步没意义）"
+    assert fake_chat.call_count == 0
+
+
+def test_async_mode_actually_runs_the_pipeline_in_the_background(env, fake_chat,
+                                                                 monkeypatch):
+    """★ 反过来也要证明：后台**真的会跑**，而且结论写回了事件、通知也发了。
+
+    只测"立刻返回"是不够的 —— 那样一个"接了不干"的实现也能过测试。
+    """
+    monkeypatch.setattr(m, "ALERT_ASYNC", True)
+    fake_chat.push({"action": "diagnose", "service": "nginx", "host": "web-01",
+                    "risk": "low", "need_confirm": False, "reason": "r"})
+    bg = _bg()
+    out = m.webhook_alert(_one_alert(), bg)
+    incident_id = out["reports"][0]["incident_id"]
+
+    _run_bg(bg)                      # 执行排队的后台任务
+
+    assert env["diag"], "后台任务没有真的跑诊断"
+    rec = env["store"].get(incident_id)
+    assert rec["diagnosis"], "结论应当写回事件"
+    assert rec["notifications"], "通知应当已经发出（异步不等于不通知）"
+    audit = (m.AUDIT_LOG).read_text(encoding="utf-8")
+    assert "alert.accepted" in audit, "受理也要留痕（否则丢任务时无从对账）"
+
+
+def test_async_mode_still_merges_duplicates(env, fake_chat, monkeypatch):
+    """异步不影响幂等：Alertmanager 超时重推时，聚合表照样把它并进同一个事件。"""
+    monkeypatch.setattr(m, "ALERT_ASYNC", True)
+    fake_chat.push({"action": "diagnose", "service": "nginx", "host": "web-01",
+                    "risk": "low", "need_confirm": False, "reason": "r"})
+    bg1 = _bg()
+    first = m.webhook_alert(_one_alert(), bg1)
+    bg2 = _bg()
+    second = m.webhook_alert(_one_alert(), bg2)      # 同源重推
+
+    assert first["reports"][0]["decision"] == "accepted_async"
+    assert second["reports"][0]["decision"] == "merged_into_incident"
+    _run_bg(bg1)
+    _run_bg(bg2)
+    assert len(env["diag"]) == 1, "重推不该再花一次钱"
+
+
+# ============================================================
 # 二、空批次与维护窗口
 # ============================================================
 def test_空告警批次不建事件不调模型(env, fake_chat):
