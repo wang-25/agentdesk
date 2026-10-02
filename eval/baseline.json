@@ -1,6 +1,6 @@
 {
   "_comment": "检索基线。由 scripts/eval_baseline.py --update 生成。embedder 变了（例如从 local-hash 换成真 embedding）就该重新标定，否则门禁会拿旧后端的成绩去卡新后端。",
-  "generated_at": "2026-10-02T18:29:26",
+  "generated_at": "2026-10-02T18:44:57",
   "tolerance": 0.05,
   "latency_tolerance": 0.5,
   "top_k": 8,
@@ -15,19 +15,19 @@
     "vector.recall.lexical": 0.9677,
     "vector.recall.semantic": 0.9167,
     "vector.recall.trap": 1.0,
-    "vector.latency_p50_ms": 0.131,
-    "vector.latency_p95_ms": 0.244,
+    "vector.latency_p50_ms": 0.12,
+    "vector.latency_p95_ms": 0.159,
     "bm25.recall": 0.9565,
     "bm25.recall.lexical": 1.0,
     "bm25.recall.semantic": 0.8333,
     "bm25.recall.trap": 1.0,
-    "bm25.latency_p50_ms": 0.283,
-    "bm25.latency_p95_ms": 0.535,
-    "hybrid.recall": 0.9783,
+    "bm25.latency_p50_ms": 0.252,
+    "bm25.latency_p95_ms": 0.382,
+    "hybrid.recall": 1.0,
     "hybrid.recall.lexical": 1.0,
-    "hybrid.recall.semantic": 0.9167,
+    "hybrid.recall.semantic": 1.0,
     "hybrid.recall.trap": 1.0,
-    "hybrid.latency_p50_ms": 0.399,
-    "hybrid.latency_p95_ms": 0.531
+    "hybrid.latency_p50_ms": 0.323,
+    "hybrid.latency_p95_ms": 0.468
   }
 }

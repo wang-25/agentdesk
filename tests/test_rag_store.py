@@ -301,6 +301,99 @@ def test_hybrid_top_k_is_capped_and_ranks_are_unique(store):
     assert len(ids) == len(set(ids)), f"融合结果里有重复块：{ids}"
 
 
+# ============================================================
+# ★ 检索参数：默认值来自扫参，不是拍脑袋
+# ============================================================
+def test_retrieval_parameter_defaults(store):
+    """默认值必须与"扫参后的结论"一致 —— 改它就得改这里，改这里就得给证据。"""
+    assert store.candidate_k == 30, "candidate_k 的默认值是扫参扫出来的（见最后那条用例）"
+    assert store.rrf_k == 60
+
+
+def test_retrieval_parameters_can_be_overridden_by_env(monkeypatch):
+    from app.rag.embedder import Embedder
+    from app.rag.store import VectorStore
+
+    monkeypatch.setenv("RETRIEVAL_CANDIDATE_K", "50")
+    monkeypatch.setenv("RETRIEVAL_RRF_K", "10")
+    fresh = VectorStore(Embedder(backend="local"))
+    assert (fresh.candidate_k, fresh.rrf_k) == (50, 10)
+
+
+@pytest.mark.parametrize("value", ["abc", "0", "-3", "3.5", ""])
+def test_invalid_candidate_k_falls_back_to_the_default(monkeypatch, value):
+    """★ 调参写错的表现应该是"没调成"，不应该是"服务起不来"。"""
+    from app.rag.embedder import Embedder
+    from app.rag.store import VectorStore
+
+    monkeypatch.setenv("RETRIEVAL_CANDIDATE_K", value)
+    assert VectorStore(Embedder(backend="local")).candidate_k == 30
+
+
+def test_bm25_parameters_are_configurable_and_bounded(monkeypatch):
+    from app.rag.embedder import Embedder
+    from app.rag.loader import Chunk
+    from app.rag.store import VectorStore
+
+    chunks = [Chunk(doc_id="d", title="t", text="磁盘写满 清理", source="s",
+                    index=0, chunk_id="c0")]
+    base = VectorStore(Embedder(backend="local")).build(chunks)
+    assert (base.bm25.k1, base.bm25.b) == (1.5, 0.75)
+
+    monkeypatch.setenv("RETRIEVAL_BM25_K1", "2.0")
+    monkeypatch.setenv("RETRIEVAL_BM25_B", "0.5")
+    tuned = VectorStore(Embedder(backend="local")).build(chunks)
+    assert (tuned.bm25.k1, tuned.bm25.b) == (2.0, 0.5)
+
+    # b 的物理含义是"长度归一化程度"，超出 [0,1] 没有意义 → 回退默认
+    monkeypatch.setenv("RETRIEVAL_BM25_B", "1.5")
+    assert VectorStore(Embedder(backend="local")).build(chunks).bm25.b == 0.75
+
+
+def test_search_uses_the_instance_candidate_k_when_not_given(store):
+    """`candidate_k=None` 时用实例属性 —— 这是"能扫参"的前提。"""
+    store.candidate_k = 1
+    limited = store.search("磁盘 df -h nginx 502", top_k=5, mode="hybrid")
+    store.candidate_k = 50
+    wide = store.search("磁盘 df -h nginx 502", top_k=5, mode="hybrid")
+    assert len(limited) <= len(wide)
+
+
+def test_the_sweep_that_justifies_candidate_k_30_is_reproducible():
+    """★★ 这条用例把"为什么默认值是 30"**钉成可复现的证据**。
+
+    扫参结果（本地哈希后端 · 46 条用例 · Top-8）：
+        candidate_k = 5 / 10 / 20  → 97.8%
+        candidate_k = 30 / 50      → 100.0%
+    → 30 是拐点；20 恰好漏掉一条**语义改写**型问题
+      （"机器响应变得很慢，等一次要好久"）。
+      延迟没有代价（P50 0.314ms → 0.317ms，噪声级）：两路打分本来就要遍历全部文档，
+      candidate_k 只影响**融合时看几个候选**。
+
+    为什么值得写一条用例：**"业界通用值"和"扫参结论"是两回事**。
+    这条保证结论可复现；哪天索引或语料变了导致 20 也够用，它会红，
+    那时回来重新扫参、更新默认值与文档即可。
+    """
+    from app.rag import pipeline
+    from app.rag.embedder import Embedder
+    from app.rag.store import VectorStore
+
+    try:
+        base = VectorStore.load(pipeline.INDEX_DIR, embedder=Embedder(backend="local"))
+    except Exception:                              # pragma: no cover
+        pytest.skip("当前索引不是 local 后端建的（配了 Key 之后会跳过）")
+
+    def recall(candidate_k):
+        base.candidate_k = candidate_k
+        report = pipeline.evaluate(top_k=8, modes=("hybrid",), verbose=False,
+                                   store=base)
+        return report["modes"]["hybrid"]["recall"]
+
+    assert recall(30) > recall(20), \
+        "candidate_k=30 不再优于 20 —— 那条证据过期了：请重新扫参并更新默认值与文档"
+    assert recall(30) == 1.0, "在加固后的 46 条上混合检索应当满分"
+
+
 def test_hybrid_ranking_is_deterministic(store):
     """同一查询两次 hybrid 检索结果必须完全一致（评测与复现的前提）。"""
     a = store.search("磁盘 df 写满", top_k=3, mode="hybrid")

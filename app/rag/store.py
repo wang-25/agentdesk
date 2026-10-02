@@ -31,6 +31,7 @@ RRF（Reciprocal Rank Fusion）只用**排名**不用分数：
 import json
 import logging
 import math
+import os
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -50,6 +51,48 @@ except ImportError:      # pragma: no cover
 
 INDEX_VECTORS = "index.npz"
 INDEX_CHUNKS = "chunks.json"
+
+log = logging.getLogger("agentdesk.rag.store")
+
+
+# ============================================================
+# 检索参数（环境变量，默认值 = 一直以来的值）
+# ============================================================
+# ★ 这些开关的存在理由只有一个：**让调参可以用数据说话**。
+#   没有它们，"RRF 的 k 取 60"就只能靠"业界通用"来解释；
+#   有了它们，就可以拿评测集扫一遍，赢就改、没赢就如实记下"默认值已在平台期"。
+#
+# ★ 非法值一律回退默认并打一条警告 —— 调参写错的表现应该是"没调成"，
+#   不应该是"服务起不来"（与 AGENT_BUDGET_SECONDS 同一条原则）。
+def _env_int(name: str, default: int, minimum: int = 1) -> int:
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        log.warning("%s=%r 不是整数，回退默认值 %s", name, raw, default)
+        return default
+    if value < minimum:
+        log.warning("%s=%s 小于下限 %s，回退默认值 %s", name, value, minimum, default)
+        return default
+    return value
+
+
+def _env_float(name: str, default: float, minimum: float = 0.0,
+               maximum: float = None) -> float:
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        log.warning("%s=%r 不是数字，回退默认值 %s", name, raw, default)
+        return default
+    if value < minimum or (maximum is not None and value > maximum):
+        log.warning("%s=%s 超出范围，回退默认值 %s", name, value, default)
+        return default
+    return value
 
 
 # ============================================================
@@ -154,6 +197,21 @@ class VectorStore:
         self.bm25 = None
         self.tokenized = []
 
+        # ---- 检索参数（默认值 = 一直以来的值，所以默认行为完全不变）----
+        #
+        # ★ 为什么把它们做成属性而不是写死在函数签名里：
+        #   有了它们，才能**用评测集去扫参**，而不是靠"业界通用值应该没问题"。
+        #
+        # ★ candidate_k 的默认值从 20 改成了 30 —— 这是**扫参扫出来的**，不是顺手改的：
+        #     取值  5/10/20 → 97.8%；  30/50 → 100.0%
+        #   即 30 是那个拐点（再往上没有收益），而 20 恰好差一条：
+        #   被它漏掉的是一条**语义改写**型问题（"机器响应变得很慢，等一次要好久"）。
+        #   延迟代价为零（P50 0.314ms → 0.317ms，噪声级）——
+        #   因为两路的打分本来就要遍历全部文档，candidate_k 只影响**融合时看几个候选**。
+        #   证据与复现命令见 docs/evaluation.md。
+        self.candidate_k = _env_int("RETRIEVAL_CANDIDATE_K", 30, minimum=1)
+        self.rrf_k = _env_int("RETRIEVAL_RRF_K", 60, minimum=1)
+
     # ---------- 构建 ----------
     def build(self, chunks):
         """向量化所有块，同时建好 BM25 索引。"""
@@ -165,7 +223,11 @@ class VectorStore:
 
         self.matrix = self.embedder.encode([c.text for c in self.chunks])
         self.tokenized = [tokenize(c.text) for c in self.chunks]
-        self.bm25 = BM25(self.tokenized)
+        # k1 / b 同样可配，默认是 BM25 的通用值（1.5 / 0.75）
+        self.bm25 = BM25(self.tokenized,
+                         k1=_env_float("RETRIEVAL_BM25_K1", 1.5, minimum=0.0),
+                         b=_env_float("RETRIEVAL_BM25_B", 0.75,
+                                      minimum=0.0, maximum=1.0))
         return self
 
     def __len__(self):
@@ -268,12 +330,18 @@ class VectorStore:
         return [int(i) for i in order if scores[i] > 0], scores
 
     def search(self, query: str, top_k: int = 5, mode: str = "hybrid",
-               candidate_k: int = 20) -> list:
+               candidate_k: int = None) -> list:
         """检索。mode 可选 vector / bm25 / hybrid。
 
-        candidate_k 是「召回候选数」：先从每路取回 20 个候选，
+        candidate_k 是「召回候选数」：先从每路取回若干个候选，
         融合之后再截取前 top_k。这就是「粗筛 → 精排」的粗筛那一步。
+
+        `candidate_k=None`（默认）时用实例上的 `self.candidate_k`
+        （默认 30，可用 `RETRIEVAL_CANDIDATE_K` 覆盖）——
+        留这个参数是为了调用方能为**单次**查询临时放宽或收紧候选数。
         """
+        if candidate_k is None:
+            candidate_k = self.candidate_k
         if len(self.chunks) == 0:
             return []
 
@@ -286,7 +354,8 @@ class VectorStore:
         elif mode == "hybrid":
             vec_idx, vec_sims = self._rank_vector(query, candidate_k)
             bm_idx, bm_scores = self._rank_bm25(query, candidate_k)
-            fused = rrf_fuse([vec_idx, bm_idx])[:top_k]
+            # rrf_k 用实例属性（可用 RETRIEVAL_RRF_K 覆盖）—— 默认仍是 60
+            fused = rrf_fuse([vec_idx, bm_idx], k=self.rrf_k)[:top_k]
             picked = [(i, score) for i, score in fused]
         else:
             raise ValueError(f"未知检索模式：{mode}")
