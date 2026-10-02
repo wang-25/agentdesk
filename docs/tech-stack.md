@@ -766,7 +766,7 @@ curl http://127.0.0.1:8000/sandbox
 |---|---|---|---|
 | 可观测 | **Langfuse**（自托管） | 自己写 JSONL 日志（**本项目已有审计**） | Langfuse 有 Trace 树、Token 成本面板、Prompt 版本管理；自己写只能查文本 |
 | 评测 | **Ragas**（LLM-as-Judge） | 自己写召回率 + 双引擎对比（**本项目已有**） | Ragas 有忠实度、答案相关性等成熟指标；自写指标简单但可解释 |
-| 监控告警 | **Prometheus + Grafana** | 打印日志 | 有 Zabbix/Grafana 基础的话，这块上手最快 |
+| 监控告警 | **Prometheus + Grafana** | **手写 Prometheus 文本端点 /metrics**（零新增依赖）+ 结构化日志（LOG_FORMAT=json） | M4 补上了：Prometheus 可直接抓 /metrics，Grafana 不用改造。★ 这里原先写的是「打印日志」——**那是当时的真实状态，现在不再是了** |
 | 部署 | **Docker Compose + Nginx** | 直接跑 uvicorn | Nginx 负责 HTTPS、超时、缓冲控制（SSE 那个坑就出在这里） |
 
 > **注意一个顺序问题**：**先手写，再上框架。** 反了的话只会用框架；"LangGraph 的状态图底层怎么跑的"这类问题就答不上来。
