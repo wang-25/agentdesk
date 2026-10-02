@@ -1,0 +1,43 @@
+# ============================================================
+#  工具链配置（**不是打包配置**）
+# ------------------------------------------------------------
+#  ★ 这里故意**没有 [project] 段**：本项目仍是「脚本 + requirements.txt」
+#    的形态，不发布成包。放这个文件只是给 ruff / pytest / mypy 一个
+#    统一的配置落点，而不是在根目录堆三个 ini 文件。
+#
+#  运行时依赖仍在 requirements.txt（9 个）；开发依赖在 requirements-dev.txt。
+# ============================================================
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --strict-markers"
+# 测试必须零成本、无网络、不写真实 logs/ —— 守卫见 tests/conftest.py。
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+exclude = [".venv", "data", "logs", "__pycache__", "eval/reports"]
+
+[tool.ruff.lint]
+# ★ 起步只开"能抓到 bug"的规则集，不做纯风格之争 ——
+#   一次性给 1.3 万行老代码套上全部规则，只会得到一个没人看的红屏。
+select = ["E", "F", "W", "B"]
+ignore = [
+    "E501",   # 行长交给 formatter，不当作错误
+    "B008",   # FastAPI 的 Depends/Query 默认值是惯用法
+]
+
+[tool.ruff.lint.per-file-ignores]
+# 脚本必须先改 sys.path 再 import，E402 在这里是必要的写法
+"scripts/*" = ["E402"]
+"tests/*" = ["E402"]
+
+[tool.mypy]
+python_version = "3.12"
+# ★ 渐进式：当前只检查 tests/。
+#   老代码（1.3 万行、基本没有类型标注）先进 ignore 名单，
+#   里程碑推进时逐模块加进来 —— 而不是现在生成几千条无意义的报错。
+files = ["tests"]
+ignore_missing_imports = true
+check_untyped_defs = true
+warn_unused_ignores = false

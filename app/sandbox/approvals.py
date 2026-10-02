@@ -138,9 +138,22 @@ class ApprovalStore:
 
     def _append(self, event: dict) -> None:
         """追加一条事件。先落盘再更新内存 —— 顺序反了的话，
-        内存说"批准了"而盘上没有，重启就丢了。"""
+        内存说"批准了"而盘上没有，重启就丢了。
+
+        ★ `ts` 必须**回填到调用方那个 dict 上**（setdefault 原地写），
+          不能只写进本地的临时 dict。
+
+          这里踩过一个很安静的坑：原先是
+              event = {"ts": _now(), **event}     # ← 只改了局部变量
+          于是紧跟其后的 `self._apply(ev)` 拿到的 `ev` 里**没有 ts**，
+          `created_at` / `approved_at` / `consumed_at` 在**当前进程内**全成了
+          None —— 而重启之后从盘上折叠回来又是好的（盘上有 ts）。
+          表现是：接口返回的 `created_at: null`、`list()` 按 `created_at or ""`
+          排序时同一批单子顺序随机；一重启就"自愈"，所以极难复现。
+          **同一份数据有两个来源时，两个来源必须拿到同一个值。**
+        """
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        event = {"ts": _now(), **event}
+        event.setdefault("ts", _now())
         with open(self.path, "a", encoding="utf-8") as f:
             f.write(json.dumps(event, ensure_ascii=False) + "\n")
 

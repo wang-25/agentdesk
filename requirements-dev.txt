@@ -1,0 +1,30 @@
+# ============================================================
+#  Development dependencies (never shipped, never in the runtime set)
+# ------------------------------------------------------------
+#  Runtime deps live in requirements.txt (9 of them, on purpose).
+#  These three are only for local development and CI:
+#
+#      pip install -r requirements.txt -r requirements-dev.txt
+#
+#  Usage:
+#      .venv\Scripts\python.exe -m pytest -q
+#      .venv\Scripts\python.exe -m ruff check tests scripts
+#      .venv\Scripts\python.exe -m mypy
+#
+#  NOTE: keep this file ASCII-only, exactly like requirements.txt.
+#        pip decodes it with the system locale codec (GBK on Chinese
+#        Windows), so any non-ASCII byte crashes the install with
+#        UnicodeDecodeError.  This file broke that rule once already.
+# ============================================================
+
+# Test runner. The suite must be zero-cost and offline --
+# see the _no_network guard in tests/conftest.py.
+pytest>=8.0
+
+# Linter. Only the rule sets that catch real bugs are enabled
+# to start with; see [tool.ruff] in pyproject.toml.
+ruff>=0.6
+
+# Static type checker. Rolled out gradually: tests/ only for now,
+# see [tool.mypy] in pyproject.toml.
+mypy>=1.10
