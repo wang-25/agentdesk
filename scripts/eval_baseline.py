@@ -41,8 +41,27 @@ if str(PROJECT_ROOT) not in sys.path:
 
 BASELINE_PATH = PROJECT_ROOT / "eval" / "baseline.json"
 DEFAULT_TOLERANCE = 0.05      # 5 个百分点。先宽松，避免噪声造成假红
+# 延迟的容差是**相对值**（允许变慢 50%），不是百分点 ——
+# 拿"5 个百分点"去卡延迟没有意义：它是毫秒，不是 0~1 的比例。
+# 50% 也是刻意宽松的：Windows 上亚毫秒级计时的抖动本来就大，
+# 门禁要抓的是"慢了一倍"这种量级的退化，不是 3% 的噪声。
+LATENCY_TOLERANCE = 0.5
+# ★ 测量下限：**两边都低于这个值时，延迟不判失败，只打印**。
+#
+#   为什么必须有它：实测同一份代码连跑两次，`vector.latency_p95_ms` 从 0.24ms
+#   变成 0.45ms（+84%）—— 亚毫秒级的数字在这台机器上主要由计时器精度与
+#   调度抖动决定，而不是由代码决定。拿它当门禁，CI 会随机变红，
+#   然后所有人学会无视这个门禁（"那只会让人学会无视门禁"是项目自己写下的原则）。
+#
+#   但只要**有一边**超过下限（例如从 0.2ms 变成 10ms），那就是真实退化，照判。
+#   索引变大以后（几万块 → 几十毫秒）这个门禁自然开始起作用。
+LATENCY_FLOOR_MS = 5.0
 
 MODES = ("vector", "bm25", "hybrid")
+
+
+def _is_latency(name: str) -> bool:
+    return name.endswith("_ms")
 
 
 def collect(top_k: int) -> dict:
@@ -56,6 +75,12 @@ def collect(top_k: int) -> dict:
         metrics[f"{mode}.recall"] = data["recall"]
         for qtype, t in (data.get("by_type") or {}).items():
             metrics[f"{mode}.recall.{qtype}"] = t["recall"]
+        # ★ 延迟也进门禁。没有它，"某次改动让每次检索慢了一倍"只能靠人感觉 ——
+        #   而检索是**每次问答都要走**的路径，慢一倍会被放大到所有回答上。
+        lat = data.get("latency_ms") or {}
+        if lat:
+            metrics[f"{mode}.latency_p50_ms"] = lat.get("p50", 0.0)
+            metrics[f"{mode}.latency_p95_ms"] = lat.get("p95", 0.0)
 
     return {
         "top_k": top_k,
@@ -74,6 +99,7 @@ def write_baseline(current: dict) -> None:
         ),
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "tolerance": DEFAULT_TOLERANCE,
+        "latency_tolerance": LATENCY_TOLERANCE,
         **current,
     }
     BASELINE_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -102,10 +128,36 @@ def compare(current: dict, baseline: dict) -> int:
 
     regressions = []
     improved = []
+    latency_tol = float(baseline.get("latency_tolerance", LATENCY_TOLERANCE))
     for name, value in sorted(new.items()):
         if name not in old:
-            print(f"  ＋ {name:26s} {value * 100:6.1f}%　（基线里没有，新增记录）")
+            unit = (f"{value:8.2f}ms" if _is_latency(name)
+                    else f"{value * 100:6.1f}%")
+            print(f"  ＋ {name:26s} {unit}　（基线里没有，新增记录）")
             continue
+
+        # ★ 延迟与召回**方向相反**：召回越高越好，延迟越低越好。
+        #   用同一套比较方向会让"变慢"被算成"变好" ——
+        #   这是性能门禁最容易写错、而且错了以后**永远不报**的地方。
+        if _is_latency(name):
+            before, after = old[name], value
+            ratio = (after / before) if before else 1.0
+            # ★ 两边都在测量下限之下 → 这个数字由噪声决定，不判失败（见 LATENCY_FLOOR_MS）
+            if max(before, after) < LATENCY_FLOOR_MS:
+                print(f"    {name:26s} {after:8.2f}ms　(基线 {before:.2f}ms，"
+                      f"{ratio * 100 - 100:+.0f}%)　低于测量下限 {LATENCY_FLOOR_MS:g}ms，"
+                      f"不判失败")
+                continue
+            bad = ratio > 1 + latency_tol
+            flag = "❌" if bad else "  "
+            print(f"  {flag} {name:26s} {after:8.2f}ms　(基线 {before:.2f}ms，"
+                  f"{after - before:+.2f}ms / {ratio * 100 - 100:+.0f}%)")
+            if bad:
+                regressions.append((name, before, after, ratio - 1))
+            elif ratio < 1 - latency_tol:
+                improved.append((name, -(1 - ratio)))
+            continue
+
         delta = value - old[name]
         flag = "  " if delta >= -tolerance else "❌"
         print(f"  {flag} {name:26s} {value * 100:6.1f}%　(基线 {old[name] * 100:.1f}%，"
@@ -119,15 +171,20 @@ def compare(current: dict, baseline: dict) -> int:
     if regressions:
         print(f"  ❌ {len(regressions)} 项指标退化超过容差：")
         for name, before, after, delta in regressions:
-            print(f"     · {name}：{before * 100:.1f}% → {after * 100:.1f}%"
-                  f"（{delta * 100:+.1f}pp）")
+            if _is_latency(name):
+                print(f"     · {name}：{before:.2f}ms → {after:.2f}ms"
+                      f"（{delta * 100:+.0f}%）")
+            else:
+                print(f"     · {name}：{before * 100:.1f}% → {after * 100:.1f}%"
+                      f"（{delta * 100:+.1f}pp）")
         return 1
 
     if improved:
         print(f"  ⬆  {len(improved)} 项指标变好（记得在提交说明里写清楚为什么，"
               f"并考虑 --update 抬高基线）：")
         for name, delta in improved:
-            print(f"     · {name} {delta * 100:+.1f}pp")
+            unit = f"{delta * 100:+.0f}%（更快）" if _is_latency(name) else f"{delta * 100:+.1f}pp"
+            print(f"     · {name} {unit}")
     print("  ✅ 没有指标退化超过容差。")
     return 0
 

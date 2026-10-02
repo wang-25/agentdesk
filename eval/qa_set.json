@@ -1,40 +1,349 @@
 [
-  {"question": "nginx 报 502，error.log 里是 upstream timed out，是什么原因？", "expect_docs": ["nginx-502"], "note": "超时类，精确词命中"},
-  {"question": "502 错误是 nginx 本身的问题吗？", "expect_docs": ["nginx-502"], "note": "语义类，需要理解反向代理"},
-  {"question": "nginx 日志里的 no live upstreams 是什么意思？", "expect_docs": ["nginx-502"], "note": "精确词"},
-  {"question": "SELinux 会不会导致 nginx 反向代理失败？", "expect_docs": ["nginx-502"], "note": "边角知识"},
-  {"question": "怎么判断 nginx 是超时还是上游进程挂了？", "expect_docs": ["nginx-502"], "note": "需要错误码对照表"},
-
-  {"question": "df -h 显示还有空间，但应用报 No space left on device，可能是什么原因？", "expect_docs": ["disk-full"], "note": "inode 与已删除文件，语义类"},
-  {"question": "怎么找出已经被删除但仍然占用磁盘空间的文件？", "expect_docs": ["disk-full"], "note": "lsof 精确命令"},
-  {"question": "docker 容器日志把磁盘占满了怎么处理？", "expect_docs": ["disk-full"], "note": "跨 docker 与 disk，考点在归类"},
-  {"question": "清理日志文件为什么建议用 truncate 而不是 rm？", "expect_docs": ["disk-full"], "note": "需要理解文件句柄"},
-  {"question": "磁盘满了会不会导致数据库写不进去？", "expect_docs": ["disk-full", "mysql-too-many-connections"], "note": "跨文档"},
-
-  {"question": "容器退出码 137 是什么意思？", "expect_docs": ["docker-exit-code"], "note": "精确数字"},
-  {"question": "退出码 137 和 143 有什么区别？", "expect_docs": ["docker-exit-code"], "note": "对比类"},
-  {"question": "容器退出码 127 应该怎么排查？", "expect_docs": ["docker-exit-code"], "note": "精确数字"},
-  {"question": "容器正常退出 0，但服务不可用，是什么原因？", "expect_docs": ["docker-exit-code"], "note": "前台进程概念"},
-  {"question": "怎么确认容器是不是被 OOM Killer 杀掉的？", "expect_docs": ["docker-exit-code"], "note": "OOMKilled 字段"},
-
-  {"question": "MySQL 报 Too many connections 的时候怎么还能连进去？", "expect_docs": ["mysql-too-many-connections"], "note": "extra_port / socket"},
-  {"question": "怎么找出哪个来源 IP 开了太多数据库连接？", "expect_docs": ["mysql-too-many-connections"], "note": "processlist 分组"},
-  {"question": "有没有办法不重启就提高 max_connections？", "expect_docs": ["mysql-too-many-connections"], "note": "SET GLOBAL"},
-  {"question": "应用侧连接泄漏在数据库里表现成什么样？", "expect_docs": ["mysql-too-many-connections"], "note": "Sleep 状态"},
-
-  {"question": "load average 很高但 CPU 看起来很闲，可能是什么原因？", "expect_docs": ["linux-load-high"], "note": "D 状态与 I/O，语义类"},
-  {"question": "怎么区分负载高是 CPU 瓶颈还是磁盘 I/O 瓶颈？", "expect_docs": ["linux-load-high"], "note": "wa 与 iostat"},
-  {"question": "进程处于 D 状态说明什么？", "expect_docs": ["linux-load-high"], "note": "不可中断等待"},
-
-  {"question": "Pod 一直 CrashLoopBackOff，怎么看崩溃之前的日志？", "expect_docs": ["k8s-crashloop"], "note": "--previous 参数"},
-  {"question": "Kubernetes 里内存超限和 CPU 超限的表现有什么区别？", "expect_docs": ["k8s-crashloop"], "note": "杀掉 vs 限流"},
-  {"question": "livenessProbe 配置太严会导致容器反复重启吗？", "expect_docs": ["k8s-crashloop"], "note": "探针类，隐蔽问题"},
-  {"question": "ConfigMap 挂载到应用目录会有什么问题？", "expect_docs": ["k8s-crashloop"], "note": "挂载覆盖"},
-
-  {"question": "服务处理请求太慢，前面的代理层直接返回了网关错误，应该从哪里开始查？", "type": "semantic", "expect_docs": ["nginx-502"], "note": "语义型：全篇没提 502/nginx/upstream"},
-  {"question": "容器的运行日志没人清理，最后把整块盘都占满了，怎么根治？", "type": "semantic", "expect_docs": ["disk-full"], "note": "语义型：不提磁盘已满字样"},
-  {"question": "数据库提示连接数量已达上限，怎么先把自己放进去？", "type": "semantic", "expect_docs": ["mysql-too-many-connections"], "note": "语义型：用中文描述报错"},
-  {"question": "应用起来了马上就退出，来回循环，怎么看到它上一次挂掉之前的输出？", "type": "semantic", "expect_docs": ["k8s-crashloop"], "note": "语义型：不提 Pod/kubectl"},
-  {"question": "服务器整体变卡，但 CPU 并不忙，瓶颈可能在哪一类资源上？", "type": "semantic", "expect_docs": ["linux-load-high"], "note": "语义型：不提 load/D 状态"},
-  {"question": "进程被系统强行终止了，怎么确认是不是内存不足造成的？", "type": "semantic", "expect_docs": ["docker-exit-code", "k8s-crashloop"], "note": "语义型：跨两篇文档"}
+  {
+    "question": "nginx 报 502，error.log 里是 upstream timed out，是什么原因？",
+    "expect_docs": [
+      "nginx-502"
+    ],
+    "note": "超时类，精确词命中"
+  },
+  {
+    "question": "502 错误是 nginx 本身的问题吗？",
+    "expect_docs": [
+      "nginx-502"
+    ],
+    "note": "语义类，需要理解反向代理"
+  },
+  {
+    "question": "nginx 日志里的 no live upstreams 是什么意思？",
+    "expect_docs": [
+      "nginx-502"
+    ],
+    "note": "精确词"
+  },
+  {
+    "question": "SELinux 会不会导致 nginx 反向代理失败？",
+    "expect_docs": [
+      "nginx-502"
+    ],
+    "note": "边角知识"
+  },
+  {
+    "question": "怎么判断 nginx 是超时还是上游进程挂了？",
+    "expect_docs": [
+      "nginx-502"
+    ],
+    "note": "需要错误码对照表"
+  },
+  {
+    "question": "df -h 显示还有空间，但应用报 No space left on device，可能是什么原因？",
+    "expect_docs": [
+      "disk-full"
+    ],
+    "note": "inode 与已删除文件，语义类"
+  },
+  {
+    "question": "怎么找出已经被删除但仍然占用磁盘空间的文件？",
+    "expect_docs": [
+      "disk-full"
+    ],
+    "note": "lsof 精确命令"
+  },
+  {
+    "question": "docker 容器日志把磁盘占满了怎么处理？",
+    "expect_docs": [
+      "disk-full"
+    ],
+    "note": "跨 docker 与 disk，考点在归类"
+  },
+  {
+    "question": "清理日志文件为什么建议用 truncate 而不是 rm？",
+    "expect_docs": [
+      "disk-full"
+    ],
+    "note": "需要理解文件句柄"
+  },
+  {
+    "question": "磁盘满了会不会导致数据库写不进去？",
+    "expect_docs": [
+      "disk-full",
+      "mysql-too-many-connections"
+    ],
+    "note": "跨文档"
+  },
+  {
+    "question": "容器退出码 137 是什么意思？",
+    "expect_docs": [
+      "docker-exit-code"
+    ],
+    "note": "精确数字"
+  },
+  {
+    "question": "退出码 137 和 143 有什么区别？",
+    "expect_docs": [
+      "docker-exit-code"
+    ],
+    "note": "对比类"
+  },
+  {
+    "question": "容器退出码 127 应该怎么排查？",
+    "expect_docs": [
+      "docker-exit-code"
+    ],
+    "note": "精确数字"
+  },
+  {
+    "question": "容器正常退出 0，但服务不可用，是什么原因？",
+    "expect_docs": [
+      "docker-exit-code"
+    ],
+    "note": "前台进程概念"
+  },
+  {
+    "question": "怎么确认容器是不是被 OOM Killer 杀掉的？",
+    "expect_docs": [
+      "docker-exit-code"
+    ],
+    "note": "OOMKilled 字段"
+  },
+  {
+    "question": "MySQL 报 Too many connections 的时候怎么还能连进去？",
+    "expect_docs": [
+      "mysql-too-many-connections"
+    ],
+    "note": "extra_port / socket"
+  },
+  {
+    "question": "怎么找出哪个来源 IP 开了太多数据库连接？",
+    "expect_docs": [
+      "mysql-too-many-connections"
+    ],
+    "note": "processlist 分组"
+  },
+  {
+    "question": "有没有办法不重启就提高 max_connections？",
+    "expect_docs": [
+      "mysql-too-many-connections"
+    ],
+    "note": "SET GLOBAL"
+  },
+  {
+    "question": "应用侧连接泄漏在数据库里表现成什么样？",
+    "expect_docs": [
+      "mysql-too-many-connections"
+    ],
+    "note": "Sleep 状态"
+  },
+  {
+    "question": "load average 很高但 CPU 看起来很闲，可能是什么原因？",
+    "expect_docs": [
+      "linux-load-high"
+    ],
+    "note": "D 状态与 I/O，语义类"
+  },
+  {
+    "question": "怎么区分负载高是 CPU 瓶颈还是磁盘 I/O 瓶颈？",
+    "expect_docs": [
+      "linux-load-high"
+    ],
+    "note": "wa 与 iostat"
+  },
+  {
+    "question": "进程处于 D 状态说明什么？",
+    "expect_docs": [
+      "linux-load-high"
+    ],
+    "note": "不可中断等待"
+  },
+  {
+    "question": "Pod 一直 CrashLoopBackOff，怎么看崩溃之前的日志？",
+    "expect_docs": [
+      "k8s-crashloop"
+    ],
+    "note": "--previous 参数"
+  },
+  {
+    "question": "Kubernetes 里内存超限和 CPU 超限的表现有什么区别？",
+    "expect_docs": [
+      "k8s-crashloop"
+    ],
+    "note": "杀掉 vs 限流"
+  },
+  {
+    "question": "livenessProbe 配置太严会导致容器反复重启吗？",
+    "expect_docs": [
+      "k8s-crashloop"
+    ],
+    "note": "探针类，隐蔽问题"
+  },
+  {
+    "question": "ConfigMap 挂载到应用目录会有什么问题？",
+    "expect_docs": [
+      "k8s-crashloop"
+    ],
+    "note": "挂载覆盖"
+  },
+  {
+    "question": "服务处理请求太慢，前面的代理层直接返回了网关错误，应该从哪里开始查？",
+    "type": "semantic",
+    "expect_docs": [
+      "nginx-502"
+    ],
+    "note": "语义型：全篇没提 502/nginx/upstream"
+  },
+  {
+    "question": "容器的运行日志没人清理，最后把整块盘都占满了，怎么根治？",
+    "type": "semantic",
+    "expect_docs": [
+      "disk-full"
+    ],
+    "note": "语义型：不提磁盘已满字样"
+  },
+  {
+    "question": "数据库提示连接数量已达上限，怎么先把自己放进去？",
+    "type": "semantic",
+    "expect_docs": [
+      "mysql-too-many-connections"
+    ],
+    "note": "语义型：用中文描述报错"
+  },
+  {
+    "question": "应用起来了马上就退出，来回循环，怎么看到它上一次挂掉之前的输出？",
+    "type": "semantic",
+    "expect_docs": [
+      "k8s-crashloop"
+    ],
+    "note": "语义型：不提 Pod/kubectl"
+  },
+  {
+    "question": "服务器整体变卡，但 CPU 并不忙，瓶颈可能在哪一类资源上？",
+    "type": "semantic",
+    "expect_docs": [
+      "linux-load-high"
+    ],
+    "note": "语义型：不提 load/D 状态"
+  },
+  {
+    "question": "进程被系统强行终止了，怎么确认是不是内存不足造成的？",
+    "type": "semantic",
+    "expect_docs": [
+      "docker-exit-code",
+      "k8s-crashloop"
+    ],
+    "note": "语义型：跨两篇文档"
+  },
+  {
+    "question": "误删了一张表，还能找回来吗",
+    "expect_docs": [
+      "backup-restore"
+    ],
+    "note": "语义类：字面几乎不重合（误删/找回 vs 备份/恢复）",
+    "type": "semantic"
+  },
+  {
+    "question": "有人一直在猜我的后台密码，怎么拦住他",
+    "expect_docs": [
+      "brute-force-attack"
+    ],
+    "note": "语义类：没有任何精确词，只有场景",
+    "type": "semantic"
+  },
+  {
+    "question": "网站前台能打开，但一进后台就一直转圈",
+    "expect_docs": [
+      "wordpress-site"
+    ],
+    "note": "语义类：靠场景描述命中，不靠关键词",
+    "type": "semantic"
+  },
+  {
+    "question": "机器响应变得很慢，等一次要好久",
+    "expect_docs": [
+      "linux-load-high"
+    ],
+    "note": "语义类：绕开 load average 字面",
+    "type": "semantic"
+  },
+  {
+    "question": "服务起不来，提示端口已经被别的程序占了",
+    "expect_docs": [
+      "docker-compose-stack"
+    ],
+    "note": "语义类：端口冲突在 compose 那篇里",
+    "type": "semantic"
+  },
+  {
+    "question": "容器刚起来就退出，日志都来不及看",
+    "expect_docs": [
+      "docker-exit-code"
+    ],
+    "note": "语义类：靠“起来就退出”对齐退出码那篇",
+    "type": "semantic"
+  },
+  {
+    "question": "K8s 里的 Pod 反复重启，容器退出码 137",
+    "expect_docs": [
+      "k8s-crashloop",
+      "docker-exit-code"
+    ],
+    "note": "陷阱类：137 的字面在 docker-exit-code，但场景是 K8s（两篇都算命中）",
+    "type": "trap"
+  },
+  {
+    "question": "MySQL 连接数满了，同时磁盘也快写满了，先看哪个",
+    "expect_docs": [
+      "mysql-too-many-connections",
+      "disk-full"
+    ],
+    "note": "陷阱类：跨两篇，考的是别被一方面的关键词带偏",
+    "type": "trap"
+  },
+  {
+    "question": "WordPress 后台很慢，nginx 日志里全是 502",
+    "expect_docs": [
+      "wordpress-site",
+      "nginx-502"
+    ],
+    "note": "陷阱类：站点问题与网关错误并存",
+    "type": "trap"
+  },
+  {
+    "question": "CrashLoopBackOff 到底是什么意思",
+    "expect_docs": [
+      "k8s-crashloop"
+    ],
+    "note": "精确词：状态名",
+    "type": "lexical"
+  },
+  {
+    "question": "ERROR 1040 是哪个错误",
+    "expect_docs": [
+      "mysql-too-many-connections"
+    ],
+    "note": "精确词：错误码",
+    "type": "lexical"
+  },
+  {
+    "question": "面板上报 No space left on device",
+    "expect_docs": [
+      "disk-full"
+    ],
+    "note": "精确词：报错原文",
+    "type": "lexical"
+  },
+  {
+    "question": "docker compose up -d 之后报端口冲突",
+    "expect_docs": [
+      "docker-compose-stack"
+    ],
+    "note": "精确词：命令原文",
+    "type": "lexical"
+  },
+  {
+    "question": "load average 的 15 分钟值特别高",
+    "expect_docs": [
+      "linux-load-high"
+    ],
+    "note": "精确词：指标名",
+    "type": "lexical"
+  }
 ]

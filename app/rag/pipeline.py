@@ -18,6 +18,7 @@ RAG 全链路编排与评测
 import argparse
 import json
 import sys
+import time
 from collections import defaultdict
 from pathlib import Path
 
@@ -178,6 +179,21 @@ def load_qa_set(path=None) -> list:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _percentile(ordered: list, pct: float) -> float:
+    """已排序列表的百分位（最近秩法）。
+
+    ★ 为什么不用 numpy.percentile：这里的样本只有几十条，
+      而我们关心的是"这次改动有没有让 P95 明显变差"，
+      最近秩法给出的就是**实际存在的那次耗时**，比插值出来的数字更好解释 ——
+      "P95 = 12.3ms" 应该对应一次真实发生过的检索，而不是两个样本的平均。
+      也省掉一次 numpy 依赖方向的纠结（它是运行时依赖，但检索层本可以更薄）。
+    """
+    if not ordered:
+        return 0.0
+    idx = max(0, min(len(ordered) - 1, int(round(pct / 100 * len(ordered) + 0.5)) - 1))
+    return float(ordered[idx])
+
+
 def evaluate(top_k: int = 3, modes=("vector", "bm25", "hybrid"),
              qa_set_path=None, verbose: bool = True) -> dict:
     """计算 Top-K 召回率，并对比三种检索模式 × 两类问题。
@@ -212,12 +228,19 @@ def evaluate(top_k: int = 3, modes=("vector", "bm25", "hybrid"),
         hits = 0
         by_type = defaultdict(lambda: {"total": 0, "hits": 0})
         misses = []
+        latencies = []
 
         for item in qa_set:
             qtype = item.get("type", "lexical")
             by_type[qtype]["total"] += 1
 
+            # ★ 逐条计时：只测"检索本身"，不含后面的答案生成。
+            #   这是为了让延迟门禁能定位到**检索层**的退化 ——
+            #   混进模型调用的耗时里，就再也分不清"检索变慢了"还是"模型变慢了"。
+            _t0 = time.perf_counter()
             results = store.search(item["question"], top_k=top_k, mode=mode)
+            latencies.append((time.perf_counter() - _t0) * 1000)
+
             got_docs = {r["doc_id"] for r in results}
 
             if got_docs & set(item["expect_docs"]):
@@ -231,9 +254,16 @@ def evaluate(top_k: int = 3, modes=("vector", "bm25", "hybrid"),
                     "got": sorted(got_docs),
                 })
 
+        ordered = sorted(latencies)
         report["modes"][mode] = {
             "hits": hits,
             "recall": round(hits / len(qa_set), 4) if qa_set else 0.0,
+            "latency_ms": {
+                "p50": round(_percentile(ordered, 50), 3),
+                "p95": round(_percentile(ordered, 95), 3),
+                "mean": round(sum(ordered) / len(ordered), 3) if ordered else 0.0,
+                "max": round(ordered[-1], 3) if ordered else 0.0,
+            },
             "by_type": {
                 t: {"total": v["total"], "hits": v["hits"],
                     "recall": round(v["hits"] / v["total"], 4) if v["total"] else 0.0}
