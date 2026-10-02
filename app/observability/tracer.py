@@ -37,13 +37,14 @@ trace 这里每条 span 在**结束时一次性写完整**（含耗时、usage�
 """
 
 import contextvars
-import json
 import secrets
 import threading
 import time
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
+
+from app.observability import jsonl
 
 # 项目根目录。注意这里**不复用** app.llm.PROJECT_ROOT ——
 # llm.py 会 import 本文件，反过来 import 就是循环依赖。
@@ -74,6 +75,9 @@ _collected: contextvars.ContextVar = contextvars.ContextVar("collected", default
 # 导出器由 langfuse_export 在配置了 Key 时挂进来；tracer 只管在 trace 结束时通知。
 _export_hook = None          # callable(trace_record) 或 None
 _export_failures = 0
+# 观测**写入**失败的累计次数。写入失败不能中断业务（见模块铁律），
+# 但也不能装作没发生 —— 这个计数由 /metrics 与 /healthz 暴露出去。
+_write_failures = 0
 
 
 def _now() -> str:
@@ -81,13 +85,26 @@ def _now() -> str:
 
 
 def _write(record: dict) -> None:
-    """追加一条记录。**任何失败都吞掉** —— 见模块 docstring 的铁律。"""
+    """追加一条记录。**任何失败都吞掉** —— 见模块 docstring 的铁律。
+
+    ★ 但"吞掉"不等于"装作没发生"：失败次数记在 `_write_failures` 里，
+      由 `write_failures()` 暴露给 /metrics 与 /healthz。
+      观测数据写不进去，业务不该中断；但**看板上必须看得出来**，
+      否则就成了"以为在记录、其实一直在丢"——那正是本项目反复警惕的静默失败。
+    """
+    global _write_failures
     try:
-        TRACE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with _lock, open(TRACE_PATH, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        jsonl.append_jsonl(TRACE_PATH, record,
+                           limit_bytes=jsonl.max_bytes(),
+                           keep=jsonl.keep_count())
     except Exception:
-        pass
+        with _lock:
+            _write_failures += 1
+
+
+def write_failures() -> int:
+    """观测写入失败的累计次数（进程内计数）。"""
+    return _write_failures
 
 
 def set_export_hook(hook) -> None:
@@ -422,28 +439,24 @@ def sum_usage(usages) -> dict:
     return out
 
 
-def read_recent(limit: int = 800) -> list:
-    """读最近 N 条原始记录。从尾部取，避免整个文件载入内存。"""
-    if not TRACE_PATH.exists():
-        return []
-    try:
-        with open(TRACE_PATH, "rb") as f:
-            f.seek(0, 2)
-            size = f.tell()
-            f.seek(max(0, size - 2 * 1024 * 1024))     # 尾部 2MB
-            tail = f.read().decode("utf-8", errors="replace")
-        out = []
-        for line in tail.splitlines()[-limit:]:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                out.append(json.loads(line))
-            except json.JSONDecodeError:
-                continue          # 跳过写坏的行，别让一行废数据弄挂查询接口
-        return out
-    except Exception:
-        return []
+def read_recent(limit: int = 800, stats: dict = None) -> list:
+    """读最近 N 条原始记录（**跨轮转文件回读**）。
+
+    ★ 两处刻意的改动（M4）：
+
+      ① 轮转之后仍要能读到"最近 N 条"：当前文件不够就回读 `.1`、`.2`…
+         否则刚轮转完，看板会突然变成"最近没有任何记录" —— 比不轮转更糟。
+
+      ② **不再"出任何错就 return []"**：读失败与"确实没有数据"是两件事，
+         而原实现把前者伪装成后者（看板静默显示空）。
+         失败/截断/坏行都写进 `stats["read"]`（嵌套键，避免与 recent_traces
+         自己那个 `scanned`（含义是"扫过多少条 trace"）撞名 —— 同名不同义
+         正是这个项目最容易出错的坑之一）。
+    """
+    records, meta = jsonl.read_tail(TRACE_PATH, limit)
+    if stats is not None:
+        stats["read"] = meta
+    return records
 
 
 def recent_traces(limit: int = 20, source: str = "live", stats: dict = None) -> list:
