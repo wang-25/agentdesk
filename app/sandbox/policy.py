@@ -33,6 +33,7 @@
 """
 
 import hashlib
+import os
 import re
 import shlex
 from dataclasses import dataclass, field
@@ -234,10 +235,37 @@ BLOCKED_BINARIES = {
 #
 # 而且只允许读 .log 结尾的文件 —— 日志目录里也可能有别的，
 # 没必要给。**能少给就少给。**
-# ---- 读：日志目录 ----
-# 只允许读 /var/log 下的文件。日志目录里也可能有别的（wtmp、btmp、审计日志），
-# 没必要给。**能少给就少给。**
+# ---- 读：日志目录下的**日志文件** ----
+# 原实现只校验目录前缀，于是 `/var/log/secure`、`wtmp`、`btmp`、`audit/*`
+# 全都在可读范围内 —— **与本节注释（"只允许读 .log 结尾的文件"）自相矛盾**。
+# 注释与代码不一致本身就是缺陷：后来的人按注释理解系统，而系统实际给得更多。
+#
+# 收紧方案（已与用户确认）：
+#   ① `.log`（含 `.log.1` 这类轮转文件）放行；
+#   ② **显式放行几个常用但无扩展名的日志**：syslog / messages / kern.log /
+#      auth.log / daemon.log。严格只认 `.log` 会把 `tail /var/log/syslog`
+#      这类最常用的排障命令挡掉 —— "能少给就少给"不等于"给到不能用"；
+#   ③ `secure` / `wtmp` / `btmp` / `audit/*` **不给**：它们分别是认证记录、
+#      登录记录、审计记录，与"看服务日志"是两件事。需要时应当由人去看，
+#      而不是让 Agent 顺手读走。
 _READABLE_DIRS = ("/var/log",)
+# 显式拒绝名单：这几类是**认证与审计记录**，即使名字以 .log 结尾也不给。
+#   · /var/log/audit/*   —— auditd 的安全审计记录（audit.log 会命中 .log 规则，必须单独挡）
+#   · /var/log/private/* —— 各发行版放私有日志的目录
+#   · secure / wtmp / btmp / lastlog —— 认证与登录记录
+#
+# ★ 一个已知的不对称，写在这里免得下一个人以为是漏了：
+#   Debian 系把认证日志叫 auth.log，RHEL 系叫 secure。
+#   本方案按确认的口径**放行 auth.log、拒绝 secure** —— 这偏严而不是偏松
+#   （宁可对 RHEL 更保守）。要统一口径就改这一行，别改别处。
+_READ_DENY_DIRS = ("/var/log/audit", "/var/log/private")
+_READ_DENY_NAMES = ("secure", "wtmp", "btmp", "lastlog")
+_READABLE_LOG_RE = re.compile(
+    r"^/var/log/(?:[\w.-]+/)*("
+    r"[\w.-]+\.log(?:\.\d+)?"
+    r"|syslog(?:\.\d+)?|messages(?:\.\d+)?|kern\.log|auth\.log|daemon\.log"
+    r")$"
+)
 # ---- 写：只允许日志目录，而且必须是 .log 文件 ----
 # 比读更严，因为读错了最多是泄露，写错了可能是服务起不来。
 _WRITABLE_DIRS = ("/var/log",)
@@ -323,6 +351,27 @@ def _check_path(path: str, *, writable: bool = False) -> str:
         raise PolicyError(
             f"只允许对 .log 文件做写操作，收到：{path!r}。"
             f"日志轮转文件（.log.1）也可以")
+
+    if not writable and not _READABLE_LOG_RE.match(path):
+        # 读也必须落在"确实是日志"的文件上（见上面 _READABLE_LOG_RE 的说明）。
+        # 这一条以前是缺的：只校验目录前缀，于是 secure/wtmp/btmp/audit 也能读走。
+        raise PolicyError(
+            f"只允许读 /var/log 下的日志文件，收到：{path!r}。"
+            f"允许 .log（含 .log.1）以及 syslog / messages / kern.log / "
+            f"auth.log / daemon.log；"
+            f"secure、wtmp、btmp、audit/* 这类认证与审计记录不开放给 Agent。")
+
+    # 显式拒绝名单对**读和写都生效**。
+    #
+    # ★ 这一条是被测试逼出来的：写完读路径的收紧后，我顺手测了一下
+    #   `truncate -s 0 /var/log/audit/audit.log` —— 它被判成 needs_approval，
+    #   也就是**有人批准就能截断审计日志**。
+    #   截断审计记录是典型的"抹掉痕迹"动作，它不该因为"有人点了同意"就变得可以。
+    #   （`.log` 正则会放行 audit.log，所以这份名单必须独立于读写分支。）
+    if any(path == d or path.startswith(d + "/") for d in _READ_DENY_DIRS):
+        raise PolicyError(f"该目录属于认证/审计记录，不开放读写：{path!r}")
+    if path.rsplit("/", 1)[-1] in _READ_DENY_NAMES:
+        raise PolicyError(f"该文件是认证/登录记录，不开放读写：{path!r}")
     return path
 
 
@@ -511,6 +560,75 @@ def _v_docker_restart(args):
     return _sub(args, "restart", _container_name)
 
 
+def _v_docker_logs(args):
+    """`docker logs [--tail N | -n N] <容器名>` —— 只读看容器日志。
+
+    ★ 这条规则是**把一个已经存在的旁路显式纳入白名单**，不是新增能力。
+
+      在这之前，`app/tools/ops.py` 的 `_run_logs` 为了让容器的 stderr
+      也能被看见，拼的是 `sh -c "docker logs --tail N <容器名> 2>&1"`
+      并直接丢给运输层执行 —— 也就是说 **`docker logs` 本来就在被真实执行，
+      只是绕过了 `decide()` 这一层**：白名单里查不到它、审计里没有它、
+      审批界面也看不到它。而 `sh -c` 那条路尤其讽刺 ——
+      `sh` 恰恰是 BLOCKED_BINARIES 里明令禁止的可执行文件。
+
+      「已经在跑的命令」留在白名单外，是这张表最坏的一种状态：
+      它不报错、不告警，只是让规则表看起来比实际更严。
+      **准入规则和实际能力对不上，比没有规则更危险。**
+
+    【边界：正好是原来那条旁路的能力，一个参数都没多给】
+
+      允许：`docker logs <容器名>`
+            `docker logs --tail <1-500> <容器名>`
+            `docker logs -n <1-500> <容器名>`
+      拒绝：其它任何子命令/参数（`-f`、`--since`、`--until`、`--details`…）
+
+      `-f`（follow）必须拒：它**永不返回**，会一直占着执行通道直到超时 ——
+      在自动化里等价于把这次调用挂死。
+
+      `--since 1h` 也必须拒：它看着无害，但引入的是"时间窗口"这个自由参数，
+      而这条规则的全部价值就在于**参数形态固定、可枚举**。
+
+      `--tail` 的上界取 500（`_check_lines` 的 200 是给 journalctl/tail 用的，
+      容器日志需要更大的窗口，但同样必须有上界 —— 无上界的 `--tail` 可以
+      要求 docker 吐出容器整个生命周期几万行日志）。
+    """
+
+    def _rest(rest):
+        # ★ 必须走 _sub：args 的第一位是子命令 `logs`，不是参数。
+        #   这一点被真实踩过（见 _sub 的文档）—— 按"纯参数"写的话，
+        #   校验收到的其实是 ["logs", ...]，于是规则**永远命中不了**，
+        #   而且不报错：看起来支持，实际一执行就说"参数形式不被允许"。
+        if not rest:
+            raise PolicyError("用法：docker logs [--tail <1-500>] <容器名>")
+
+        first = rest[0]
+        if first in ("--tail", "-n"):
+            if len(rest) != 3:
+                raise PolicyError(
+                    "用法：docker logs [--tail <1-500>] <容器名>。"
+                    "只允许 --tail/-n 这一个可选参数，"
+                    "其它参数（如 -f、--since）一律不允许")
+            raw = rest[1]
+            if not raw.isdigit():
+                raise PolicyError(f"行数必须是数字，收到 {raw!r}")
+            n = int(raw)
+            if not 1 <= n <= 500:
+                raise PolicyError(f"行数必须在 1-500 之间，收到 {n}")
+            # 容器名最后校验：它不合法时给出的理由最贴近实际错误
+            name = _container_name([rest[2]])[0]
+            return [first, str(n), name]
+
+        if len(rest) != 1:
+            raise PolicyError(
+                "用法：docker logs [--tail <1-500>] <容器名>。"
+                "只允许 --tail/-n 这一个可选参数，"
+                "其它参数（如 -f、--since）一律不允许")
+        return [_container_name(rest)[0]]
+
+    return _sub(args, "logs", _rest)
+
+
 def _v_du(args):
     """du —— 查看目录占用。只支持两种形态：
 
@@ -612,6 +730,15 @@ COMMANDS = {
         example="docker ps -a",
         usage="docker ps [-a]",
         note="只读，列出容器"),
+    # ★ 这条规则是**收口**来的，不是新加的能力 —— 详见 _v_docker_logs 的说明。
+    #   走 host 通道：容器里没有宿主机的 docker daemon，`docker logs`
+    #   放进一次性容器根本够不着目标容器。
+    "docker.logs": CommandRule(
+        bin="docker", decision=ALLOW, isolation=CHANNEL_HOST, timeout=15,
+        validate=_v_docker_logs,
+        example="docker logs --tail 100 wp-app",
+        usage="docker logs [--tail <1-500>] <容器名>",
+        note="只读，查看容器日志尾部（可选 --tail/-n 1-500）"),
 
     # ★ lsof 只放行 `+L1`（列出"已删除但仍被进程持有"的文件）。
     #
@@ -756,6 +883,66 @@ def fingerprint(argv: list, isolation: str, mounts: list) -> str:
 
 _HINT = ("命令必须是白名单里的（见 /sandbox/commands）。"
          "只读诊断通常已有专用工具，优先用它们。")
+
+
+# ============================================================
+# 二·B、可执行文件的解析：**只看固定目录，绝不看 PATH**
+# ============================================================
+# 【为什么必须这样】
+# 白名单只比对命令名（并且显式拒绝带 `/` 的名字），这拦住了"用 /tmp/df 冒充 df"。
+# 但执行时如果靠**继承的 PATH** 去找程序，那么：
+#
+#     谁能控制 PATH，谁就能放一个假的 systemctl 进去，绕过**整张白名单表**。
+#
+# 白名单再严也没用 —— 因为它把"到底执行哪个程序"这个决定交给了环境变量。
+# 这是"用结构约束，而不是靠自觉"这条原则在**执行面**的同一个应用：
+#
+#     **搜索路径必须是代码里写死的常量，不能来自环境。**
+#
+# 【为什么返回 None 而不是抛异常 / 也不是在 decide() 里就拒】
+#   · `decide()` 保持"只看命令文本"的纯函数语义，白名单测试才不会被
+#     "这台机器上有没有装 docker"影响（CI 里就没有 docker）。
+#   · 真正的"找不到程序"在执行那一刻才知道 —— 那时拒绝，理由也最准确。
+BINARY_DIRS = ("/usr/bin", "/bin", "/usr/sbin", "/sbin", "/usr/local/bin")
+
+
+def resolve_binary(bin_name: str) -> str:
+    """把命令名解析成**固定候选目录里的绝对路径**；找不到返回 None。
+
+    调用方（executor）拿到 None 时应当**拒绝执行**，而不是退回裸名 ——
+    退回裸名等于把刚才堵上的那个洞又打开。
+    """
+    if not bin_name or "/" in bin_name or "\\" in bin_name:
+        return None
+    for directory in BINARY_DIRS:
+        candidate = os.path.join(directory, bin_name)
+        try:
+            if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                return candidate
+        except OSError:
+            continue
+    return None
+
+
+def command_env() -> dict:
+    """执行命令时用的**最小环境**。
+
+    【为什么要清环境】
+    除了 PATH，还有一批环境变量能改变"实际执行了什么"：
+
+        LD_PRELOAD / LD_LIBRARY_PATH   → 注入动态库
+        BASH_ENV / ENV / IFS           → 影响 shell 行为（即便当前是 shell=False）
+        PYTHONPATH / PYTHONSTARTUP     → 注入 import 路径
+
+    我们现在不用 shell，所以后两类眼下无法被利用 ——
+    但**"眼下无法被利用"不是不清理的理由**：这类变量的价值会随着
+    "哪天有人图省事改成 shell=True"而立刻兑现。历史上这种改动很常见。
+    """
+    return {
+        "PATH": ":".join(BINARY_DIRS),
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+    }
 
 
 def decide(command: str) -> Decision:

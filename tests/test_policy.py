@@ -148,6 +148,112 @@ def test_du_accepts_inspect_dirs_but_not_root_home():
 
 
 # ============================================================
+# 四·B、读路径：只读"确实是日志"的文件（M3 收紧）
+# ============================================================
+@pytest.mark.parametrize("path", [
+    pytest.param("/var/log/nginx/error.log", id="nginx-err"),
+    pytest.param("/var/log/nginx/access.log.1", id="rotated-log"),
+    pytest.param("/var/log/syslog", id="syslog"),
+    pytest.param("/var/log/messages", id="messages"),
+    pytest.param("/var/log/kern.log", id="kern"),
+    pytest.param("/var/log/auth.log", id="auth"),
+    pytest.param("/var/log/daemon.log", id="daemon"),
+    pytest.param("/var/log/mysql/error.log", id="mysql-nested"),
+])
+def test_read_path_allows_real_logs_including_common_extensionless_ones(path):
+    """**"能少给就少给"不等于"给到不能用"。**
+
+    严格只认 `.log` 会把 `tail /var/log/syslog` 挡掉 ——
+    那是排查系统问题最常用的命令之一。所以显式放行几个常用的无扩展名日志。
+    """
+    assert policy.decide(f"tail -n 20 {path}").decision != policy.DENY, path
+
+
+@pytest.mark.parametrize("path", [
+    pytest.param("/var/log/secure", id="secure-auth"),
+    pytest.param("/var/log/wtmp", id="wtmp-logins"),
+    pytest.param("/var/log/btmp", id="btmp-failed-logins"),
+    pytest.param("/var/log/lastlog", id="lastlog"),
+    pytest.param("/var/log/audit/audit.log", id="auditd-log-ends-with-dot-log"),
+    pytest.param("/var/log/private/app.log", id="private-dir"),
+])
+def test_read_path_denies_auth_and_audit_records(path):
+    """认证与审计记录不开放给 Agent —— **即使名字以 .log 结尾**。
+
+    `audit/audit.log` 这条是关键：它能命中 `.log` 正则，
+    只靠正则挡不住，必须有一份显式拒绝名单。
+    """
+    assert policy.decide(f"tail -n 20 {path}").decision == policy.DENY, path
+
+
+def test_read_deny_list_applies_to_writes_too():
+    """认证/审计记录**即便有人批准也不开放** —— 读和写都拒。
+
+    这条是写完读路径收紧后顺手测出来的：`truncate -s 0 /var/log/audit/audit.log`
+    原本被判成 needs_approval，也就是"有人点同意就能截断审计日志"。
+    截断审计记录是典型的抹掉痕迹动作，不该因为有人批准就变得可以。
+
+    写路径本来就比读严，但"严"体现在**需要审批**上；对认证/审计记录来说，
+    需要审批还不够，必须是**做不到**。
+    """
+    assert policy.decide("truncate -s 0 /var/log/nginx/error.log").decision \
+        == policy.NEEDS_APPROVAL
+    for bad in ("/var/log/secure", "/var/log/audit/audit.log", "/var/log/wtmp"):
+        assert policy.decide(f"truncate -s 0 {bad}").decision == policy.DENY, bad
+        assert policy.decide(f"tail -n 20 {bad}").decision == policy.DENY, bad
+
+
+# ============================================================
+# 四·C、可执行文件解析：只看固定目录，绝不看 PATH（M3 C1）
+# ============================================================
+def test_binary_dirs_is_a_fixed_constant_not_from_env(monkeypatch):
+    """★ 搜索路径必须是代码里写死的常量。
+
+    这是消掉 PATH 劫持面的根据：白名单只比命令名，如果执行时靠继承的 `PATH`
+    去找程序，**谁能控制 PATH 谁就能放一个假 systemctl 绕过整张表**。
+    """
+    assert policy.BINARY_DIRS
+    assert all(d.startswith("/") for d in policy.BINARY_DIRS)
+    # 就算把环境里的 PATH 换成满是陷阱的目录，候选目录也不该变
+    monkeypatch.setenv("PATH", "/tmp/evil:/tmp/evil2")
+    assert "/tmp/evil" not in policy.BINARY_DIRS
+
+
+def test_resolve_binary_refuses_names_with_paths():
+    """`/tmp/df`、`./df` 这类名字不该被"解析" —— 它们本身就是绕过尝试。"""
+    assert policy.resolve_binary("/tmp/df") is None
+    assert policy.resolve_binary("./df") is None
+    assert policy.resolve_binary("") is None
+    assert policy.resolve_binary(None) is None  # type: ignore[arg-type]
+
+
+def test_resolve_binary_does_not_use_path(monkeypatch, tmp_path):
+    """在 PATH 里放一个假的 `df`，解析结果**绝不能**指向它。"""
+    fake_dir = tmp_path / "evil"
+    fake_dir.mkdir()
+    fake = fake_dir / "df"
+    fake.write_text("#!/bin/sh\necho pwned\n", encoding="utf-8")
+    fake.chmod(0o755)
+    monkeypatch.setenv("PATH", str(fake_dir))
+
+    resolved = policy.resolve_binary("df")
+    # Linux 上会解析到真的 /usr/bin/df；Windows 上没有 df，返回 None。
+    # **两种情况都算通过** —— 关键是与假目录无关。
+    assert resolved is None or str(fake_dir) not in resolved
+
+
+def test_command_env_drops_inherited_variables(monkeypatch):
+    """执行环境是最小集：`LD_PRELOAD` 这类注入变量的价值会随"哪天有人改成 shell=True"立刻兑现。"""
+    monkeypatch.setenv("LD_PRELOAD", "/tmp/evil.so")
+    monkeypatch.setenv("LD_LIBRARY_PATH", "/tmp/evil")
+    monkeypatch.setenv("PYTHONPATH", "/tmp/evil")
+    env = policy.command_env()
+    assert env["PATH"] == ":".join(policy.BINARY_DIRS)
+    for leaked in ("LD_PRELOAD", "LD_LIBRARY_PATH", "PYTHONPATH"):
+        assert leaked not in env, leaked
+
+
+# ============================================================
 # 五、决策字段的完整性
 # ============================================================
 def test_needs_approval_carries_enough_for_a_human_to_decide():
