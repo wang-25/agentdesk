@@ -7,9 +7,10 @@ AgentDesk 服务入口
 【运行方式】在 agentdesk 目录下执行：
     .venv\\Scripts\\python.exe -m uvicorn app.main:app --reload --port 8000
 
-【接口一览】共 31 个业务路由，其中 26 个进 OpenAPI 文档。
-  为什么是 24 而不是 22：`GET /`（导航页）和 `GET /try`（在线试用页）是给人看的
-  页面，标了 `include_in_schema=False`，不进 OpenAPI 的路径表 ——
+【接口一览】共 34 个业务路由，其中 29 个进 OpenAPI 文档。
+  为什么进文档的比总数少：`GET /`（导航页）、`GET /try`（在线试用页）、
+  `/dashboard`、`/settings`、`/view/{name}` 是**给人看的页面**，
+  标了 `include_in_schema=False`，不进 OpenAPI 的路径表 ——
   它们真实存在、能访问，只是不该混进接口清单里干扰视线。
 
   健康与审计
@@ -45,6 +46,18 @@ AgentDesk 服务入口
     POST /approvals/{id}/approve    批准（必须填审批人）
     POST /approvals/{id}/reject     驳回
     POST /approvals/{id}/execute    执行已批准的命令（一次性）
+
+  事件与通知
+    GET  /incidents                 事件列表（含计数与聚合口径）
+    GET  /incidents/{id}            单个事件详情（完整时间线 + 成员告警）
+    POST /incidents/{id}/ack        认领（必须填处理人）
+    POST /incidents/{id}/resolve    结单（顺便把它变成一个"案例"，见 M5b）
+
+  记忆（M5b）
+    GET    /sessions                会话列表 + 计数 + 上限（不含对话正文）
+    GET    /sessions/{id}           看一个会话记住了什么（正文要显式要）
+    DELETE /sessions/{id}           清空一个会话（返回删掉几轮）
+    POST /chat 的 session_id 字段    传了才带上历史与历史案例（默认完全无状态）
 
   可观测
     GET  /metrics/summary           成本与延迟聚合看板
@@ -95,9 +108,24 @@ from app.llm import chat_json, chat_stream_async
 from app.notify import events as notify_events
 from app.observability import costs as obs_costs
 from app.observability import langfuse_export, tracer as obs
+from app.plays import PlayError as PlayConfigError
+from app.plays import render as render_play
+from app.plays import store as plays_store
 
 # 配了 LANGFUSE_* 环境变量才生效；没配就是本地记录模式，功能不受影响
 langfuse_export.install()
+
+# ★ 启动时就把剧本校验一遍，**坏剧本让服务拒绝启动**。
+#
+#   为什么这么严：剧本是给"半夜被叫起来的人"用的，而它的错误形态是**静默**的 ——
+#   一条不在白名单里的命令，要等执行到第 4 步才发现；一个拼错的分叉名，
+#   会让某条分支永远走不到。相比之下"启动就报错、说清第几步为什么"是
+#   当时就能修好的故障。空目录不算错误（还没写剧本是合法状态）。
+try:
+    plays_store.load_all()
+except PlayConfigError as e:
+    raise RuntimeError(
+        f"处置剧本加载失败，服务拒绝启动（修好 plays/*.json 再启动）：{e}") from e
 
 # ============================================================
 # 应用实例
@@ -325,10 +353,24 @@ def _display_path(path) -> str:
 # ============================================================
 class ChatRequest(BaseModel):
     """pydantic 会自动做校验 —— 字段缺失或类型不对会直接返回 422，
-    业务代码里不用写任何 if 判断。"""
+    业务代码里不用写任何 if 判断。
+
+    ★ `session_id` 是**可选**的，而且不传时的行为与加这个字段之前**逐字段一致**
+      （不读会话、不写会话、响应仍然只有 `answer`）。
+      这条是硬约束，有回归用例守着：
+      `tests/test_memory.py::test_chat_without_session_id_keeps_the_old_behaviour`。
+      理由：`/chat` 是既有调用方（脚本、集成方）在用的接口，
+      "加了记忆"不应该让任何人不改代码就改变行为。
+      要记忆能力就显式传 `session_id` —— **显式开关比"悄悄变了"好**。
+    """
 
     question: str = Field(..., min_length=1, max_length=2000,
                           description="用户的提问")
+    session_id: Optional[str] = Field(
+        None, max_length=64,
+        description=("可选。传了就带上该会话最近的几轮对话（带标注、仅供参考），"
+                     "并把这一轮追加进去。只允许 A-Za-z0-9_- 。"
+                     "不传 = 完全无状态，与不传时行为一致"))
 
 
 class ChatResponse(BaseModel):
@@ -508,17 +550,28 @@ _ALERT_AGG = AlertAggregator(
 _ALERT_SILENCE = Silence()
 _ALERT_HOUR = {"hour": "", "count": 0}
 
+# ★ 这里的每一条命令**必须**是 policy 白名单允许的。
+#
+#   M5 写结构化剧本时才发现：原来的这几份清单里有 4 条系统自己会拒绝的命令 ——
+#     `systemctl --failed`（在默认预案里，**所有告警都会展示它**）
+#     `ss -lntp | grep :80`
+#     `tail -100 …`（只允许 `tail -n 100` 这种写法）
+#     `docker logs --tail 100 <container>`（占位符，不是能执行的命令）
+#   以前没人发现，因为这些清单**只是一段展示给人看的文本，从不经过策略校验**。
+#   现在有一条用例（tests/test_playbook_policy.py）逐条把清单喂给 policy，
+#   再出现越界命令会当场变红。
+#
+#   更完整的处置流程（带判定与分叉、带回滚声明）见 plays/*.json 与 GET /plays。
 DIAGNOSE_PLAYBOOK = {
-    "nginx": ["systemctl status nginx", "tail -100 /var/log/nginx/error.log",
-              "df -h", "ss -lntp | grep :80"],
+    "nginx": ["systemctl status nginx", "tail -n 100 /var/log/nginx/error.log",
+              "journalctl -u nginx -n 100", "df -h"],
     "mysql": ["systemctl status mariadb", "df -h", "free -m",
-              "tail -100 /var/log/mysql/error.log"],
+              "tail -n 100 /var/log/mysql/error.log"],
     "mariadb": ["systemctl status mariadb", "df -h", "free -m",
-                "tail -100 /var/log/mysql/error.log"],
-    "docker": ["docker ps -a", "docker logs --tail 100 <container>",
-               "df -h", "systemctl status docker"],
+                "tail -n 100 /var/log/mysql/error.log"],
+    "docker": ["docker ps -a", "df -h", "free -m", "systemctl status docker"],
 }
-DEFAULT_PLAYBOOK = ["uptime", "df -h", "free -m", "systemctl --failed"]
+DEFAULT_PLAYBOOK = ["uptime", "df -h", "free -m", "du -sh /var/log"]
 
 
 # `normalize_alerts` / `alert_to_question` 已搬到 app/alerting/normalize.py，
@@ -2242,6 +2295,85 @@ loadAll();
 
 
 # ============================================================
+# 接口 1·A：处置剧本（M5 · I-9）
+# ============================================================
+@app.get("/plays")
+def list_plays():
+    """列出全部结构化处置剧本。
+
+    【和告警响应里那个 `playbook` 字段的区别】
+    告警里的 `playbook` 是一份**只读命令清单**（保留是为了兼容既有响应字段）；
+    剧本是**有判定、有分叉、有回滚声明**的流程，而且每一条命令都在加载时
+    与 policy 对过账。要动手处置的时候看剧本，不要看那个清单。
+
+    【为什么这个接口不执行任何东西】
+    项目的边界是"写操作永不自动执行"。这里的回应里只有**描述**：
+    哪些步骤是只读（可自动跑）、哪些是写操作（要审批）、哪些退不回去。
+    """
+    plays = plays_store.load_all()
+    return {
+        "total": len(plays),
+        "counts": plays_store.counts(),
+        "items": [
+            {
+                "name": p.name,
+                "title": p.title,
+                "description": p.description,
+                "applies_to": p.applies_to,
+                "steps": len(p.steps),
+                "actions": len(p.action_steps()),
+                # ★ 不可回滚的步骤数单独列出来：这是决策时最该看到的一个数
+                "irreversible": sum(1 for s in p.action_steps()
+                                    if s.rollback.get("none")),
+            }
+            for p in sorted(plays.values(), key=lambda x: x.name)
+        ],
+        "note": ("剧本只描述处置流程，不自动执行任何命令；"
+                 "写操作步骤仍需走既有审批。"),
+    }
+
+
+@app.get("/plays/{name}")
+def read_play(name: str):
+    """看一份剧本的完整流程（含每一步的 policy 判定）。
+
+    找不到就是 404；`plan` 字段是给人读的渲染文本，
+    `steps` 是结构化的（接口与前端按字段取值，不用解析文本）。
+    """
+    try:
+        play = plays_store.get(name)
+    except PlayConfigError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+
+    return {
+        "name": play.name,
+        "title": play.title,
+        "description": play.description,
+        "applies_to": play.applies_to,
+        "plan": render_play(play),
+        "steps": [
+            {
+                "id": s.id,
+                "kind": s.kind,
+                # 如实标出"这一步会不会自动跑"与"要不要审批"
+                "auto_run": not s.is_action,
+                "run": s.run,
+                "policy": {"verdict": s.verdict, "rule": s.rule_key},
+                "expect": s.expect,
+                "on_pass": s.on_pass,
+                "on_fail": s.on_fail,
+                "rollback": s.rollback,
+                "rollback_policy": {"verdict": s.rollback_verdict},
+                "note": s.note,
+            }
+            for s in play.steps
+        ],
+        "note": ("剧本只描述处置流程，不自动执行任何命令；"
+                 "写操作步骤仍需走既有审批。"),
+    }
+
+
+# ============================================================
 # 接口 1：健康检查
 # ============================================================
 @app.get("/health")
@@ -2369,25 +2501,173 @@ def read_audit(limit: int = Query(20, ge=1, le=200, description="返回最近多
 
 
 # ============================================================
+# 会话记忆（M5b）：存取会话的入口
+# ============================================================
+# 【为什么这两个取用函数要写成"每次调用现取"】
+#   与 `_incident_store()` 同一个理由（也踩过同一个坑）：测试用 monkeypatch
+#   替换 `app.memory.sessions._STORE` 来把落盘改到临时目录。顶层
+#   `from app.memory.sessions import store` 会在 import 时把函数对象绑死，
+#   隔离装置就失效了 —— 那正是 M1 那次"假 trace 写进真实 logs"的事故形态。
+def _session_store():
+    from app.memory import sessions as session_memory
+    return session_memory.store()
+
+
+def _cases_module():
+    """取案例模块（**模块本身**，不是某个函数）。
+
+    为什么拿模块：`record_case` / `find_similar` 都可能被测试打桩，
+    而打桩必须打在**消费方**（本项目用的是 `from x import y` 直接导入）。
+    拿着模块对象按需取属性，打桩才生效。
+    """
+    from app.memory import cases as case_memory
+    return case_memory
+
+
+def _bad_session_id(e: ValueError) -> HTTPException:
+    """把 `session_id` 校验失败翻成 400（参数不对，不是服务器错）。
+
+    ★ 调用处一律写 `raise _bad_session_id(e) from e`：400 只是个状态码，
+      真正的"哪里不合法"在 `ValueError` 的消息里（它原样进 `detail`）。
+      保留异常链，日志里就还能看到来源；丢掉它就退化成"一个 400"。
+    """
+    return HTTPException(status_code=400, detail=str(e))
+
+
+def _session_context(session_id: str, limit: int = 10) -> str:
+    """把最近几轮对话渲染成**带标注**的上下文。没有历史 → `""`。
+
+    ★ 三条标注缺一不可，理由见 `app/memory/sessions.py` 与 `docs/memory.md`：
+
+        ① 说明这是**过去的对话记录**（不是本次的观测事实）
+        ② 每一轮**带时间**（没有时间的上下文，模型无法判断新旧）
+        ③ 结尾明确"仅供参考，要用当前机器的实际数据重新判断"
+
+      历史对话的风险比案例低，但**机制上它是同一类东西**：
+      都是"上一次的说法"，都不能被当成"这一次的事实"。
+      本项目一贯拒绝把未标注的推测喂给模型 —— 所以这里照样标注。
+    """
+    turns = _session_store().recent(session_id, limit=limit)
+    if not turns:
+        return ""
+
+    lines = [
+        f"【同一会话的历史对话 · 仅供参考】以下是会话 {session_id} 最近 "
+        f"{len(turns)} 轮的记录（旧 → 新）。它们只说明**当时**问了什么、答了什么，"
+        "不代表现在的机器仍是那个状态。",
+        "",
+    ]
+    for i, turn in enumerate(turns, 1):
+        lines.append(f"[{i}] 时间：{turn.get('ts') or '(无时间)'}")
+        lines.append(f"    用户：{turn.get('question') or ''}")
+        lines.append(f"    助手：{turn.get('answer') or ''}")
+    lines.append("")
+    lines.append("以上是历史对话，仅供参考。回答当前问题前，"
+                 "请用当前机器的实际数据重新判断，不要把上面助手的说法当成事实。")
+    return "\n".join(lines)
+
+
+def _case_context(question: str, limit: int = 3) -> str:
+    """找相似的历史案例并渲染成带标注的文本。没有 → `""`。
+
+    ★ 案例是**旁路**：查询失败绝不能影响问答本身（同通知层的取舍）。
+      失败时返回空串 = "没有案例"，同时留一条审计 —— 静默吞掉异常会让
+      "案例记忆不工作了"变成一个没人知道的状态。
+    """
+    try:
+        cases = _cases_module()
+        return cases.render_context(cases.find_similar(question, limit=limit))
+    except Exception as e:                       # noqa: BLE001 —— 见 docstring
+        write_audit("memory.cases_lookup_failed",
+                    {"error": f"{type(e).__name__}: {e}"})
+        return ""
+
+
+def _record_case_quietly(incident: dict) -> None:
+    """把一个已结单的事件记成案例。**失败只记审计，绝不影响结单。**
+
+    与 `_link_alert_quietly` / `_notify_incident` 同一纪律：
+    旁路能力出问题时，主流程（结单）必须照常完成。
+
+    但"悄悄失败"和"留一条审计"是两件事 —— 后者能让
+    "案例库怎么一直不涨"这个问题有一个可查的答案。
+    """
+    try:
+        result = _cases_module().record_case(incident)
+    except Exception as e:                       # noqa: BLE001 —— 见 docstring
+        write_audit("memory.case_record_failed", {
+            "incident_id": (incident or {}).get("id"),
+            "error": f"{type(e).__name__}: {e}"})
+        return
+    write_audit("memory.case_recorded", {
+        "incident_id": result.get("recorded"),
+        "evicted": result.get("evicted", 0),
+        "reason": result.get("reason", ""),
+    })
+
+
+# ============================================================
 # 接口 3：问答（非流式）
 # ============================================================
 @app.post("/chat", response_model=ChatResponse)
 async def chat_endpoint(req: ChatRequest):
-    """一次性返回完整回答。实现最简单，但用户要等。"""
+    """一次性返回完整回答。实现最简单，但用户要等。
+
+    【M5b 加了什么】
+    传了 `session_id` 时：把最近几轮历史 + 几条相似**历史案例**作为
+    **带标注的上下文**注入，回答完再追加一轮。
+    不传时不读不写 —— 与加这个字段之前逐字段一致（有回归用例）。
+    """
     # ★ 一次 HTTP 请求 = 一个 trace。
     #   /chat 也会被记录 —— 因为"成本看板"需要覆盖所有调用方，
     #   只看 Agent 的成本会低估真实开销。
     with obs.trace("chat", question=req.question):
+        messages = [{"role": "system",
+                     "content": "你是一个简洁的运维助手，回答不超过 100 字。"}]
+
+        # ★ 校验只做**一次**，后面一律用规范化后的 `sid`：
+        #   放在模型调用**之前**，是因为"非法 id"是个纯参数问题 ——
+        #   先花钱调一次模型、再因为参数不合法返回 400，那笔钱是白花的。
+        from app.memory import sessions as session_memory
+        sid = ""
+        if req.session_id:
+            try:
+                sid = session_memory.require_session_id(req.session_id)
+            except ValueError as e:
+                raise _bad_session_id(e) from e
+
+        # ★ 顺序是"先案例、后对话"，而且各自是被**独立标注**的块。
+        #   合在一个块里会让模型分不清"这段是过去别人的故障"还是
+        #   "这段是我们刚才说过的话" —— 而这正是最需要它分清的边界。
+        if sid:
+            case_block = _case_context(req.question)
+            if case_block:
+                messages.append({"role": "system", "content": case_block})
+            history = _session_context(sid)
+            if history:
+                messages.append({"role": "system", "content": history})
+
+        messages.append({"role": "user", "content": req.question})
+
         try:
-            answer = llm_chat([
-                {"role": "system", "content": "你是一个简洁的运维助手，回答不超过 100 字。"},
-                {"role": "user", "content": req.question},
-            ])
+            answer = llm_chat(messages)
         except ModelError as e:
             # 模型层出问题 → 502 Bad Gateway（上游服务故障）
             # 用户参数不对 → 422（FastAPI 自动处理）
             # 调用方看状态码就知道该找谁。
             raise HTTPException(status_code=502, detail=str(e))
+
+        # ★ 只在**拿到回答之后**才写会话：模型失败时不追加半轮。
+        #   否则历史里会出现"用户问了、助手没答"，下一次注入时模型会
+        #   努力去补一个不存在的回答（而且它不知道自己缺了什么）。
+        #   **会话记的是发生过的事，不是尝试过的事。**
+        if sid:
+            appended = _session_store().append(sid, req.question, answer)
+            write_audit("session.turn", {
+                "session_id": sid,
+                "turns": appended["turns"],
+                "evicted": appended["evicted"],
+            })
 
     return ChatResponse(answer=answer)
 
@@ -3568,7 +3848,26 @@ def ack_incident(incident_id: str, req: IncidentAction):
 
 @app.post("/incidents/{incident_id}/resolve")
 def resolve_incident(incident_id: str, req: IncidentAction):
-    """结单：谁结的 + 为什么结（note 就是复盘的第一手材料）。"""
+    """结单：谁结的 + 为什么结（note 就是复盘的第一手材料）。
+
+    【M5b：结单时顺手把它变成一个"案例"】
+    为什么选**这一处**接（而不是接在 `IncidentStore.resolve()` 里或告警链路里）：
+
+        · 接在 `IncidentStore.resolve()` 里 —— 那会让"事件存储"反向依赖
+          "记忆模块"。事件存储是这个项目的核心审计物，它多一个依赖，
+          每个 import 事件的场景（看板、脚本、MCP）都跟着多一份加载成本，
+          而且存储层一旦调记忆层失败，**结单这件事本身会受影响**。
+          分层上"存储不认识记忆"更干净。
+        · 接在告警链路里 —— 那条链路（`_run_alert_pipeline`）根本不会
+          resolve（它只建事件、挂诊断、推通知），接在那里等于没接。
+        · **接在这里**：这是全项目**唯一**能把事件从 ack 推到 resolved
+          的地方（`grep -rn "resolve(" app/` 里对事件调用它的只有这一处），
+          所以接这一处就覆盖了全部结单路径，一行都不用改存储层。
+
+    ★ `_record_case_quietly` 里**吞掉所有异常**：案例是旁路记忆，
+      它写不进去不该让"结单"失败 —— 与通知层同一条纪律
+      （推不出去只留记录，绝不影响处置结论）。
+    """
     _require_incident(incident_id)
     try:
         rec = _incident_store().resolve(incident_id, by=req.by, note=req.note)
@@ -3576,6 +3875,10 @@ def resolve_incident(incident_id: str, req: IncidentAction):
         raise HTTPException(status_code=400, detail=str(e)) from e
     write_audit("incident.resolve", {"incident_id": incident_id, "by": req.by,
                                      "note": req.note, "status": rec.get("status")})
+    # ★ 在通知**之前**记案例：案例是本地写文件（毫秒级、无网络），
+    #   而通知会走网络。反过来的话，推送慢/超时会让案例晚记很久，
+    #   而"结单之后立刻有新故障，却查不到刚刚这条案例"正是它最该派上用场的时刻。
+    _record_case_quietly(rec)
     # 结单也通知一声：处置完成是值班场景里最该被看见的一条状态变化
     notify_events.send(
         f"[AgentDesk] 事件 {incident_id} 已结单",
@@ -3584,6 +3887,83 @@ def resolve_incident(incident_id: str, req: IncidentAction):
         key=f"incident-resolved:{incident_id}",
         payload={"incident_id": incident_id, "by": req.by})
     return rec
+
+
+# ============================================================
+# 十二·C、会话记忆（M5b）—— 看/清一个会话
+# ============================================================
+# 【为什么必须给会话一个可查询、可清除的出口】
+#   有状态的接口如果不给出口，运维遇到问题时的唯一办法是"去翻那个 jsonl"：
+#
+#     · 看：`GET /sessions/{id}` —— "它到底记住了什么？"（模型答得奇怪时第一件事）
+#     · 清：`DELETE /sessions/{id}` —— "记错了，重来"（否则错误上下文会一直污染下去）
+#     · 列：`GET /sessions` —— "现在有几个会话、占了多少轮、离上限多远"
+#
+#   第三条尤其重要：`SESSION_MAX_SESSIONS` 触发时是**静默淘汰最久未使用的**，
+#   而"我的会话怎么没了"必须有地方能提前看出来（`counts` 里带上下限）。
+#
+# 三个接口都过 `write_audit` —— 本项目的"可追溯"要求：
+# 会话是**谁**的上下文，看和清都是对它的操作，都要留痕。
+@app.get("/sessions")
+def list_sessions(limit: int = Query(50, ge=1, le=500,
+                                     description="返回最近用过的多少个会话")):
+    """会话列表（最近用过的在前，**不含对话正文**）。"""
+    st = _session_store()
+    return {
+        "items": st.list(limit=limit),
+        "counts": st.counts(),
+        "config": st.describe(),
+    }
+
+
+@app.get("/sessions/{session_id}")
+def get_session(session_id: str,
+                limit: int = Query(20, ge=1, le=200,
+                                   description="返回最近多少轮"),
+                include_turns: bool = Query(
+                    False, description="是否带上对话正文（默认不带，只给条数）")):
+    """看一个会话记住了什么。
+
+    ★ 默认**不带正文**（`include_turns=false`）：会话正文是用户与模型的对话，
+      可能含有主机名、路径、凭据片段。默认少给一点，需要时显式要 ——
+      而且这个默认值也让"敲一下接口看看有几个会话"变成一次廉价请求。
+    """
+    st = _session_store()
+    try:
+        turns = st.recent(session_id, limit=limit)
+    except ValueError as e:
+        raise _bad_session_id(e) from e
+    write_audit("session.view", {"session_id": session_id,
+                                 "turns": len(turns),
+                                 "include_turns": include_turns})
+    body = {
+        "session_id": session_id,
+        "turns": len(turns),
+        "max_turns": st.max_turns,
+    }
+    if include_turns:
+        body["items"] = turns
+    return body
+
+
+@app.delete("/sessions/{session_id}")
+def delete_session(session_id: str):
+    """清空一个会话，返回**删掉了几轮**。
+
+    ★ 返回条数而不是 `{"ok": true}`：调用方要能区分
+      "清了一个不存在的会话"（0 轮）和"清了一个有 10 轮的会话"（10 轮）——
+      这两件事运维要做的事完全不同（前者是 id 打错了，后者是目的达成）。
+    """
+    st = _session_store()
+    try:
+        removed = st.clear(session_id)
+    except ValueError as e:
+        raise _bad_session_id(e) from e
+    write_audit("session.clear", {"session_id": session_id, "turns": removed})
+    return {"session_id": session_id, "cleared_turns": removed,
+            "note": ("已清空。会话日志本身是追加的，"
+                     "被清掉的轮次不会再被折叠回来（clear 事件留在日志里）" if removed
+                     else "这个会话不存在或已经没有轮次（cleared_turns=0）")}
 
 
 # ============================================================
