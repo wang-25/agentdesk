@@ -72,6 +72,7 @@ import json
 import os
 import time
 from datetime import datetime
+from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Query, Response
@@ -170,6 +171,22 @@ def write_audit(event: str, detail: dict) -> dict:
     with open(AUDIT_LOG, "a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
     return record
+
+
+def _display_path(path) -> str:
+    """尽量显示成项目内相对路径；不在项目内就退回绝对路径。
+
+    ★ 原先这里是直接 `obs.TRACE_PATH.relative_to(PROJECT_ROOT)`，
+      只要 trace 文件被放到项目根之外（挂载卷、自定义部署路径、
+      测试用的临时目录），就会抛 ValueError 让 `/metrics/summary` 直接 500。
+
+      **一个只读看板不该因为"文件放在哪儿"而挂掉** —— 路径显示是给人看的，
+      取不到相对路径就显示绝对路径，而不是报错。
+    """
+    try:
+        return str(Path(path).relative_to(PROJECT_ROOT))
+    except ValueError:
+        return str(path)
 
 
 # ============================================================
@@ -3074,7 +3091,7 @@ def metrics_summary(limit: int = Query(50, ge=1, le=500,
     report["langfuse"] = langfuse_export.describe()
     report["export_failures"] = obs.export_failures()
     report["store"] = {
-        "path": str(obs.TRACE_PATH.relative_to(PROJECT_ROOT)),
+        "path": _display_path(obs.TRACE_PATH),
         "exists": obs.TRACE_PATH.exists(),
     }
     # ★ 如实交代"这份报告统计的是什么"。
