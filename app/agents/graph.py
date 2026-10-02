@@ -76,6 +76,14 @@ LIMIT_NOTICE = ("已达到工具调用上限。请立即停止调用工具，"
                 "基于你目前已经获得的信息给出结论。"
                 "如果信息不足以确定根因，就明确说明还缺什么。")
 
+# 预算用尽的收口语。与 LIMIT_NOTICE 分开，因为对用户是两件事：
+# "问得太多被截断"和"时间到了被截断"，后者还必须说清"还差什么没查"。
+# ★ 明写"不要猜测没查过的数据"：被截断时模型最容易做的恰恰是把缺口补成幻觉。
+BUDGET_NOTICE = ("时间预算已用尽。请立即停止调用工具，"
+                 "基于你目前已经获得的信息给出结论，"
+                 "并明确说明：哪些已经查到、还有哪些没来得及查。"
+                 "不要猜测没查过的数据。")
+
 
 # ============================================================
 # 一、状态定义
@@ -132,6 +140,14 @@ class AgentState(TypedDict):
     usage: Annotated[dict, _merge_usage]
     # 停止原因：不加 Annotated → 后写的覆盖前面的，正是我们要的
     stop_reason: str
+    # 墙钟预算的截止时刻（time.time() 语义）。None = 不限。
+    #
+    # ★ 它必须在**状态**里，不能塞进 build_graph 的闭包：
+    #   这个图是**编译后缓存、跨请求复用**的（见 build_graph 的缓存），
+    #   把每个请求各自的 deadline 烘进闭包，等于让所有请求共用第一次那个值 ——
+    #   一个"看起来生效、实际用错时间"的 bug，而且极难发现。
+    #   凡"每请求不同"的东西，一律走 state。
+    deadline: float
 
 
 # ============================================================
@@ -364,18 +380,28 @@ def close_dangling_tool_calls(messages: list) -> list:
 
 
 def finalize_node(state: AgentState) -> dict:
-    """节点三：超上限时强制收口。
+    """节点三：超上限 / 预算用尽 时强制收口。
 
     同样是把 tools 参数去掉，让它只能输出文字。
+
+    ★ 两种收口原因要**分开说**：撞步数上限是"问得太多"，
+      预算用尽是"时间到了" —— 对用户是两件事，后者还应该告诉他"还差什么没查"。
+      把两者混成一句话（"已达到上限"）会让人以为"再问一次就能查完"。
     """
+    deadline = state.get("deadline")
+    over_budget = bool(deadline and time.time() >= deadline)
+
     # ★ 先补齐未应答的 tool_calls，否则发出去会被服务端 400 拒绝
     msgs = payload_messages(close_dangling_tool_calls(state["messages"]))
-    msgs.append({"role": "user", "content": LIMIT_NOTICE})
+    if over_budget:
+        msgs.append({"role": "user", "content": BUDGET_NOTICE})
+    else:
+        msgs.append({"role": "user", "content": LIMIT_NOTICE})
     out = chat_step(msgs, tools=None, temperature=0)
     return {
         "messages": [AIMessage(content=out["message"].get("content") or "")],
         "usage": out["usage"] or {},
-        "stop_reason": "max_steps",
+        "stop_reason": "budget" if over_budget else "max_steps",
     }
 
 
@@ -394,6 +420,12 @@ def make_router(max_steps: int):
         last = state["messages"][-1]
         if not (getattr(last, "tool_calls", None) or []):
             return END                       # 模型自己决定回答了 → 结束
+        # ★ 预算检查放在步数检查**之前**：两者都要收口，但原因不同，
+        #   而 finalize 要靠"现在是不是已经过点"来区分该说哪句话。
+        #   先判预算，就不会出现"明明超时了却报成撞步数上限"。
+        deadline = state.get("deadline")
+        if deadline and time.time() >= deadline:
+            return "finalize"                # 时间到了 → 强制收口（不硬砍，见 finalize）
         if len(state.get("steps") or []) >= max_steps:
             return "finalize"                # 撞上限 → 强制收口
         return "tools"                       # 否则继续查
@@ -459,11 +491,15 @@ def mermaid(max_steps: int = DEFAULT_MAX_STEPS) -> str:
 @tracer.traced("langgraph")            # ★ 一次运行 = 一个 trace
 def run(question: str, max_steps: int = DEFAULT_MAX_STEPS,
         verbose: bool = False, tool_names: list = None,
-        system_prompt: str = None) -> dict:
+        system_prompt: str = None, deadline: float = None) -> dict:
     """跑一次。返回结构和手写版完全一致（这样对比脚本才不用写两套）。
 
     tool_names   限制可用工具（多 Agent 拆分时用）
     system_prompt 换一套系统提示（子 Agent 用另一种身份时用）
+    deadline     墙钟预算的截止时刻（`time.time()` 语义）。None = 不限（默认）。
+
+    ★ deadline 只进 state（**不进 build_graph 的缓存键**）：图是跨请求复用的，
+      而预算是每请求各不相同的。把它烘进编译结果就是"所有请求共用第一次那个时间"。
     """
     started = time.time()
     graph = build_graph(max_steps, tool_names)
@@ -475,6 +511,7 @@ def run(question: str, max_steps: int = DEFAULT_MAX_STEPS,
         "rounds": 0,
         "usage": new_usage(),
         "stop_reason": "answered",
+        "deadline": deadline,
     }
 
     # recursion_limit 兜底：万一图里出现意料外的环，框架层会直接中断，

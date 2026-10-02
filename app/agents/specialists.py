@@ -382,7 +382,8 @@ DIAGNOSE_SYSTEM_REASON = """你是一个 Linux 运维问题解答者。**你没�
 def diagnose(question: str, intent: dict, knowledge: dict = None,
              max_steps: int = 6, tool_names: list = None,
              previous_problems: list = None,
-             previous_evidence: list = None) -> dict:
+             previous_evidence: list = None,
+             deadline: float = None) -> dict:
     """工具执行 Agent：跑一个受限的 ReAct 子图。
 
     【"受限"具体体现在哪】
@@ -452,6 +453,7 @@ def diagnose(question: str, intent: dict, knowledge: dict = None,
             + "\n请把有限的工具调用额度用在**还没查过**的数据上。")
 
     result = _react_run("\n\n".join(parts), max_steps=max_steps,
+                            deadline=deadline,
                         tool_names=tool_names,
                         # ★ 提示词必须跟着「有没有工具」一起换 —— 见
                         #   DIAGNOSE_SYSTEM_REASON 上面的说明（踩过的坑）。

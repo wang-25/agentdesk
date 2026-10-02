@@ -69,7 +69,9 @@ Supervisor 依然是个**节点**而不是一条普通的条件边 —— 因为
 "结论站不住就得重查"是诊断这件事的固有需求。
 """
 
+import logging
 import operator
+import os
 import time
 from typing import Annotated, TypedDict
 
@@ -301,6 +303,7 @@ def make_diagnose_node(tool_names: list, node_name: str):
             tool_names=tool_names,
             previous_problems=(verdict.get("problems") or []) if is_retry else None,
             previous_evidence=previous.get("evidence") if is_retry else None,
+            deadline=state.get("deadline"),
         )
         elapsed = int((time.time() - t0) * 1000)
 
@@ -466,9 +469,37 @@ def mermaid(max_retries: int = 1) -> str:
 # ============================================================
 # 五、入口
 # ============================================================
+log = logging.getLogger("agentdesk.supervisor")
+
+
+def _deadline_from_env() -> float:
+    """从 `AGENT_BUDGET_SECONDS` 算墙钟预算的截止时刻。返回 None = 不限。
+
+    ★ 默认就是"不限"（不设这个变量 / 设 0）：**行为与改动前完全一致**。
+      给整条 Agent 链路默认加上时限是行为变更，不该悄悄发生 ——
+      谁需要保护，谁显式打开。
+
+    ★ 非法值（`"60s"`、负数）按"不限"处理并打一条警告，而不是让服务起不来：
+      配置写错的表现应该是"没限制住"，不应该是"服务挂了"。
+      没限制住这件事本身也看得见 —— `stop_reason` 不会是 budget，
+      而 `/metrics` 上有 `agentdesk_agent_budget_exceeded_total`。
+    """
+    raw = (os.getenv("AGENT_BUDGET_SECONDS") or "").strip()
+    if not raw:
+        return None
+    try:
+        seconds = float(raw)
+    except ValueError:
+        log.warning("AGENT_BUDGET_SECONDS=%r 不是数字，按不限处理", raw)
+        return None
+    if seconds <= 0:
+        return None
+    return time.time() + seconds
+
+
 @tracer.traced("supervisor")           # ★ 一次运行 = 一个 trace
 def run(question: str, max_retries: int = 1, verbose: bool = False,
-        config: dict = None) -> dict:
+        config: dict = None, deadline: float = None) -> dict:
     """跑一次多 Agent 流程。
 
     返回结构兼容单 Agent 版（engine/question/answer/metrics/），
@@ -476,6 +507,11 @@ def run(question: str, max_retries: int = 1, verbose: bool = False,
     """
     config = config or {}
     started = time.time()
+    # 预算只在这里算一次，然后随 state 传下去 ——
+    # 让各节点自己读环境变量的话，一次运行里可能跨过"配置被改"的边界，
+    # 出现"前面节点不限、后面节点限 60 秒"这种没人查得出来的不一致。
+    if deadline is None:
+        deadline = _deadline_from_env()
     graph = build_graph(max_retries, config)
 
     init = {
@@ -486,6 +522,8 @@ def run(question: str, max_retries: int = 1, verbose: bool = False,
         "visited": [], "retries": 0, "node_log": [],
         "usage": new_usage(), "answer": "",
         "stop_reason": "answered",
+        # ★ 墙钟预算的截止时刻；None = 不限（默认，行为与改动前一致）
+        "deadline": deadline,
     }
 
     # recursion_limit 兜底：图上可能出现意料外的环，

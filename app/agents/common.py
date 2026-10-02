@@ -245,7 +245,19 @@ def tool_payload(only: list = None) -> list:
 
 def summarize(engine: str, question: str, answer: str, steps: list,
               stop_reason: str, usage: dict, elapsed_ms: int) -> dict:
-    """统一两个引擎的返回结构 —— 不然对比脚本得写两套解析。"""
+    """统一两个引擎的返回结构 —— 不然对比脚本得写两套解析。
+
+    ★ 顺便在这里把"被预算截断"记进指标：这是两个引擎**唯一的公共收口点**，
+      放这里只需要一处，react / graph / supervisor 三条路都覆盖到。
+      放各自的 run() 里迟早会漏一边（"两处各写一遍必然漂移"是本项目反复踩的坑）。
+    """
+    if stop_reason == "budget":
+        try:
+            from app.observability import metrics
+            metrics.counter("agentdesk_agent_budget_exceeded_total",
+                            {"engine": engine})
+        except Exception:                          # pragma: no cover
+            pass                                   # 指标是旁路，绝不能影响结果
     return {
         "engine": engine,
         "question": question,

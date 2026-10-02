@@ -59,15 +59,27 @@ from app.llm import ModelError, chat_step
 
 @tracer.traced("handwritten")          # ★ 一次运行 = 一个 trace
 def run(question: str, max_steps: int = DEFAULT_MAX_STEPS,
-        verbose: bool = False) -> dict:
+        verbose: bool = False, deadline: float = None) -> dict:
     """跑一次完整的 ReAct 循环。
 
     参数：
         question   用户的问题，比如「web-01 上的网站访问很慢，帮我查下」
         max_steps  最多允许几轮"思考 + 调工具"。这既是成本上限，也是防死循环的护栏。
         verbose    打印每一步的轨迹（调试时用）
+        deadline   **墙钟预算的截止时刻**（`time.time()` 语义）。None = 不限（默认）。
 
-    返回：见 common.summarize()
+    【deadline 为什么是"软"的】
+    到点之后**不是**把整个运行砍掉，而是：
+      ① 不再开**新的**工具调用（那才是花时间和花钱的地方）
+      ② 用**已经拿到的信息**收口出结论
+      ③ 在答案与 stop_reason 里如实写"因时间预算被截断、还差什么没查"
+
+    硬超时会把已经花掉的钱和已经查到的事实一起丢掉，用户拿到的是一个没有结论的错误 ——
+    **"以现有信息作答 + 如实说明被截断"严格优于"什么都没有"。**
+    这与审批记录必须回写真实结果、健康检查必须点名坏哪一项是同一条原则：
+    **宁可报告残缺，也不要假装完整。**
+
+    检查点放在每轮**开头**（模型决策之前）：一旦到点，连"再问一次模型"都不做。
     """
     started = time.time()
     messages = [{"role": "system", "content": SYSTEM_PROMPT},
@@ -80,6 +92,13 @@ def run(question: str, max_steps: int = DEFAULT_MAX_STEPS,
     answer = ""
 
     for step_no in range(1, max_steps + 1):
+        # ---------- 0. 墙钟预算闸门（在开新工具调用之前）----------
+        if deadline is not None and time.time() >= deadline:
+            stop_reason = "budget"
+            if verbose:
+                print(f"  时间预算已用尽（第 {step_no} 轮之前），不再开新的工具调用")
+            break
+
         if verbose:
             print(f"\n──── 第 {step_no} 轮：模型决策 ────")
 
@@ -123,16 +142,29 @@ def run(question: str, max_steps: int = DEFAULT_MAX_STEPS,
         # 注意 for...else 的语义：只有循环没被 break 才走到这里。
         stop_reason = "max_steps"
 
-    # ---------- 4. 步数耗尽时强制收口 ----------
+    # ---------- 4. 收口：步数耗尽 / 预算用尽 ----------
     # 关键点：**把 tools 参数去掉**，让它没有工具可调，只能输出文字。
     # 如果还带着 tools，模型很可能又调一次工具，然后再次撞上限 —— 死循环。
-    if stop_reason == "max_steps":
-        messages.append({
-            "role": "user",
-            "content": ("已达到工具调用上限。请立即停止调用工具，"
-                        "基于你目前已经获得的信息给出结论。"
-                        "如果信息不足以确定根因，就明确说明还缺什么。"),
-        })
+    #
+    # ★ 预算用尽时**也必须走这一步**：它仍然值一次模型调用 ——
+    #   花这一次调用把已经查到的东西整理成结论，比丢掉全部信息划算得多。
+    if stop_reason in ("max_steps", "budget"):
+        if stop_reason == "budget":
+            used = time.time() - started
+            messages.append({
+                "role": "user",
+                "content": (f"时间预算已用尽（已用 {used:.0f} 秒）。请立即停止调用工具，"
+                            "基于你目前已经获得的信息给出结论，"
+                            "并在结论里**明确说明**：哪些已经查到、还有哪些没来得及查。"
+                            "不要猜测没查过的数据。"),
+            })
+        else:
+            messages.append({
+                "role": "user",
+                "content": ("已达到工具调用上限。请立即停止调用工具，"
+                            "基于你目前已经获得的信息给出结论。"
+                            "如果信息不足以确定根因，就明确说明还缺什么。"),
+            })
         try:
             out = chat_step(messages, tools=None, temperature=0)
             add_usage(usage, out["usage"])
