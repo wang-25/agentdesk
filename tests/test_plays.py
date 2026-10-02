@@ -405,7 +405,7 @@ def test_plays_module_never_executes_anything():
 
     forbidden = ("subprocess", "executor", "app.tools", "os.system", "popen")
     for mod in (model_mod, store_mod):
-        src = Path(mod.__file__).read_text(encoding="utf-8")
+        src = Path(mod.__file__ or "").read_text(encoding="utf-8")
         for bad in forbidden:
             assert bad not in src, \
                 f"{mod.__name__} 里出现了 {bad!r} —— 剧本不该能执行任何东西"
@@ -431,6 +431,70 @@ def test_rollback_verdict_is_recorded_when_a_rollback_command_exists():
               rollback={"run": "truncate -s 0 /var/log/nginx/error.log"}),
     ]))
     assert play.step("a1").rollback_verdict == "needs_approval"
+
+
+# ============================================================
+# 九、接口接线（GET /plays、GET /plays/{name}）
+# ============================================================
+@pytest.fixture
+def client():
+    from fastapi.testclient import TestClient
+
+    import app.main as main_mod
+
+    with TestClient(main_mod.app) as c:
+        yield c
+
+
+def test_list_plays_endpoint(client):
+    body = client.get("/plays").json()
+    assert body["total"] >= 3
+    names = {i["name"] for i in body["items"]}
+    assert {"disk-full", "service-down", "high-load"} <= names
+    # ★ 不可回滚的步骤数要单独列出来 —— 这是决策时最该看到的一个数
+    for item in body["items"]:
+        assert "irreversible" in item and item["irreversible"] <= item["actions"]
+
+
+def test_read_play_endpoint_exposes_policy_verdicts(client):
+    body = client.get("/plays/service-down").json()
+    steps = {s["id"]: s for s in body["steps"]}
+    assert steps["check_active"]["auto_run"] is True
+    assert steps["check_active"]["policy"]["verdict"] == "allow"
+    assert steps["approve_restart"]["auto_run"] is False
+    assert steps["approve_restart"]["policy"]["verdict"] == "needs_approval"
+    assert steps["approve_restart"]["rollback"]["none"] is True
+    assert "plan" in body and "只读" in body["plan"]
+
+
+def test_read_play_endpoint_404s_with_the_available_names(client):
+    r = client.get("/plays/does-not-exist")
+    assert r.status_code == 404
+    assert "没有名为" in r.json()["detail"]
+
+
+def test_plays_endpoints_say_they_do_not_execute(client):
+    """★ 接口自己要把边界说清楚：这是描述，不是执行入口。"""
+    for path in ("/plays", "/plays/disk-full"):
+        assert "不自动执行" in client.get(path).json()["note"]
+
+
+def test_broken_play_refuses_to_start_the_service(tmp_path, monkeypatch):
+    """★ 坏剧本让服务**拒绝启动**（而不是带着它跑起来）。
+
+    这是设计选择：剧本的错误形态是静默的 —— 一条越界命令要等执行到第 4 步
+    才发现，一个拼错的分叉名会让某条分支永远走不到。
+    "启动时报错、说清第几步为什么"是当时就能修好的故障。
+    """
+    (tmp_path / "bad.json").write_text(json.dumps(
+        {"name": "bad", "title": "坏的",
+         "steps": [{"id": "s1", "kind": "probe", "run": "rm -rf /"}]},
+        ensure_ascii=False), encoding="utf-8")
+    monkeypatch.setenv("PLAYS_DIR", str(tmp_path))
+    st.reset()
+    with pytest.raises(m.PlayError):
+        st.load_all()
+    st.reset()
 
 
 def test_current_whitelist_has_no_true_inverse_for_its_actions():

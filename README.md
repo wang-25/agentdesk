@@ -264,7 +264,7 @@ Agent 只知道 `web-01` 这样的**逻辑名**，它不知道、也不该知道
 
 ## 接口
 
-37 个路由（32 个进 OpenAPI 文档），按功能分组（本地起服务后打开 <http://127.0.0.1:8000/docs> 即可）：
+45 个路由（37 个进 OpenAPI 文档），按功能分组（本地起服务后打开 <http://127.0.0.1:8000/docs> 即可）：
 <details>
 
 <summary><b>Agent 与检索</b></summary>
@@ -411,7 +411,7 @@ CI 见 [`.github/workflows/ci.yml`](.github/workflows/ci.yml)：
 agentdesk/
 ├── app/
 │   ├── llm.py              模型调用统一入口
-│   ├── main.py             FastAPI 服务入口（37 个路由）
+│   ├── main.py             FastAPI 服务入口（45 个路由）
 │   ├── security.py         公网安全层：白名单鉴权 + 三层限流 + 每日额度
 │   ├── rag/                检索层：切分 / 向量化 / 存储 / 混合检索管线
 │   ├── tools/              工具层：7 个运维工具（6 只读 + 1 执行）+ 参数白名单
@@ -477,6 +477,8 @@ agentdesk/
 | [沙箱与人工确认](docs/sandbox-hitl.md)              | 三层职责、五个坑、常见追问           |
 | [事件与出站通知](docs/incident-notify.md)             | 告警怎么聚合成事件、通知怎么配、没收到怎么排障 |
 | [监控与运维](docs/monitoring.md)                   | 怎么监控 Agent 自己：`/metrics`、`/healthz`、日志格式与 JSONL 轮转 |
+| [会话与案例记忆](docs/memory.md)                   | 跨轮次记忆怎么存、案例怎么回流、以及"案例只作参考"的三道防线 |
+| [处置剧本](docs/plays.md)                        | 带判定与分叉的处置流程；为什么它不做自动执行与自动回滚 |
 | [可观测](docs/observability.md)                 | Trace 与成本归因的设计          |
 | [评测](docs/evaluation.md)                     | 六维度设计、判定器自证、误报排查        |
 | [MCP Server](docs/mcp-server.md)             | 协议原理、四个真实坑、客户端配置        |
