@@ -123,6 +123,55 @@ SSH_TARGETS = _parse_ssh_targets(os.getenv("OPS_SSH_TARGETS"))
 
 
 # ============================================================
+# 零·二、审计出口
+# ============================================================
+# ★ 和 `app/notify/events.py` 里的 `set_audit_hook` / `_audit` 是**同一款**：
+#   主链路（main.py）在 import 时把 `write_audit` 注进来，本模块不 import main
+#   （那会循环导入），也不自己决定审计格式。
+#
+# 【为什么工具层必须自己有一条审计出口】
+#   在这之前，`run_command` 的三种关键动作**只进了 trace，没进 audit.jsonl**：
+#
+#       策略 DENY     —— trace 里有 `approval.denied` span，审计里没有
+#       开审批单      —— trace 里有 `approval.created` span
+#       只读执行      —— trace 里有 `sandbox.run` span
+#
+#   trace 和审计回答的是**两个不同的问题**，谁也不能替代谁：
+#       trace 回答"这次运行里 Agent 想干什么、走到哪一步" —— 面向调试
+#       审计  回答"谁在什么时候试图做什么、结果如何"    —— 面向追责
+#   而"被拒绝的尝试"恰恰是最需要留痕的那一类：
+#   拒绝**没有产生任何可观测的副作用**，如果不写审计，
+#   一个模型在半夜反复试探 `rm -rf /` 这件事就完全查不到。
+#   （trace 是采样/滚动清理的观测数据，不能拿来当追责依据。）
+_audit_hook = None
+
+
+def set_audit_hook(fn) -> None:
+    """注入写审计的函数（签名 `(event: str, detail: dict) -> dict`）。"""
+    global _audit_hook
+    _audit_hook = fn
+
+
+def _audit(event: str, detail: dict) -> None:
+    """写一条审计。**永不抛异常** —— 见下面两条纪律。"""
+    if _audit_hook is None:
+        return
+    try:
+        _audit_hook(event, detail)
+    except Exception:                      # pragma: no cover
+        # 两条纪律，缺一不可：
+        #   ① **审计写不进去，不能影响工具调用结果。**
+        #      审计是旁路。磁盘满、权限不对、盘被卸载都可能让写审计失败，
+        #      而那一刻工具**已经把命令执行完了** —— 让一次执行成功
+        #      因为"记账失败"而变成异常返回，是把旁路的故障升级成主链路的故障。
+        #      （这和 notify 的纪律是同一条：推不出去只能变成一条失败记录。）
+        #   ② **没有 hook 时静默跳过。**
+        #      单独跑工具、自检脚本、单元测试时并不存在 main.write_audit，
+        #      此时行为必须与"加审计之前"逐字段一致。
+        pass
+
+
+# ============================================================
 # 一、参数校验（防命令注入的第一道墙）
 # ============================================================
 # 只允许小写字母、数字、点、下划线、连字符。长度限死。
@@ -538,13 +587,99 @@ _LOG_FILE_CANDIDATES = [
 ]
 
 
+def _exec_through_policy(command: str, host: str) -> tuple:
+    """**统一准入**：日志类命令必须先过 `policy.decide()` 再执行。
+
+    ★ 这个助手是为了修 C11 —— 两条绕过统一准入的旁路。
+
+      `_run_logs` 原先自己拼 `journalctl` 和 `docker logs` 并直接调 `_exec`，
+      而本项目里其它每一条真机命令（`run_command`）走的都是
+      `policy.decide()` → `executor.run()`。于是这两条命令：
+
+        · 不在白名单的可枚举范围内（`docker logs` 干脆没有规则）
+        · 不产生任何审计（谁在什么机器上读了什么容器的日志，查不到）
+        · 改策略时也无法确认它到底受不受约束
+
+      **"大部分走准入、少数几条自己拼命令"是最糟的形态** ——
+      它让"白名单就是全部能力"这句话变成假的，而且不报错。
+      收口之后，能执行的命令集合与 COMMANDS 表严格一致。
+
+    【两个后端，两种落地方式 —— 这是刻意的，不是偷懒】
+
+      · 沙箱后端可用（docker / subprocess）：走 `executor.run(decision)`。
+        这是真正的"唯一执行出口"，Decision 进去、结构化结果出来。
+      · `OPS_BACKEND=ssh`：**仍然走远端运输层 `_exec`**，但用的是
+        **policy 规范化后的 argv**（不是自己拼的字符串）。
+        为什么不丢给 executor：executor 的执行通道只在本机落地。
+        拿一台 web-01 的 `journalctl` 去本机执行，会静默返回
+        "本机没有这个服务"的空日志 —— 也就是**用一个看起来正常的错答案
+        替换掉一个正确的答案**，这比报错危险得多（同一条原则见
+        run_command 里的"ssh 后端下执行通道整体关闭"）。
+      · 沙箱是 mock：准入照旧，但运输层退回真实只读执行 —— 理由见下面。
+
+    返回 `(exit_code, 输出文本)`；输出已合并 stderr，与原先的 `2>&1` 等价。
+    """
+    decision = policy.decide(command)
+
+    # ---- 策略拒绝：绝不执行 ----
+    if decision.decision == policy.DENY:
+        raise ToolError(
+            f"日志读取被策略拒绝：{command}。原因：{decision.reason}")
+
+    # ---- ssh：远端执行，argv 来自 policy ----
+    # ★ `--no-pager` **只给 journalctl**。
+    #   它必须加：不加的话 journalctl 会去调分页器，而分页器在非交互 SSH 会话里
+    #   读不到终端，表现是"命令卡住"（原因见下面 _run_logs 的注释）。
+    #   但它**不能给 docker logs** —— docker 不认识这个参数，会直接报错，
+    #   而 `tail_log` 把"非零退出"当成"这条来源没有日志"，
+    #   于是表现成"容器明明在跑却取不到日志"（实测踩到过：web-01 上的 wp-app）。
+    #   两个命令共用一个分支，所以这里必须按**命中的规则**分开加参数，
+    #   而不是在分支入口统一拼上去。
+    if BACKEND == "ssh":
+        argv = list(decision.argv)
+        if decision.rule_key == "journalctl":
+            argv = argv + ["--no-pager"]
+        rc, out = _exec(argv, host=host)
+        return rc, out
+
+    from app.sandbox import executor
+
+    # ---- 其余后端：唯一执行出口 ----
+    #
+    # ★ 唯一的例外：`SANDBOX_BACKEND=mock`。
+    #   mock 的 executor **不真的执行任何东西**，它返回
+    #   `（mock 后端：仿真执行 journalctl ...）` 这样的占位文本；
+    #   而 `tail_log` 靠 stdout 的形状判断"这条来源到底有没有日志"——
+    #   于是它会把那段占位文案当成 web-01 的日志念给用户听。
+    #   在收口之前这条路由根本没碰过 executor，所以这是本次改动唯一
+    #   可能引入的功能回退，必须显式挡住。
+    #
+    #   挡的方式是"退回真实只读执行"，不是"跳过 policy"：
+    #   decision 已经拿到了（准入照旧生效、argv 照旧来自 policy），
+    #   只是换一个运输层。mock 的语义是"不要在真机上执行**改动**"，
+    #   而这两条是**只读**且刚过准入的命令 —— 用真实进程去读日志，
+    #   既没有副作用，也保住了 tail_log 的能力。
+    if executor.active_backend() == "mock":
+        return _exec(decision.argv, host=host)
+
+    result = executor.run(decision)
+    if not result.ok:
+        return result.exit_code or 1, result.error or ""
+    # 合并两股流。原先靠 `2>&1` 在 shell 里合，现在由这里合 ——
+    # 这一层合并**不会丢东西**，而且不再需要 `sh -c`
+    # （`sh` 恰恰是 BLOCKED_BINARIES 里明令禁止的可执行文件）。
+    parts = [p for p in (result.stdout, result.stderr) if p and p.strip()]
+    return result.exit_code or 0, "\n".join(parts).strip()
+
+
 def _run_logs(host: str, service: str, lines: int) -> dict:
     """取某个服务的日志。返回 {"source": 来源描述, "lines": [...]}。"""
     # ---- 1. systemd ----
-    # `--no-pager` 必须加：不加会去调分页器，
-    # 在非交互的 SSH 会话里分页器读不到终端，表现是"命令卡住"。
-    rc, out = _exec(
-        ["journalctl", "-u", service, "-n", str(lines), "--no-pager"], host=host)
+    # ★ 经统一准入执行（C11）：journalctl 已有白名单规则，这条路原来绕过了它。
+    #   注意 argv 与白名单规则严格对应 —— 规范化由 policy 完成，
+    #   这里不再自己拼 `-n {lines}`。
+    rc, out = _exec_through_policy(
+        f"journalctl -u {service} -n {int(lines)}", host=host)
     if rc == 0 and out and "No entries" not in out:
         # journalctl 会在开头插一行 `-- Logs begin at ...`，
         # 那是它自己的表头，不是日志内容，去掉。
@@ -562,15 +697,17 @@ def _run_logs(host: str, service: str, lines: int) -> dict:
             return {"source": path, "lines": out.splitlines()}
 
     # ---- 3. 容器日志 ----
-    # ★ 这里用 `sh -c` 是有原因的：`docker logs` 把容器的 stderr
-    #   写到自己的 stderr 上，而我们的运输层**刻意不合并 stderr**
-    #   （原因见 _exec 的注释）。所以必须显式 `2>&1` 把两股流合起来，
-    #   否则容器里真正有用的报错会全部丢掉。
-    #   参数用的是 _exec 里的同一套引号规则，没有引入新的注入面。
-    rc, out = _exec(
-        ["sh", "-c",
-         "docker logs --tail {} {} 2>&1".format(int(lines), _remote_quote(service))],
-        host=host)
+    # ★ 原先这里是 `sh -c "docker logs --tail N <容器名> 2>&1"` 直接执行，
+    #   完全绕过 policy —— 现在改为经 `policy.decide("docker logs ...")`
+    #   命中新增的 `docker.logs` 规则后执行。
+    #   容器名用的是**同一个** `_check_service` 校验（与服务名同款正则），
+    #   所以进不了 policy 的字符串在这一步就已经被拒了。
+    #
+    #   stderr 仍然要合进来：容器里真正有用的报错走的是 docker 自己的 stderr，
+    #   而我们的运输层**刻意不合并 stderr**（原因见 _exec 的注释）。
+    #   合并动作挪到 _exec_through_policy 里做，能力不变。
+    rc, out = _exec_through_policy(
+        f"docker logs --tail {int(lines)} {service}", host=host)
     if rc == 0 and out:
         return {"source": f"docker logs {service}", "lines": out.splitlines()}
 
@@ -906,6 +1043,16 @@ def run_command(command: str, purpose: str = "") -> dict:
                          risk=decision.risk) as sp:
             sp.set("decision", "deny")
             sp.set_error(decision.reason)
+        # ★ 审计（C8）：**被拒绝的尝试必须留痕。**
+        #   拒绝没有产生任何副作用 —— 也就是说，如果不写这一行，
+        #   "模型在凌晨三点反复试探 rm -rf /" 这件事**在任何地方都查不到**。
+        #   运维里最需要事后回答的问题恰恰是这一类："谁试图做什么，为什么被拒"。
+        _audit("policy.denied", {
+            "command": base["command"],
+            "rule": decision.rule_key,
+            "risk": decision.risk,
+            "reason": decision.reason,
+        })
         base["error"] = decision.reason
         base["hint"] = "这条命令不允许执行。请改用白名单里的等价做法，或优先使用专用工具。"
         return base
@@ -928,6 +1075,18 @@ def run_command(command: str, purpose: str = "") -> dict:
             sp.set("approval_id", rec["id"])
             sp.set("expires_at", rec["expires_at"])
             sp.set("executed", False)     # 这一条最容易被误读，显式记下来
+        # ★ 审计（C8）：**开票本身要留痕。**
+        #   approvals.jsonl 只记状态迁移（created/approved/…），回答不了
+        #   "这次是哪个工具、命中哪条规则提交的"。expires_at 也要写进去：
+        #   审批单会因为超时静默失效，事后追查必须能看出"当时还有效吗"。
+        _audit("approval.requested", {
+            "approval_id": rec["id"],
+            "command": decision.command,
+            "rule": decision.rule_key,
+            "risk": decision.risk,
+            "isolation": decision.isolation,
+            "expires_at": rec["expires_at"],
+        })
         base["approval_id"] = rec["id"]
         base["expires_at"] = rec["expires_at"]
         base["hint"] = ("已提交人工审批，尚未执行。请在结果里告诉用户："
@@ -952,6 +1111,18 @@ def run_command(command: str, purpose: str = "") -> dict:
         sp.set("exit_code", result.exit_code)
         if not result.ok:
             sp.set_error(result.error or f"退出码 {result.exit_code}")
+    # ★ 审计（C8）：**只读执行也要留痕。**
+    #   "只读"不等于"不需要记账"：它是真实碰到过生产机的动作，而事后最常
+    #   被问的就是"这条结论是哪次命令、什么时候、以什么退出码得出来的"。
+    #   少了这一行，诊断结论就没有可核对的依据。
+    #   （trace 里有 sandbox.run span，但 trace 是会被滚动清理的观测数据，
+    #     不能当追责依据 —— 这也正是两者都要写的原因。）
+    _audit("run_command.readonly", {
+        "command": decision.command,
+        "rule": decision.rule_key,
+        "exit_code": result.exit_code,
+        "ok": bool(result.ok),
+    })
     base["executed"] = True
     base["result"] = result.to_dict()
     if not result.ok:
