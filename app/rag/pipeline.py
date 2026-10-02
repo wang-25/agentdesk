@@ -232,7 +232,10 @@ def evaluate(top_k: int = 3, modes=("vector", "bm25", "hybrid"),
 
     for mode in modes:
         hits = 0
-        by_type = defaultdict(lambda: {"total": 0, "hits": 0})
+        hit1 = hit3 = 0
+        rr_sum = 0.0
+        by_type = defaultdict(lambda: {"total": 0, "hits": 0, "hit1": 0,
+                                       "hit3": 0, "rr": 0.0})
         misses = []
         latencies = []
 
@@ -247,23 +250,48 @@ def evaluate(top_k: int = 3, modes=("vector", "bm25", "hybrid"),
             results = store.search(item["question"], top_k=top_k, mode=mode)
             latencies.append((time.perf_counter() - _t0) * 1000)
 
-            got_docs = {r["doc_id"] for r in results}
+            # ★ rank-aware 指标：**只看"有没有进前 k"是不够的**。
+            #
+            #   这段是本项目评测方法上的一个真实教训：语料只有 10 篇文档、
+            #   而口径是 top-8 —— "正确答案有没有落进前 8"几乎必然命中
+            #   （随机取 8 块也有约五成以上概率命中），于是分数长期停在 95~100%，
+            #   看起来很好，却区分不出"排第 1"和"排第 8"。
+            #   实测里就有这种查询：正确答案在本地后端排第 5~8 名（算命中），
+            #   在语义后端排第 1 名 —— 两者体验完全不同，旧指标却一样是满分。
+            #
+            #   所以同时记录 Top-1 / Top-3 命中与 MRR（平均倒数排名）。
+            #   它们对"排序质量"敏感，而且在小语料上依然有意义。
+            got = [r["doc_id"] for r in results]
+            expect = set(item["expect_docs"])
+            rank = next((i for i, d in enumerate(got, 1) if d in expect), None)
 
-            if got_docs & set(item["expect_docs"]):
+            if rank:
                 hits += 1
                 by_type[qtype]["hits"] += 1
+                by_type[qtype]["rr"] += 1.0 / rank
+                if rank == 1:
+                    hit1 += 1
+                    by_type[qtype]["hit1"] += 1
+                if rank <= 3:
+                    hit3 += 1
+                    by_type[qtype]["hit3"] += 1
+                rr_sum += 1.0 / rank
             else:
                 misses.append({
                     "question": item["question"],
                     "type": qtype,
                     "expected": item["expect_docs"],
-                    "got": sorted(got_docs),
+                    "got": sorted(set(got)),
                 })
 
+        total = len(qa_set)
         ordered = sorted(latencies)
         report["modes"][mode] = {
             "hits": hits,
-            "recall": round(hits / len(qa_set), 4) if qa_set else 0.0,
+            "recall": round(hits / total, 4) if total else 0.0,
+            "accuracy_at_1": round(hit1 / total, 4) if total else 0.0,
+            "accuracy_at_3": round(hit3 / total, 4) if total else 0.0,
+            "mrr": round(rr_sum / total, 4) if total else 0.0,
             "latency_ms": {
                 "p50": round(_percentile(ordered, 50), 3),
                 "p95": round(_percentile(ordered, 95), 3),
@@ -272,7 +300,12 @@ def evaluate(top_k: int = 3, modes=("vector", "bm25", "hybrid"),
             },
             "by_type": {
                 t: {"total": v["total"], "hits": v["hits"],
-                    "recall": round(v["hits"] / v["total"], 4) if v["total"] else 0.0}
+                    "recall": round(v["hits"] / v["total"], 4) if v["total"] else 0.0,
+                    "accuracy_at_1": (round(v["hit1"] / v["total"], 4)
+                                      if v["total"] else 0.0),
+                    "accuracy_at_3": (round(v["hit3"] / v["total"], 4)
+                                      if v["total"] else 0.0),
+                    "mrr": round(v["rr"] / v["total"], 4) if v["total"] else 0.0}
                 for t, v in by_type.items()
             },
             "misses": misses,

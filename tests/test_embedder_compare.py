@@ -164,6 +164,46 @@ def test_force_local_env_removes_the_key(monkeypatch):
     assert ce.has_key() is False
 
 
+def test_with_local_env_restores_the_key(monkeypatch):
+    """★ 摘 Key 必须**成对**：跑完要还回去。
+
+    这个 bug 真的发生过（第一次配好 Key 跑 --build 时）：`_force_local_env()`
+    永久摘掉了进程内的 Key，于是同一个进程里随后评测**语义**后端时反而报
+    「指定了 dashscope 后端，但 .env 里没有 DASHSCOPE_API_KEY」——
+    刚配好的 Key 被自己的脚本摘掉了。
+    这类 bug 的形态是"配置明明是对的，工具说不对"，最难查。
+    """
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "sk-test")
+    seen = {}
+
+    def probe():
+        seen["inside"] = ce.has_key()
+        return "done"
+
+    assert ce._with_local_env(probe) == "done"
+    assert seen["inside"] is False, "回调执行期间 Key 应当被摘掉"
+    assert ce.has_key() is True, "跑完必须把 Key 还回去，否则后面的语义评测会误判为没配"
+
+
+def test_with_local_env_restores_nothing_when_there_was_no_key(monkeypatch):
+    """本来就没有 Key 时，跑完也不该凭空造一个出来。"""
+    monkeypatch.delenv("DASHSCOPE_API_KEY", raising=False)
+    ce._with_local_env(lambda: None)
+    assert ce.has_key() is False
+
+
+def test_with_local_env_restores_even_if_the_callback_raises(monkeypatch):
+    """回调抛异常也要还 Key —— 否则一次失败会让后续步骤全都误判为没配。"""
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "sk-test")
+
+    def boom():
+        raise RuntimeError("评测炸了")
+
+    with pytest.raises(RuntimeError):
+        ce._with_local_env(boom)
+    assert ce.has_key() is True
+
+
 def test_store_for_forces_the_requested_backend(tmp_path):
     directory = _tiny_store(tmp_path)
     store = ce._store_for(directory, "local")

@@ -146,3 +146,51 @@ def test_percentile_helper_returns_a_real_sample():
 @pytest.mark.parametrize("name", ["hybrid.latency_p50_ms", "vector.latency_p95_ms"])
 def test_latency_metric_names_are_recognised(name):
     assert eb._is_latency(name)
+
+
+# ============================================================
+# 六、★ rank-aware 指标（M5d 的度量修正）
+# ============================================================
+def test_evaluate_reports_rank_aware_metrics():
+    """★ 只报 recall@k 是不够的：10 篇文档 + top-8 时它几乎必然命中。
+
+    实测：混合检索的 recall@8 是 100%，而 **acc@1 只有 73.9%** ——
+    也就是说 26% 的查询里正确答案根本不在第一位，而旧指标完全看不出来。
+    这就是 M5d 差点得出错误结论的原因（先用旧指标比，说"真语义没赢"）。
+    """
+    from app.rag import pipeline
+    from app.rag.embedder import Embedder
+    from app.rag.loader import Chunk
+    from app.rag.store import VectorStore
+
+    chunks = [
+        Chunk(doc_id="disk-full", title="磁盘", text="磁盘写满 空间 清理 df",
+              source="a.md", index=0, chunk_id="c0"),
+        Chunk(doc_id="nginx-502", title="502", text="nginx 502 网关",
+              source="b.md", index=0, chunk_id="c1"),
+    ]
+    store = VectorStore(Embedder(backend="local")).build(chunks)
+    report = pipeline.evaluate(top_k=8, modes=("bm25",), verbose=False, store=store)
+    mode = report["modes"]["bm25"]
+    for key in ("accuracy_at_1", "accuracy_at_3", "mrr"):
+        assert key in mode, f"缺少 rank-aware 指标 {key}"
+    assert 0.0 <= mode["accuracy_at_1"] <= mode["accuracy_at_3"] <= mode["recall"]
+    assert 0.0 <= mode["mrr"] <= 1.0
+    for qtype, data in mode["by_type"].items():
+        assert "accuracy_at_1" in data and "mrr" in data, f"{qtype} 缺 rank-aware 指标"
+
+
+def test_rank_aware_metrics_are_gated():
+    """新指标也要进门禁 —— 否则"排序变差了"照样没人发现。"""
+    cur = _current({"hybrid.accuracy_at_1": 0.50})
+    base = _baseline({"hybrid.accuracy_at_1": 0.80})
+    assert eb.compare(cur, base) == 1, "acc@1 掉了 30 个百分点必须红"
+
+
+def test_mrr_is_treated_as_a_percentage_style_metric():
+    """MRR 是 0~1 的比例，走的是召回那套百分点容差（不是延迟那套）。"""
+    assert eb.compare(_current({"hybrid.mrr": 0.70}),
+                      _baseline({"hybrid.mrr": 0.80})) == 1
+    assert eb.compare(_current({"hybrid.mrr": 0.78}),
+                      _baseline({"hybrid.mrr": 0.80})) == 0
+    assert not eb._is_latency("hybrid.mrr")

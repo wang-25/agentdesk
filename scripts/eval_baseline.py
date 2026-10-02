@@ -73,8 +73,19 @@ def collect(top_k: int) -> dict:
     metrics = {}
     for mode, data in report["modes"].items():
         metrics[f"{mode}.recall"] = data["recall"]
+        # ★ rank-aware 指标也进门禁。只门禁 recall@k 是不够的：
+        #   语料 10 篇文档、口径 top-8，"有没有进前 8"几乎必然命中，
+        #   于是分数长期停在 95~100%，区分不出"排第 1"和"排第 8"。
+        #   实测里 hybrid 的 recall@8 是 100%，而 acc@1 只有 73.9% ——
+        #   两个数字说的是两件事，后者才贴近使用体验。
+        for key in ("accuracy_at_1", "accuracy_at_3", "mrr"):
+            if key in data:
+                metrics[f"{mode}.{key}"] = data[key]
         for qtype, t in (data.get("by_type") or {}).items():
             metrics[f"{mode}.recall.{qtype}"] = t["recall"]
+            for key in ("accuracy_at_1", "accuracy_at_3", "mrr"):
+                if key in t:
+                    metrics[f"{mode}.{key}.{qtype}"] = t[key]
         # ★ 延迟也进门禁。没有它，"某次改动让每次检索慢了一倍"只能靠人感觉 ——
         #   而检索是**每次问答都要走**的路径，慢一倍会被放大到所有回答上。
         lat = data.get("latency_ms") or {}

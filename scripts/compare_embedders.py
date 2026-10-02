@@ -93,9 +93,25 @@ def _force_local_env() -> None:
     """把当前进程的 Key 拿掉，让 `Embedder()` 选中 local 后端。
 
     只在评测本地索引时用：否则 auto 模式会选 dashscope，载入本地索引时报维度不匹配。
+
+    ★ 必须**成对使用**（见 `_with_local_env`）：早先这里只摘不还，
+      结果同一个进程里随后评测语义后端时反而报"指定了 dashscope 但没有 Key" ——
+      刚配好的 Key 被自己摘掉了。这类 bug 的形态是"配置明明是对的，工具说不对"。
     """
     import os
     os.environ.pop("DASHSCOPE_API_KEY", None)
+
+
+def _with_local_env(fn):
+    """临时摘掉 Key 跑 `fn`，跑完**恢复**（不留副作用）。"""
+    import os
+
+    saved = os.environ.pop("DASHSCOPE_API_KEY", None)
+    try:
+        return fn()
+    finally:
+        if saved is not None:
+            os.environ["DASHSCOPE_API_KEY"] = saved
 
 
 def evaluate_backend(name: str, directory: Path, backend: str) -> dict:
@@ -113,9 +129,12 @@ def _row(label: str, mode_data: dict) -> str:
     by_type = mode_data.get("by_type") or {}
     lat = mode_data.get("latency_ms") or {}
     return (f"  {label:22s} {mode_data['recall'] * 100:6.1f}%"
+            f"{mode_data.get('accuracy_at_1', 0) * 100:8.1f}%"
+            f"{mode_data.get('accuracy_at_3', 0) * 100:8.1f}%"
+            f"{mode_data.get('mrr', 0):7.3f}"
             f"{by_type.get('lexical', {}).get('recall', 0) * 100:9.1f}%"
             f"{by_type.get('semantic', {}).get('recall', 0) * 100:9.1f}%"
-            f"{by_type.get('trap', {}).get('recall', 0) * 100:9.1f}%"
+            f"{by_type.get('semantic', {}).get('accuracy_at_1', 0) * 100:10.1f}%"
             f"{lat.get('p50', 0):9.2f}ms")
 
 
@@ -127,9 +146,9 @@ def print_report(reports: list) -> None:
         emb = report.get("embedder") or {}
         print(f"\n  【{report['backend_name']}】{emb.get('model')}"
               f"（{emb.get('dim')} 维）　索引：{report['index_dir']}")
-        print(f"  {'检索模式':22s} {'总体':>7s}{'词面型':>10s}{'语义型':>10s}"
-              f"{'陷阱型':>10s}{'P50':>11s}")
-        print("  " + "-" * 74)
+        print(f"  {'检索模式':22s} {'recall@8':>8s}{'acc@1':>8s}{'acc@3':>8s}"
+              f"{'MRR':>7s}{'词面型':>10s}{'语义型':>10s}{'语义acc@1':>11s}{'P50':>12s}")
+        print("  " + "-" * 96)
         for mode, label in (("vector", "纯向量"), ("bm25", "纯关键词(BM25)"),
                             ("hybrid", "混合(向量+BM25+RRF)")):
             print(_row(label, report["modes"][mode]))
@@ -142,19 +161,23 @@ def print_report(reports: list) -> None:
     print("  结论")
     print("  " + "=" * 74)
     base, sem = reports[0], reports[1]
+    print("  ★ 主要看 acc@1 与『语义列的 acc@1』：recall@8 在这份 10 篇文档的语料上"
+          "几乎没有分辨力（随机猜也有五成以上）。")
     for mode, label in (("vector", "纯向量"), ("hybrid", "混合检索")):
-        before = base["modes"][mode]["recall"] * 100
-        after = sem["modes"][mode]["recall"] * 100
-        delta = after - before
-        arrow = "↑" if delta > 0 else ("↓" if delta < 0 else "＝")
-        print(f"  {label:10s} 本地哈希 {before:5.1f}% → 真语义 {after:5.1f}%"
-              f"　{arrow} {delta:+.1f}pp")
-    b_sem = base["modes"]["hybrid"].get("by_type", {}).get("semantic", {})
-    s_sem = sem["modes"]["hybrid"].get("by_type", {}).get("semantic", {})
-    if b_sem and s_sem:
-        print(f"  语义型问题  本地哈希"
-              f" {b_sem['recall'] * 100:5.1f}% → 真语义 {s_sem['recall'] * 100:5.1f}%"
-              f"　（这一列才是真语义该赢的地方）")
+        before_r = base["modes"][mode]["recall"] * 100
+        after_r = sem["modes"][mode]["recall"] * 100
+        before_1 = base["modes"][mode].get("accuracy_at_1", 0) * 100
+        after_1 = sem["modes"][mode].get("accuracy_at_1", 0) * 100
+        before_s = (base["modes"][mode].get("by_type", {})
+                    .get("semantic", {}).get("accuracy_at_1", 0) * 100)
+        after_s = (sem["modes"][mode].get("by_type", {})
+                   .get("semantic", {}).get("accuracy_at_1", 0) * 100)
+        print(f"  {label:10s} recall@8 {before_r:5.1f}% → {after_r:5.1f}%"
+              f"（{after_r - before_r:+.1f}pp）")
+        print(f"  {'':10s} acc@1    {before_1:5.1f}% → {after_1:5.1f}%"
+              f"（{after_1 - before_1:+.1f}pp）")
+        print(f"  {'':10s} 语义列 acc@1 {before_s:5.1f}% → {after_s:5.1f}%"
+              f"（{after_s - before_s:+.1f}pp）　← 真语义该赢的就是这一行")
     print("\n  ★ 判断口径：真语义应当**明显赢在语义型那一列**。"
           "如果两列都没赢，那就如实写『没赢、不引入』——"
           "换后端是要花钱的，数据说了不算才引入。")
@@ -201,10 +224,10 @@ def main() -> int:
             print("\n  已构建语义索引（未评测）。")
             return 0
 
-    # ---- 本地后端（强制指定，避免 auto 模式看到 Key 就选 dashscope）----
+    # ---- 本地后端（临时摘 Key → 跑 → 恢复；不能留副作用）----
     if LOCAL_INDEX.is_dir():
-        _force_local_env()          # 进程内把 Key 摘掉，auto 模式才会选 local
-        reports.append(evaluate_backend("本地哈希", LOCAL_INDEX, "local"))
+        reports.append(_with_local_env(
+            lambda: evaluate_backend("本地哈希", LOCAL_INDEX, "local")))
     else:
         print(f"  ⚠️ 本地索引不存在：{LOCAL_INDEX}")
 
