@@ -291,7 +291,7 @@ Test-Path tests, .github, pyproject.toml                   # False
 |---|---|---|---|---|
 | N1 | **审批单时间戳只写盘、不回填给调用方** | `approvals.py` 的 `_append` 里 `event = {"ts": _now(), **event}` 改的是**局部变量**，紧跟其后的 `self._apply(ev)` 拿到的 `ev` 里没有 `ts` | 同一进程内新建/批准/执行的审批单，`created_at` / `approved_at` / `consumed_at` 全是 `null`；`list()` 按 `created_at or ""` 排序时同批单子顺序随机。**一重启就"自愈"**（盘上有 ts），所以极难复现 | 已修（`_append` 改 `setdefault` 原地回填），并加用例：`test_in_memory_record_matches_what_was_persisted` 把"内存与盘必须一致"钉住 |
 | N2 | **`/metrics/summary` 会因 trace 文件放在项目外而 500** | `main.py` 里 `obs.TRACE_PATH.relative_to(PROJECT_ROOT)` 直接抛 `ValueError` | 挂载卷 / 自定义部署路径下，**只读成本看板直接挂掉**；也让"把落盘位置改到临时目录"的测试根本没法写 | 已修（新增 `_display_path`：取不到相对路径就退回绝对路径） |
-| N3 | **lint 债：`app/` + `scripts/` 共 66 处** | `ruff check app scripts --statistics`：B904 18 / F541 16 / F841 10 / F401 8 / B905 6 / E731 3 / B007 3 / E741 1 / B025 1 | 一次性大扫除会把真实改动淹没在 diff 里 | M1 **只对 `tests/` 强制 lint**；M2 新增的三个子包（`app/alerting`、`app/incident`、`app/notify`）**零新增债**，且顺手清掉了 `main.py` 里 7 处历史 E402（app+scripts 从 69 降到 66）。这条债在此显式登记，按里程碑逐目录纳入（**登记了才不许它悄悄消失**） |
+| N3 | **lint 债：`app/` + `scripts/` 共 59 处（在降）** | `ruff check app scripts --statistics`：B904 18 / F541 16 / F841 10 / F401 8 / B905 6 / E731 3 / B007 3 / E741 1 / B025 1 | 一次性大扫除会把真实改动淹没在 diff 里 | M1 **只对 `tests/` 强制 lint**；M2 新增的三个子包（`app/alerting`、`app/incident`、`app/notify`）**零新增债**，且顺手清掉了 `main.py` 里 7 处历史 E402（app+scripts 从 69 降到 66）。这条债在此显式登记，按里程碑逐目录纳入（**登记了才不许它悄悄消失**） |
 | N4 | **`requirements-dev.txt` 首版带中文注释 → `pip` 直接崩** | `UnicodeDecodeError: 'gbk' codec can't decode byte 0x89` | pip 按系统区域编码（中文 Windows 上是 GBK）读 requirements 文件 | 已改为纯 ASCII。**这正是 `requirements.txt:7-9` 早就写明的规矩** —— 说明"写在注释里的约定"挡不住人，得靠 CI 兜 |
 
 **方法学教训（也记下来）**：测试"公开清单里的路径都是真实路由"时，一开始用 OpenAPI 的
@@ -404,3 +404,55 @@ Test-Path tests, .github, pyproject.toml                   # False
 
 **仍然没做的**（按路线图留给后续里程碑）：处置剧本与自动回滚（I-9）、复盘知识回流（I-6）、
 工单系统集成、真机钉钉/飞书机器人实测（需要用户提供机器人地址）、`ALERT_ASYNC=1` 的后台任务实现（开关已留，同步路径已验收）。
+
+---
+
+## 8. M3 实施记录：安全执行面收口
+
+### 8.1 缺口关闭表
+
+| 原编号 | 缺陷 | 处理 |
+|---|---|---|
+| **C1** | PATH 劫持面（执行时靠继承的 `PATH` 找程序） | **已修**：`policy.resolve_binary()` 只在**代码写死**的候选目录里找；执行面用绝对路径，解析不到就拒绝（**不回退裸名**）；子进程环境改用 `policy.command_env()`，不再继承 `LD_PRELOAD` / `LD_LIBRARY_PATH` / `PYTHONPATH` |
+| **C2** | 审批单可跨进程双执行 | **已修**：跨平台文件锁（`O_CREAT\|O_EXCL` 自旋 + **陈旧锁接管**）+ 每次迁移前**重新折叠**（判定与写入必须在同一把锁里）+ `flush/fsync`。用**两个真进程**抢同一张单验证：恰好一个成功 |
+| **C3** | 批准后无执行时限 | **已修**（用户选定方案 A）：过期即拒绝并折叠成 `expired`（含理由）。校验放在 **store 状态机里**而不只是接口预检 —— 接口可被绕过，状态机绕不过 |
+| **C4** | 审批记录 `result_ok` 错报成功 | **已修**：执行后追加 `executed` 事件回写真实结果（`exit_code`/`elapsed_ms`/`error`），并给占位值打 `result_provisional` 标记。**保持"先消费再执行"的顺序不变** —— 那是防重放的正确取舍 |
+| **C5** | 读路径与注释矛盾 | **已修**（方案 A）：`.log`（含轮转）放行；显式放行 `syslog`/`messages`/`kern.log`/`auth.log`/`daemon.log`；`secure`/`wtmp`/`btmp`/`lastlog`/`audit/*`/`private/*` 进拒绝名单。**名单对读和写都生效** |
+| **C6** | 超时只杀 CLI/直接子进程，容器与孙进程继续跑 | **已修**：主机通道 `start_new_session=True` + `killpg`（Windows `taskkill /T /F`）；容器通道 `--cidfile` + `docker rm -f` 后再杀 CLI；`finally` 清理 cidfile。真进程验证：直接子进程与**孙进程**的 pid 都已消失 |
+| **C7** | 文档说"写操作在一次性容器里执行"，实际只有文件类操作如此 | **已修**（说法与可见性）：`GET /sandbox` 新增 `isolation_scope`（哪些走容器 / 哪些走主机 / 哪些走主机且需审批）；审批通知在主机通道时显式标注"**没有容器隔离**"；README / overview / sandbox-hitl 三处表述改准 |
+| **C8** | 审计链缺口（DENY / 开票 / 只读 run_command / 被拦下的执行尝试） | **已修**：工具层与通知层各一个审计出口（`set_audit_hook`，由 `main.py` 注入 `write_audit`），补 `policy.denied` / `approval.requested` / `run_command.readonly` / `approval.execute_blocked` |
+| **C11** | `journalctl` / `docker logs` 绕过统一准入 | **已修**：两条都先过 `policy.decide`；ssh 后端用**规范化后的 argv** 走远端运输层（executor 只在本机落地），其余后端走 `executor.run`。新增 `docker.logs` 规则（严格），这是把**已经存在**的旁路显式纳入白名单，不是放宽 |
+| **M2-1** | `MAX_RECORDS = 500` 是骗人的常量（注释声称限制内存，全仓零引用） | **已修**：如实留 `None`，并在模块里写清"内存 = O(全部历史)，靠轮转解决；真正需要上限的是告警去重表" |
+
+### 8.2 验收证据（全部可复跑）
+
+| 门禁 | 结果 |
+|---|---|
+| `pytest` | **594 条全绿**（M2 为 509；M3 新增 85 条） |
+| `ruff check tests` / `mypy` | All checks passed / **16 source files 无问题** |
+| **lint 债反而降了** | `app` + `scripts`：66 → **59**（新增代码零新增债，且顺手补了多处 `raise ... from e`） |
+| `security_check` / `mcp_check` / `eval_baseline` | 21+2 项全通 / 9/9 / 无退化 |
+| **跨进程双执行** | 两个**真进程**抢同一张单 → 恰好一个 `CONSUMED`、另一个 `REJECTED`；日志里只有一条 `consumed` |
+| **假 PATH 不生效** | 把假 `df` 放进 `PATH`：Linux 执行真程序、Windows 因解析不到而拒绝，**两种情况假程序都没被执行** |
+| **超时回收** | 真起"子进程 + 孙进程 sleep 600"，超时 1s → 1.35s 返回，两个 pid 都已消失 |
+| **门禁自证（两处）** | 执行器：把 11 种旧行为注回去 → **11/11 全被现有用例判红**；策略：把历史上的 `"/"` + `d.rstrip("/") + "/"` 一起注回去 → 精准变红 |
+| **真机回归** | `tail_log --service wp-app` 在真实 ssh 后端取到 15 行容器日志（见 8.3） |
+
+### 8.3 M3 期间新发现的问题（含一次真机回退）
+
+| # | 问题 | 怎么发现的 | 处理 |
+|---|---|---|---|
+| M3-1 | **审计日志目录可写**：`truncate -s 0 /var/log/audit/audit.log` 只被判成 `needs_approval` —— 也就是"有人点同意就能截断审计日志" | 收紧读路径后**顺手测了一下写路径**（读严了、写没动，这个不对称本身就是线索） | 拒绝名单改为对读写都生效。截断审计记录是典型的抹掉痕迹动作，不该因为有人批准就变得可以 |
+| M3-2 | **`consume` 本身不校验有效期**：只有接口预检校验，绕过接口直接调 store 就能执行过期单 | 写"两个入口不能一个严一个松"的用例时 | 把有效期校验降进状态机（**约束放在绕不过去的那一层**），接口预检只负责给出更友好的错误 |
+| M3-3 | **真机回退：`--no-pager` 被加在共用的 ssh 分支上** —— journalctl 需要它，docker 不认识它；`docker logs … --no-pager` 直接报错，而 `tail_log` 把非零退出当成"没有日志" | 收口完成后**拿真机跑了一次** `show_live.py --only tail_log --service wp-app`：真机上明明有 `wp-app` 容器（wordpress）却报"取不到日志"；用 `git stash` 对照提交版确认是回退 | 按命中的规则分开拼参数，并补断言 argv 的回归用例。**打桩测试全绿不等于功能没坏** —— 这条只有真机能抓 |
+| M3-4 | `taskkill` 在纯最小环境（无 `SystemRoot`）下**根本起不来** | 执行器做真进程回收验证时 | 新增 `_helper_env()`：只给"我们自己的回收类辅助命令"补系统必需变量；被沙箱执行的命令仍然是纯三键环境（有用例守着） |
+| M3-5 | 回收里原先用无超时 `wait()`，taskkill 一失败就**永久挂死**（比原缺陷更糟） | 同上 | 改带超时 + 兜底 kill + 等不到就**如实**写"未能在限时内确认退出"，不假装回收成功 |
+
+### 8.4 仍未做（留给后续）
+
+- **远程（ssh 后端）下的写操作执行通道**：保持 fail-closed。审计结论不变 ——
+  "诊断在远端、执行在本地"的错配比"不能执行"危险得多。
+- **容器通道的 `DOCKER_BIN` 未固定化**：容器内命令由镜像自己的 `PATH` 解析（塞宿主机绝对路径是错的），
+  真正走宿主机 `PATH` 的只有 `docker` 这个可执行文件本身。固定它会让 Windows 开发机直接失去容器通道，
+  属于独立决策，已在 `_run_docker` 的 docstring 里写明。
+- **处置剧本与回滚**（I-9）、**RBAC / 多租户**（审计判定为"先补单令牌的自批自执漏洞，而不是先堆权限系统"）。
