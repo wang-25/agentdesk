@@ -114,6 +114,7 @@ def approval_created(rec: dict):
     "有一张单子在等你"是这套系统里最值得打扰人的一件事。
     """
     rid = rec.get("id", "?")
+    host_channel = (rec.get("isolation") or "") == "host"
     text = (
         f"**需要人工确认**\n\n"
         f"- 审批单：`{rid}`\n"
@@ -123,9 +124,16 @@ def approval_created(rec: dict):
         f"- 过期：{rec.get('expires_at', '?')}\n\n"
         f"批准后才会执行：`POST /approvals/{rid}/approve`"
     )
+    if host_channel:
+        # ★ 审批人有权知道"这条命令没有容器隔离"（M3 C7）。
+        #   把隔离承诺说得比实际大，是审批界面最不该犯的错 ——
+        #   人是在这个信息上做风险判断的。
+        text += ("\n\n> ⚠️ 这条命令走**主机通道**：它在目标主机上直接执行，"
+                 "**没有容器隔离**（重启类命令必须如此）。约束来自审批 + 指纹 + 审计。")
     return send(f"[AgentDesk] 待审批：{rec.get('command', '')[:60]}", text,
                 key=f"approval:{rid}",
                 payload={"approval_id": rid, "risk": rec.get("risk"),
+                         "isolation": rec.get("isolation"),
                          "host": rec.get("host")})
 
 

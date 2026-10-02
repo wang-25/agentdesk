@@ -177,10 +177,23 @@ def write_audit(event: str, detail: dict) -> dict:
     return record
 
 
-# 通知层的审计出口：app/notify 刻意不 import 本模块（否则循环导入），
-# 它通过这个钩子拿到写审计的函数。**通知的痕迹必须落在审计里** ——
-# 否则"以为在通知、其实一直失败"会静默很久。
+# 通知层与工具层的审计出口：
+# 这两个包刻意都不 import 本模块（否则循环导入），它们通过钩子拿到写审计的函数。
+# **痕迹必须落在审计里** —— 否则"以为在通知/以为拒绝了、其实什么都没记"会静默很久。
 notify_events.set_audit_hook(write_audit)
+
+
+def _install_ops_audit_hook() -> None:
+    """把审计出口接给工具层（`policy.denied` / `approval.requested` / 只读 run_command）。
+
+    放在函数里而不是模块顶层：工具层的 import 链比通知层重，
+    顶层立刻 import 会让"只想读一下 openapi"这种场景也去加载整套工具。
+    """
+    from app.tools import ops
+    ops.set_audit_hook(write_audit)
+
+
+_install_ops_audit_hook()
 
 
 def _display_path(path) -> str:
@@ -2945,6 +2958,29 @@ def sandbox_status():
     info = executor.preflight()
     info["policy"] = policy.describe()
     info["commands"] = policy.catalog()
+
+    # ★ 把"哪些写操作**没有**容器隔离"显式说出来（M3 C7）。
+    #
+    #   原先文档讲"写操作在一次性容器里执行"，而实际能进容器的只有文件类操作
+    #   （`truncate` 这种）；`systemctl restart` / `docker restart` 必须在
+    #   **主机上**执行才能生效 —— 它们靠审批 + 审计约束，**没有容器隔离**。
+    #
+    #   这不是能"修"的缺陷（要重启宿主机上的服务就不可能只给它一个容器），
+    #   能修的是"别让文档说出与实际不符的话"。
+    #   所以在这里把事实摊开：谁有隔离、谁没有、没有的靠什么约束。
+    host_approval = sorted(k for k, r in policy.COMMANDS.items()
+                           if r.isolation == policy.CHANNEL_HOST
+                           and r.decision == policy.NEEDS_APPROVAL)
+    info["isolation_scope"] = {
+        "container_channel": policy.describe()["container_channel"],
+        "host_channel": policy.describe()["host_channel"],
+        "host_channel_needs_approval": host_approval,
+        "note": ("写操作里只有 container 通道那批在一次性容器里执行"
+                 "（非 root、根只读、无网络、内存封顶）；"
+                 "systemctl restart / docker restart 这类必须在主机上执行才有意义，"
+                 "**它们没有容器隔离**，靠「审批 + 指纹 + 审计」约束。"
+                 "别把「写操作都进容器」当成事实 —— 那是这份文档以前的说法。"),
+    }
     return info
 
 
@@ -3082,21 +3118,30 @@ def _execute_approved(approval_id: str, req: ApprovalAction):
 
     st = approvals.store()
 
-    # 先取出来 —— 需要它的 command 去重新决策（拿到执行用的 argv）
+    # ★ 执行前的**全部**校验收敛到 store 的 `check_executable` 一处：
+    #   存在 / 已批准 / 未过期 / 指纹一致。
+    #   原先这些判断有一部分散在这个接口里，接口少判一条就是一个洞；
+    #   现在"能不能执行"只有一个定义，接口层只负责把它翻译成 HTTP 状态码。
+    #
+    #   M3 新增的那一条是**有效期**：一条三天前批准的命令，
+    #   今天的环境已经和当时不是同一回事了 —— 过期就拒绝（用户选定方案）。
     try:
-        rec = st.get(approval_id)
+        rec = st.check_executable(approval_id)
     except approvals.ApprovalError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-
-    if rec["status"] != "approved":
-        raise HTTPException(
-            status_code=409,
-            detail=f"审批单状态是 {rec['status']}，必须先批准才能执行"
-                   f"（当前状态：{rec['status']}）")
-    if rec.get("consumed_at"):
-        raise HTTPException(
-            status_code=409,
-            detail=f"这张审批单已在 {rec['consumed_at']} 执行过，不能重复执行")
+        msg = str(e)
+        status = 404 if "没有这张审批单" in msg else 409
+        if status == 409:
+            # 被拦下的尝试也必须留痕（C8 的审计缺口之一）。
+            # 命令文本取不到就留空 —— 审计写不进去不能反过来影响这次拒绝。
+            try:
+                cmd = st.get(approval_id).get("command")
+            except approvals.ApprovalError:
+                cmd = ""
+            write_audit("approval.execute_blocked", {
+                "approval_id": approval_id, "by": req.by,
+                "command": cmd, "reason": msg,
+            })
+        raise HTTPException(status_code=status, detail=msg) from e
 
     # ★ 重新走一遍策略，拿到带 argv 的 Decision。
     #
@@ -3117,14 +3162,6 @@ def _execute_approved(approval_id: str, req: ApprovalAction):
             status_code=409,
             detail=f"这条命令现在已被策略禁止，拒绝执行：{decision.reason}")
 
-    # 指纹比对（防 TOCTOU）。用当前决策算出的指纹去对审批时记下的。
-    if decision.fingerprint != rec.get("fingerprint"):
-        raise HTTPException(
-            status_code=409,
-            detail=f"命令指纹不匹配，拒绝执行。"
-                   f"审批时：{rec.get('fingerprint')}，"
-                   f"现在：{decision.fingerprint}")
-
     try:
         # 先消费（占位），再执行 —— 顺序很重要。
         #
@@ -3132,10 +3169,13 @@ def _execute_approved(approval_id: str, req: ApprovalAction):
         # 这张单子会停留在 approved，下次还能再执行一次。
         # **宁可出现"已标记消费但执行失败"，也不要出现"执行成功还能再执行"。**
         # 前者是少做了一次（人能看到错误），后者是重复做（可能造成事故）。
+        #
+        # （consume 内部也会再校验一次指纹与状态，且整个判定到写入
+        #   都在跨进程锁里 —— 见 approvals._mutating。）
         st.consume(approval_id, expected_fingerprint=decision.fingerprint,
                    by=req.by, ok=True)
     except approvals.ApprovalError as e:
-        raise HTTPException(status_code=409, detail=str(e))
+        raise HTTPException(status_code=409, detail=str(e)) from e
 
     try:
         # ★ 观测：真正动手执行的那一下，单独一个 sandbox span。
@@ -3160,7 +3200,11 @@ def _execute_approved(approval_id: str, req: ApprovalAction):
             "approval_id": approval_id, "by": req.by,
             "command": rec["command"], "error": str(e),
         })
-        raise HTTPException(status_code=503, detail=str(e))
+        # ★ 失败也要回写真实结果（C4）：否则审批记录里那条乐观的
+        #   result_ok=True 会一直挂着，而执行其实没发生。
+        _record_execution_result(st, approval_id, ok=False, error=str(e),
+                                 by=req.by)
+        raise HTTPException(status_code=503, detail=str(e)) from e
 
     payload = result.to_dict()
     write_audit("approval.executed", {
@@ -3170,12 +3214,35 @@ def _execute_approved(approval_id: str, req: ApprovalAction):
         "exit_code": result.exit_code, "elapsed_ms": result.elapsed_ms,
     })
 
+    # ★ 把**真实结果**回写进审批单（C4 的修法）。
+    #   `consume` 写下的 ok 是执行前的乐观占位（防重放要求它必须先写），
+    #   所以真值在这里补上；折叠时以最后一条为准。
+    #   **"审批记录写着成功、实际失败"这种不一致，比不记还危险** ——
+    #   复盘的人会据此认为那次变更生效了。
+    _record_execution_result(st, approval_id, ok=result.ok,
+                             exit_code=result.exit_code,
+                             elapsed_ms=result.elapsed_ms,
+                             error=result.error or "", by=req.by)
+
     # ★ 执行结果推给值班的人。失败的**更要推**：
     #   approvals.jsonl 里那条 result_ok 是在执行**之前**写下的（见 audit 报告 C4），
     #   所以"审批记录说成功、实际失败"这件事只能靠通知把真值送到人手上。
     notify_events.approval_executed(rec, payload)
 
     return {"approval": st.get(approval_id), "result": payload}
+
+
+def _record_execution_result(st, approval_id: str, *, ok: bool,
+                             exit_code=None, elapsed_ms=None,
+                             error: str = "", by: str = "system") -> None:
+    """回写执行结果。**失败不影响返回**（结果已经在审计与响应里了）。"""
+    try:
+        st.record_result(approval_id, ok=ok, exit_code=exit_code,
+                         elapsed_ms=elapsed_ms, error=error, by=by)
+    except Exception as e:                     # pragma: no cover
+        write_audit("approval.result_writeback_failed", {
+            "approval_id": approval_id,
+            "error": f"{type(e).__name__}: {e}"})
 
 
 # ============================================================

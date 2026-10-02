@@ -307,3 +307,82 @@ def test_incident_resolve_requires_a_person(client):
 def test_incident_status_filter_is_honoured(client):
     body = client.get("/incidents", params={"status": "open"}).json()
     assert body.get("items") == []
+
+
+# ============================================================
+# 七、M3：沙箱与审批的加固在接口层也成立
+# ============================================================
+def test_sandbox_tells_which_commands_have_no_container_isolation(client):
+    """★ "写操作都进容器"是**以前的错说法**，接口现在把它摊开。
+
+    `systemctl restart` / `docker restart` 必须在主机上执行才有意义 ——
+    它们没有容器隔离，只靠审批 + 指纹 + 审计约束。
+    审批人是在"有没有隔离"这个信息上做风险判断的，这个字段不能缺。
+    """
+    body = client.get("/sandbox").json()
+    scope = body.get("isolation_scope")
+    assert scope, "/sandbox 必须给出 isolation_scope"
+    assert scope["container_channel"], "总得有命令走容器"
+    assert scope["host_channel_needs_approval"], "重启类命令应当被标出来"
+    assert "systemctl.restart" in scope["host_channel_needs_approval"]
+    assert "没有容器隔离" in scope["note"]
+
+
+@pytest.fixture
+def client_with_store(tmp_path, monkeypatch):
+    """和 `client` 一样，但把隔离好的审批单存储也交出来。
+
+    需要一个"已经批准但已过期"的单子来做接口级验证，
+    而单子只能由 store 直接造（没有"创建审批单"的接口 ——
+    那是 Agent 调 run_command 才会发生的事）。
+    """
+    from app.sandbox import approvals as ap
+
+    store = ap.ApprovalStore(path=tmp_path / "approvals.jsonl")
+    monkeypatch.setattr(ap, "_STORE", store)
+    monkeypatch.setattr(tracer, "TRACE_PATH", tmp_path / "traces.jsonl")
+    monkeypatch.setattr(security, "AUTH_ENABLED", False)
+    with TestClient(main.app) as c:
+        yield c, store
+
+
+def _approved_but_expired(store):
+    """把一张已批准单子的有效期改到过去，复现"三天前批准、今天才点执行"。
+
+    ★ 不需要换 store 实例：`check_executable` 会在跨进程锁里
+      `_reload_if_changed` —— 这正是 C2 那一半修复在起作用
+      （判定必须基于最新事实，而不是进程启动时折出来的那份）。
+    """
+    import json as _json
+    rec = store.create(command="truncate -s 0 /var/log/nginx/error.log",
+                       fingerprint="fp-abc123", rule="truncate",
+                       risk="reversible", isolation="container",
+                       reason="清理写满的日志")
+    store.approve(rec["id"], by="sre-zhang")
+    events = [_json.loads(ln) for ln in
+              store.path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    for ev in events:
+        if ev["event"] == "created" and ev["id"] == rec["id"]:
+            ev["expires_at"] = "2020-01-01T00:00:00"
+    store.path.write_text(
+        "\n".join(_json.dumps(e, ensure_ascii=False) for e in events) + "\n",
+        encoding="utf-8")
+    return rec["id"]
+
+
+def test_execute_refuses_an_expired_ticket_with_409(client_with_store):
+    """过期的审批单**不能执行**（用户选定方案 A），而且是 409 而不是 500。"""
+    client, store = client_with_store
+    from app.sandbox import approvals as ap
+
+    rid = _approved_but_expired(store)
+    r = client.post(f"/approvals/{rid}/execute", json={"by": "sre-zhang"})
+    assert r.status_code == 409, r.text
+    assert "有效期" in r.text or "过期" in r.text
+    assert ap.store().get(rid)["status"] == "expired", \
+        "被拒之后单据要如实变成 expired，而不是停在 approved"
+
+
+def test_execute_unknown_ticket_is_404(client):
+    r = client.post("/approvals/ap-nope/execute", json={"by": "sre-zhang"})
+    assert r.status_code == 404
