@@ -1,0 +1,458 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AgentDesk · UI 视觉样稿（方案 08）</title>
+<style>
+/* ============================================================
+   AgentDesk 设计系统 · 视觉样稿
+   —— 这份文件就是 app/web/static/app.css 的参考实现：
+      token 在最上面，组件依次排开。改一处，全局一致。
+   ============================================================ */
+:root{
+  --bg:#f7f8fa; --surface:#fff; --surface-2:#fbfcfd;
+  --border:#e4e7ec; --border-strong:#d0d5dd;
+  --text:#101828; --text-2:#475467; --text-3:#667085;
+  --accent:#2563eb; --accent-weak:#eff4ff;
+  --ok:#16a34a; --ok-weak:#ecfdf3;
+  --warn:#d97706; --warn-weak:#fffaeb;
+  --err:#dc2626; --err-weak:#fef3f2;
+  --s1:4px; --s2:8px; --s3:12px; --s4:16px; --s6:24px; --s8:32px;
+  --fs-xs:12px; --fs-sm:13px; --fs-md:14px; --fs-lg:16px;
+  --fs-xl:20px; --fs-2xl:24px; --fs-3xl:30px;
+  --r-ctl:6px; --r-card:10px; --r-pill:999px;
+  --shadow-1:0 1px 2px rgba(16,24,40,.06);
+  --shadow-2:0 4px 12px rgba(16,24,40,.08);
+  --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;
+}
+*{box-sizing:border-box}
+body{
+  margin:0;background:var(--bg);color:var(--text);
+  font:var(--fs-md)/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",
+       "PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
+  -webkit-font-smoothing:antialiased;
+}
+.num{font-variant-numeric:tabular-nums}      /* ★ 数字等宽：列才能对齐扫读 */
+
+/* ---------- 外壳：顶栏 / 内容 / 页脚 ---------- */
+.topbar{
+  position:sticky;top:0;z-index:10;height:56px;
+  display:flex;align-items:center;gap:var(--s6);
+  padding:0 var(--s6);background:rgba(255,255,255,.9);
+  backdrop-filter:saturate(180%) blur(8px);
+  border-bottom:1px solid var(--border);
+}
+.brand{display:flex;align-items:center;gap:var(--s2);font-weight:650;
+       font-size:var(--fs-lg);letter-spacing:-.01em}
+.brand .mark{width:22px;height:22px;border-radius:6px;
+  background:linear-gradient(135deg,var(--accent),#7c3aed);
+  display:grid;place-items:center;color:#fff;font-size:12px;font-weight:700}
+.nav{display:flex;gap:var(--s1)}
+.nav a{
+  padding:6px 12px;border-radius:var(--r-ctl);color:var(--text-2);
+  text-decoration:none;font-size:var(--fs-md);
+}
+.nav a:hover{background:var(--bg);color:var(--text)}
+.nav a[aria-current]{background:var(--accent-weak);color:var(--accent);font-weight:600}
+.spacer{flex:1}
+.status{display:flex;align-items:center;gap:var(--s2);cursor:help}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--ok);
+     box-shadow:0 0 0 3px var(--ok-weak)}
+.dot.warn{background:var(--warn);box-shadow:0 0 0 3px var(--warn-weak)}
+.dot.err{background:var(--err);box-shadow:0 0 0 3px var(--err-weak)}
+.env{font-size:var(--fs-xs);color:var(--text-3);
+     border:1px solid var(--border);border-radius:var(--r-pill);
+     padding:3px 10px;background:var(--surface)}
+.wrap{max-width:1200px;margin:0 auto;padding:var(--s8) var(--s6) 64px}
+.footer{border-top:1px solid var(--border);background:var(--surface);
+  color:var(--text-3);font-size:var(--fs-xs);
+  padding:var(--s4) var(--s6);display:flex;gap:var(--s4);flex-wrap:wrap}
+.footer a{color:var(--text-3)}
+
+/* ---------- 排版 ---------- */
+h1{font-size:var(--fs-2xl);margin:0 0 var(--s1);letter-spacing:-.02em}
+h2{font-size:var(--fs-lg);margin:var(--s8) 0 var(--s3);
+   display:flex;align-items:center;gap:var(--s2)}
+h2:first-of-type{margin-top:var(--s6)}
+.sub{color:var(--text-3);font-size:var(--fs-md);margin:0 0 var(--s6)}
+.hint{color:var(--text-3);font-size:var(--fs-xs);margin:var(--s2) 0 0}
+code,.mono{font-family:var(--mono);font-size:.92em;background:var(--bg);
+  border:1px solid var(--border);border-radius:4px;padding:1px 5px}
+
+/* ---------- 卡片 ---------- */
+.card{background:var(--surface);border:1px solid var(--border);
+  border-radius:var(--r-card);box-shadow:var(--shadow-1);padding:var(--s6)}
+.card.tight{padding:var(--s4)}
+.card-head{display:flex;align-items:baseline;gap:var(--s2);
+  margin-bottom:var(--s4)}
+.card-head .t{font-weight:600}
+.card-head .d{color:var(--text-3);font-size:var(--fs-xs)}
+
+/* ---------- KPI 卡（等宽栅格） ---------- */
+.kpis{display:grid;gap:var(--s3);
+  grid-template-columns:repeat(auto-fit,minmax(184px,1fr))}
+.kpi{background:var(--surface);border:1px solid var(--border);
+  border-radius:var(--r-card);box-shadow:var(--shadow-1);padding:var(--s4)}
+.kpi .k{color:var(--text-3);font-size:var(--fs-xs);display:flex;
+  align-items:center;gap:var(--s1);margin-bottom:var(--s2)}
+.kpi .v{font-size:26px;font-weight:650;letter-spacing:-.02em;line-height:1.1}
+.kpi .v small{font-size:var(--fs-sm);font-weight:500;color:var(--text-3);
+  margin-left:var(--s1)}
+.kpi .x{color:var(--text-3);font-size:var(--fs-xs);margin-top:var(--s1)}
+.kpi.ok .v{color:var(--ok)}
+
+/* ---------- ⓘ 提示（口径解释不再写进正文） ---------- */
+.info{display:inline-grid;place-items:center;width:14px;height:14px;
+  border-radius:50%;border:1px solid var(--border-strong);color:var(--text-3);
+  font-size:10px;cursor:help;vertical-align:middle}
+
+/* ---------- 徽标 ---------- */
+.badge{display:inline-flex;align-items:center;gap:5px;font-size:var(--fs-xs);
+  border-radius:var(--r-pill);padding:3px 10px;font-weight:500}
+.badge.ok{background:var(--ok-weak);color:#067647}
+.badge.warn{background:var(--warn-weak);color:#b54708}
+.badge.err{background:var(--err-weak);color:#b42318}
+.badge.neutral{background:var(--bg);color:var(--text-2);
+  border:1px solid var(--border)}
+
+/* ---------- 按钮 ---------- */
+.btn{appearance:none;border:1px solid transparent;border-radius:var(--r-ctl);
+  padding:8px 14px;font:inherit;font-weight:550;cursor:pointer;
+  display:inline-flex;align-items:center;gap:var(--s2);transition:.12s}
+.btn.primary{background:var(--accent);color:#fff}
+.btn.primary:hover{background:#1d4ed8}
+.btn.primary:disabled{background:#c7d2fe;cursor:not-allowed}
+.btn.ghost{background:var(--surface);border-color:var(--border-strong);
+  color:var(--text-2)}
+.btn.ghost:hover{background:var(--bg);color:var(--text)}
+.btn.sm{padding:5px 10px;font-size:var(--fs-sm)}
+.btn .spin{width:12px;height:12px;border:2px solid rgba(255,255,255,.45);
+  border-top-color:#fff;border-radius:50%;animation:spin .8s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+/* ---------- 表格（数字右对齐） ---------- */
+table{width:100%;border-collapse:collapse;font-size:var(--fs-sm)}
+th,td{padding:9px var(--s3);border-bottom:1px solid var(--border);
+  text-align:left}
+th{color:var(--text-3);font-weight:600;font-size:var(--fs-xs);
+  text-transform:none;background:var(--surface-2)}
+th.r,td.r{text-align:right}          /* ★ 数字列右对齐 */
+tbody tr:last-child td{border-bottom:0}
+tbody tr:hover{background:var(--surface-2)}
+tfoot td{background:var(--surface-2);font-weight:600;border-top:1px solid var(--border-strong)}
+
+/* ---------- ★ 条形图（这份样稿修掉了原实现"空白图"的 bug） ---------- */
+.bars{display:flex;flex-direction:column;gap:var(--s3)}
+.bar{display:grid;grid-template-columns:120px 1fr 92px;
+  align-items:center;gap:var(--s3);font-size:var(--fs-sm)}
+.bar .lbl{color:var(--text-2);text-align:right;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.bar .track{height:10px;border-radius:var(--r-pill);background:#eef2f6;
+  overflow:hidden}
+.bar .fill{display:block;height:100%;border-radius:var(--r-pill);
+  background:linear-gradient(90deg,var(--accent),#60a5fa)}
+/* ↑ display:block 是关键：原实现用行内 <span> + height:100%，高度不生效，
+     于是整张图一个数据条都看不见。 */
+.bar .val{text-align:right;color:var(--text-2)}
+
+/* ---------- 时间线 ---------- */
+.tl{display:flex;flex-direction:column;gap:var(--s2)}
+.tl .row{display:grid;grid-template-columns:96px 1fr 68px;
+  align-items:center;gap:var(--s3);font-size:var(--fs-sm)}
+.tl .nm{color:var(--text-2);text-align:right}
+.tl .tr{height:8px;border-radius:var(--r-pill);background:#eef2f6;overflow:hidden}
+.tl .fl{display:block;height:100%;border-radius:var(--r-pill);background:var(--accent)}
+.tl .fl.bad{background:var(--err)}
+.tl .ms{color:var(--text-3);text-align:right}
+
+/* ---------- 空态 / 骨架 ---------- */
+.empty{border:1px dashed var(--border-strong);border-radius:var(--r-card);
+  padding:var(--s8);text-align:center;color:var(--text-3);background:var(--surface-2)}
+.sk{background:linear-gradient(90deg,#eef1f4 25%,#e6eaef 37%,#eef1f4 63%);
+  background-size:400% 100%;animation:sk 1.3s ease infinite;border-radius:6px}
+@keyframes sk{0%{background-position:100% 50%}100%{background-position:0 50%}}
+
+/* ---------- 提示条（克制版：不再整段琥珀色） ---------- */
+.note{display:flex;gap:var(--s3);align-items:flex-start;
+  border:1px solid var(--border);border-left:3px solid var(--accent);
+  background:var(--surface);border-radius:var(--r-ctl);
+  padding:var(--s3) var(--s4);font-size:var(--fs-sm);color:var(--text-2)}
+.note.warn{border-left-color:var(--warn)}
+.note.ok{border-left-color:var(--ok)}
+
+/* ---------- 两栏（提问台） ---------- */
+.split{display:grid;grid-template-columns:minmax(0,420px) minmax(0,1fr);
+  gap:var(--s6);align-items:start}
+@media (max-width:980px){.split{grid-template-columns:1fr}}
+label.f{display:block;font-size:var(--fs-xs);color:var(--text-3);
+  margin:0 0 var(--s2)}
+textarea,select,input[type=text]{width:100%;font:inherit;color:var(--text);
+  background:var(--surface);border:1px solid var(--border-strong);
+  border-radius:var(--r-ctl);padding:10px 12px}
+textarea{resize:vertical;min-height:96px}
+textarea:focus,select:focus{outline:2px solid var(--accent-weak);
+  border-color:var(--accent)}
+.chips{display:flex;flex-wrap:wrap;gap:var(--s2);margin-top:var(--s2)}
+.chip{font-size:var(--fs-xs);border:1px solid var(--border);
+  background:var(--surface);border-radius:var(--r-pill);padding:4px 10px;
+  color:var(--text-2);cursor:pointer}
+.chip:hover{border-color:var(--accent);color:var(--accent)}
+.section{border-top:1px solid var(--border);padding-top:var(--s4);
+  margin-top:var(--s4)}
+.section:first-child{border-top:0;padding-top:0;margin-top:0}
+.legend{display:flex;gap:var(--s4);flex-wrap:wrap;color:var(--text-3);
+  font-size:var(--fs-xs);margin-bottom:var(--s4)}
+
+/* 样稿自身的说明层，不属于设计系统 */
+.mocknote{background:#0f172a;color:#e2e8f0;border-radius:var(--r-card);
+  padding:var(--s3) var(--s4);font-size:var(--fs-sm);margin-bottom:var(--s6)}
+.mocknote b{color:#fff}
+</style>
+</head>
+<body>
+
+<!-- ================= 外壳 ================= -->
+<header class="topbar">
+  <div class="brand"><span class="mark">A</span>AgentDesk</div>
+  <nav class="nav">
+    <a href="#" aria-current="page">总览</a>
+    <a href="#">提问</a>
+    <a href="#">看板</a>
+    <a href="#">设置</a>
+  </nav>
+  <span class="spacer"></span>
+  <span class="status" title="健康检查 6 项全通过 · 最近一次模型调用 3 分钟前">
+    <span class="dot"></span><span class="num">正常</span>
+  </span>
+  <span class="env">本地 · 免鉴权</span>
+</header>
+
+<div class="wrap">
+
+  <div class="mocknote">
+    <b>这是 UI 方案（08）的视觉样稿</b> —— 单文件、无外部请求，双击即可打开。
+    下面同一份设计系统画了三个页面：看板（含<b>修好的图表</b>）、提问台、总览。
+    真正的实现会把它拆成 <code>app/web/static/app.css</code> + 组件函数。
+  </div>
+
+  <!-- ================= 页面一：看板 ================= -->
+  <h1>可观测看板</h1>
+  <p class="sub">成本归因 · 对账 · 执行轨迹 —— 数据来自 <code>/metrics/summary</code>、<code>/traces</code>、<code>/approvals</code>，本页只读。</p>
+
+  <div class="legend">
+    <span>运行次数 <span class="info" title="接口被调用了几次。不等于「多少人在用」：服务端区分不出真实用户与开发调试，所以要看「不同问题数」。">i</span></span>
+    <span>总成本 <span class="info" title="按 trace 的叶子 span 归因求和（唯一事实源），与各维度切分应互相吻合。">i</span></span>
+    <span>P95 <span class="info" title="只统计单次请求，批处理不计入；样本数见下方口径说明。">i</span></span>
+  </div>
+
+  <div class="kpis">
+    <div class="kpi"><div class="k">运行次数</div>
+      <div class="v num">191</div><div class="x">其中自检 9 条已排除</div></div>
+  <div class="kpi"><div class="k">不同问题</div>
+      <div class="v num">3</div><div class="x">远小于运行次数 → 多为调试</div></div>
+    <div class="kpi ok"><div class="k">错误</div>
+      <div class="v num">0</div><div class="x">近 24 小时</div></div>
+    <div class="kpi"><div class="k">总成本</div>
+      <div class="v num">¥0.0004</div><div class="x">今日累计</div></div>
+    <div class="kpi"><div class="k">token</div>
+      <div class="v num">86</div><div class="x">prompt 60 · completion 26</div></div>
+    <div class="kpi"><div class="k">缓存命中率</div>
+      <div class="v num">0.0%</div><div class="x">未启用缓存</div></div>
+    <div class="kpi"><div class="k">P50 延迟</div>
+      <div class="v num">1.0<small>s</small></div><div class="x">样本 191</div></div>
+    <div class="kpi"><div class="k">P95 延迟</div>
+      <div class="v num">1.4<small>s</small></div><div class="x">单次请求</div></div>
+  </div>
+  <p class="hint">★ 与原界面相比：KPI 等宽对齐；P50/P95 各自一张卡、单位一致；
+    「运行次数」与「扫描口径」对得上了（191 = 200 − 9，见页脚口径说明）。</p>
+
+  <h2>成本归因 <span class="info" title="两个维度是同一笔钱的两种切法，各自合计都等于总账 —— 不能相加（相加等于翻倍）。">i</span></h2>
+  <div class="card">
+    <div class="card-head">
+      <span class="t">按动作</span>
+      <span class="d">同一笔钱的另一种切法，与「按 Agent」不可相加</span>
+    </div>
+    <table>
+      <thead><tr>
+        <th>类型</th><th class="r">次数</th><th class="r">token</th>
+        <th class="r">成本</th><th class="r">耗时</th>
+      </tr></thead>
+      <tbody>
+        <tr><td><code>llm</code></td><td class="r num">2</td>
+            <td class="r num">86</td><td class="r num">¥0.0004</td>
+            <td class="r num">1.76 s</td></tr>
+        <tr><td><code>tool</code></td><td class="r num">23</td>
+            <td class="r num">0</td><td class="r num">—</td>
+            <td class="r num">8.12 s</td></tr>
+      </tbody>
+      <tfoot><tr><td>合计</td><td class="r num">25</td>
+        <td class="r num">86</td><td class="r num">¥0.0004</td>
+        <td class="r num">9.88 s</td></tr></tfoot>
+    </table>
+    <p class="hint">★ 与原界面相比：数字右对齐、零成本显示 <code>—</code>（不再是一串 <code>¥0.0000</code>）、
+      有合计行。原界面上「概览 50」与「表合计 25」的矛盾现在有脚注对上。</p>
+  </div>
+
+  <h2>成本分布</h2>
+  <div class="card tight">
+    <div class="bars">
+      <div class="bar"><span class="lbl">llm</span>
+        <span class="track"><span class="fill" style="width:100%"></span></span>
+        <span class="val num">¥0.0004</span></div>
+      <div class="bar"><span class="lbl">tool</span>
+        <span class="track"><span class="fill" style="width:2%"></span></span>
+        <span class="val num">¥0</span></div>
+    </div>
+  </div>
+  <p class="hint">★ <b>这份样稿修掉了原实现的一个真 bug</b>：原 CSS 用行内
+    <code>&lt;span class="fill"&gt;</code> + <code>height:100%</code>，
+    而行内元素的高度不生效 —— 于是原界面上这张图<b>一个数据条都看不见</b>。
+    这里加 <code>display:block</code> 即可（<code>.tl .fl</code> 时间线同理）。</p>
+
+  <h2>对账</h2>
+  <div class="card">
+    <span class="badge ok">✅ 一致</span>
+    <span class="hint" style="display:inline">叶子 span 合计与总账偏差 0.0%（阈值 1%）—— 超过阈值会自动变红</span>
+  </div>
+
+  <!-- ================= 页面二：提问台 ================= -->
+  <h1 style="margin-top:48px">提问台</h1>
+  <p class="sub">填一个问题，看它自己决定查什么。每条结论都能追到具体命令与输出。</p>
+
+  <div class="split">
+    <!-- 左：输入 -->
+    <div class="card">
+      <div class="section">
+        <label class="f" for="q">问它一个问题</label>
+        <textarea id="q" placeholder="例如：web-01 上的网站访问很慢，有时报 502，帮我看下原因"></textarea>
+        <div class="chips">
+          <span class="chip">网站变慢 / 502</span>
+          <span class="chip">磁盘写满</span>
+          <span class="chip">容器一直重启</span>
+          <span class="chip">数据库连不上</span>
+        </div>
+        <p class="hint">★ 与原界面相比：用真 <b>placeholder</b> + 示例 chips，
+          不再预填一段会被误提交的示例文字。</p>
+      </div>
+      <div class="section">
+        <label class="f" for="m">能力</label>
+        <select id="m">
+          <option>多 Agent 编排（推荐，约 10–30 秒）</option>
+          <option>LangGraph 单 Agent</option>
+          <option>手写 ReAct</option>
+        </select>
+      </div>
+      <div class="section" style="display:flex;gap:8px;align-items:center">
+        <button class="btn primary"><span class="spin"></span>分析中…</button>
+        <button class="btn ghost sm">清空</button>
+        <button class="btn ghost sm">停止</button>
+        <span class="spacer"></span>
+        <span class="hint" style="margin:0">约 10–30 秒 · 计入每日额度</span>
+      </div>
+    </div>
+
+    <!-- 右：结果（提交前就有骨架，页面不会跳动） -->
+    <div class="card">
+      <div class="card-head">
+        <span class="t">结果</span>
+        <span class="d">提交前先占位，出现时不跳版</span>
+      </div>
+
+      <div class="section">
+        <div class="card-head"><span class="t">执行轨迹</span>
+          <span class="d">总耗时 8.7 s · 条宽按各步耗时占比</span></div>
+        <div class="tl">
+          <div class="row"><span class="nm">意图路由</span>
+            <span class="tr"><span class="fl" style="width:14%"></span></span>
+            <span class="ms num">0.4s</span></div>
+          <div class="row"><span class="nm">知识检索</span>
+            <span class="tr"><span class="fl" style="width:9%"></span></span>
+            <span class="ms num">0.3s</span></div>
+          <div class="row"><span class="nm">工具执行</span>
+            <span class="tr"><span class="fl" style="width:62%"></span></span>
+            <span class="ms num">5.4s</span></div>
+          <div class="row"><span class="nm">结果校验</span>
+            <span class="tr"><span class="fl" style="width:15%"></span></span>
+            <span class="ms num">1.3s</span></div>
+        </div>
+      </div>
+
+      <div class="section">
+        <div class="card-head"><span class="t">结论</span></div>
+        <div class="sk" style="height:12px;width:92%;margin-bottom:8px"></div>
+        <div class="sk" style="height:12px;width:78%"></div>
+      </div>
+
+      <div class="section">
+        <div class="card-head"><span class="t">证据</span>
+          <span class="d">每条结论对应到具体命令与输出</span></div>
+        <div class="empty">等待分析…<br><span class="hint">这里会列出它执行过的只读命令与关键输出</span></div>
+      </div>
+
+      <div class="section">
+        <div class="note warn">多 Agent 编排会调用真实模型，属于计费动作，计入每日额度。</div>
+      </div>
+    </div>
+  </div>
+  <p class="hint">★ 与原界面相比：<b>结果区在提交前就存在</b>（骨架 + 空态），
+    四个分区固定；开发者向的说明（<code>AUTH_ENABLED=0</code> 之类）已移到「设置」页，
+    首屏只留用户需要知道的计费提醒。</p>
+
+  <!-- ================= 页面三：总览 ================= -->
+  <h1 style="margin-top:48px">总览</h1>
+  <p class="sub">面向运维场景的多 Agent 智能体系统 —— 填问题、点按钮，看它自己决定查什么。</p>
+
+  <div class="kpis" style="grid-template-columns:repeat(auto-fit,minmax(260px,1fr))">
+    <div class="kpi"><div class="k">① 去提问</div>
+      <div class="v" style="font-size:var(--fs-lg)">让它自己查一台机器</div>
+      <p class="hint">只读诊断；要动系统会走审批。</p>
+      <button class="btn primary sm" style="margin-top:8px">开始提问</button></div>
+    <div class="kpi"><div class="k">② 看看板</div>
+      <div class="v" style="font-size:var(--fs-lg)">成本 · 轨迹 · 对账</div>
+      <p class="hint">不用敲命令就能看它干了什么。</p>
+      <button class="btn ghost sm" style="margin-top:8px">打开看板</button></div>
+    <div class="kpi"><div class="k">③ 处置剧本</div>
+      <div class="v" style="font-size:var(--fs-lg)">3 份 · 2 个写操作</div>
+      <p class="hint">带判定与分叉；<b>不可回滚的步骤会明确标出</b>。</p>
+      <button class="btn ghost sm" style="margin-top:8px">查看剧本</button></div>
+  </div>
+
+  <h2>系统状态</h2>
+  <div class="card tight">
+    <div class="kpis" style="grid-template-columns:repeat(auto-fit,minmax(200px,1fr))">
+      <div class="kpi"><div class="k">日志可写</div><div class="v" style="font-size:var(--fs-lg)"><span class="badge ok">通过</span></div></div>
+      <div class="kpi"><div class="k">索引可载入</div><div class="v" style="font-size:var(--fs-lg)"><span class="badge ok">通过</span><span class="hint" style="display:block">91 块 / local-hash</span></div></div>
+      <div class="kpi"><div class="k">事件存储</div><div class="v" style="font-size:var(--fs-lg)"><span class="badge ok">通过</span><span class="hint" style="display:block">3 个事件</span></div></div>
+      <div class="kpi"><div class="k">通知配置</div><div class="v" style="font-size:var(--fs-lg)"><span class="badge neutral">未启用</span><span class="hint" style="display:block">默认不出站</span></div></div>
+      <div class="kpi"><div class="k">磁盘余量</div><div class="v" style="font-size:var(--fs-lg)"><span class="badge ok">36 GB</span></div></div>
+      <div class="kpi"><div class="k">处置剧本</div><div class="v" style="font-size:var(--fs-lg)"><span class="badge ok">3 份已加载</span></div></div>
+    </div>
+    <p class="hint">★ 新增：把 <code>/healthz</code> 的结果直接露到首页 ——
+      以前要敲命令才知道哪一项坏了。</p>
+  </div>
+
+  <h2>口径与已知边界</h2>
+  <div class="card">
+    <p class="hint" style="margin:0">
+      「运行次数」= 接口调用次数 ≠ 真实用户数；
+      「扫描 200 条 → 真实运行 191 条」是因为排除了 9 条自检记录；
+      成本按 trace 叶子 span 归因，两个维度不可相加。
+      完整说明见 <a href="#">文档</a>。
+    </p>
+  </div>
+
+</div>
+
+<footer class="footer">
+  <span>AgentDesk v1.0.0</span>
+  <span>45 个路由 · 9 个运行时依赖</span>
+  <span><a href="#">API 文档</a></span>
+  <span><a href="#">指标</a></span>
+  <span><a href="#">健康自检</a></span>
+  <span class="spacer"></span>
+  <span>亮色主题（暗色 token 已预留）</span>
+</footer>
+
+</body>
+</html>
