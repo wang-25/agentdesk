@@ -339,3 +339,64 @@ details.acc[open] summary{margin-bottom:var(--s3)}
   .content{max-width:none;padding:0}
   .card,.kpi{box-shadow:none;break-inside:avoid}
 }
+
+/* ============================================================
+   补充：页面实际用到、但上面还没定义的组件
+   ------------------------------------------------------------
+   ★ 这一节是**对账对出来的**：写完后用"页面里用到的类 vs app.css 里定义的类"
+     做了一次差集，发现下面这些是真空缺。其中 `.steps/.step/...` 尤其说明问题 ——
+     它在 P4 删掉旧的 `_BASE_CSS` 时被一起删了，而 `try.js` 仍在用它：
+     **页面不会报错，只是那几步没有样式**（静默丢失）。
+     这个对账已经加进 `scripts/ui_check.py`，以后类名打错也会被抓到。
+   ============================================================ */
+
+/* 流式执行步骤（提问台边收边显示；`.done` 表示这一步已结束） */
+.steps{display:flex;flex-direction:column;gap:2px}
+.step{display:flex;align-items:baseline;gap:var(--s2);
+  font-size:var(--fs-sm);padding:7px 2px;
+  border-bottom:1px dashed var(--border)}
+.step:last-child{border-bottom:0}
+.step .dot{width:8px;height:8px;border-radius:50%;flex:0 0 auto;
+  align-self:center;background:var(--brand-1);
+  box-shadow:0 0 0 3px rgba(79,70,229,.14);animation:pulse 1.2s ease-in-out infinite}
+.step.done .dot{background:var(--ok);box-shadow:0 0 0 3px rgba(5,150,105,.14);
+  animation:none}
+@keyframes pulse{50%{opacity:.45}}
+.step .sum{color:var(--text-3);font-size:var(--fs-xs);
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.step .ms{color:var(--text-3);font-size:var(--fs-xs);margin-left:auto;
+  font-variant-numeric:tabular-nums;flex:0 0 auto}
+
+/* 模型答案正文（markdown 子集渲染结果；`pre` 自带换行，不必再手动断行） */
+.md pre{white-space:pre-wrap;word-break:break-word;font:inherit;margin:0}
+.md code{font-family:var(--mono)}
+.md{background:var(--surface-2);border:1px solid var(--border);
+  border-radius:var(--r-ctl);padding:var(--s4);line-height:1.7}
+
+/* 看板里可展开的逐条轨迹 */
+.trace-row{cursor:pointer}
+.trace-row:hover{border-color:var(--border-strong);box-shadow:var(--shadow-2)}
+.trace-detail{margin-top:var(--s3);padding-top:var(--s3);
+  border-top:1px solid var(--border)}
+[hidden]{display:none!important}      /* 有组件类设了 display 时，`hidden` 仍然生效 */
+
+/* 流程视图的 SVG（8 列宽约 1300px；缩放到卡片宽度而不是横向滚动） */
+svg.flow{max-width:100%;height:auto;display:block}
+
+/* 骨架单元格（表格里用） */
+.sk-strong{height:14px;width:38%}
+.sk-label{height:10px;width:72%}
+
+/* 卡片副标题：替代页面里的行内 margin */
+.card-sub{color:var(--text-3);font-size:var(--fs-xs);margin-left:var(--s2)}
+
+/* KPI 栅格：让同一行的卡等高（7 张时最后一行不会被拉宽拉高） */
+.kpis{grid-auto-rows:1fr}
+
+/* hero 里的强调文字：白色 90% 上再加粗会显得偏淡，提一档 */
+.hero p b,.hero h1 b{color:#fff;font-weight:700}
+
+/* 表单：值区与标签的间距（长卡里两者贴太紧会显得拥挤） */
+.field>label.f{margin-bottom:var(--s2)}
+.field>.val,.field>div:not(.btnrow){margin-top:var(--s1)}
+

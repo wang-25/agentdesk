@@ -80,6 +80,9 @@ python -m app.rag.pipeline eval --top-k 8     # 检索召回率（纯检索，�
 - **📊 全链路可观测** —— 每次运行留下 trace（span 树）、成本归因（按 Agent/动作双维）、审计日志；
   `GET /metrics` 输出 Prometheus 文本（成本 / token / 拒绝 / 通知 / 写操作执行都进指标），
   `GET /healthz` 逐项探依赖（坏哪一项点名），日志可切 JSON 并带请求 ID。详见 [监控与运维](docs/monitoring.md)。
+- **🖥 五个页面开箱可用** —— 总览 / 提问 / 看板 / 设置 / 数据视图，统一外壳与一套设计系统；
+  **零依赖零构建**（服务端渲染 + 一个 `app.css`），离线内网可用。怎么用见 [界面使用与改造](docs/ui.md)；
+  `python scripts/ui_check.py` 是它的门禁（23 项，含**真实浏览器实测图表有没有画出来**）。
 - **🚨 事件闭环 + 出站通知** —— 告警按「主机+服务」聚合成**一个事件**（50 条同源告警只跑 1 次诊断），
   支持维护窗口抑制；诊断结论/待审批/执行结果**推给值班的人**（通用 webhook / 钉钉 / 飞书，含加签、去重、重试）。
   ⚠️ 默认**不出站**（`NOTIFY_CHANNELS` 留空即完全关闭）；开了之后出站正文默认脱敏。
@@ -479,6 +482,7 @@ agentdesk/
 | [监控与运维](docs/monitoring.md)                   | 怎么监控 Agent 自己：`/metrics`、`/healthz`、日志格式与 JSONL 轮转 |
 | [会话与案例记忆](docs/memory.md)                   | 跨轮次记忆怎么存、案例怎么回流、以及"案例只作参考"的三道防线 |
 | [处置剧本](docs/plays.md)                        | 带判定与分叉的处置流程；为什么它不做自动执行与自动回滚 |
+| [界面使用与改造](docs/ui.md)                       | 五个页面怎么用、设计系统在哪、加一个页面要动哪几个文件 |
 | [可观测](docs/observability.md)                 | Trace 与成本归因的设计          |
 | [评测](docs/evaluation.md)                     | 六维度设计、判定器自证、误报排查        |
 | [MCP Server](docs/mcp-server.md)             | 协议原理、四个真实坑、客户端配置        |
