@@ -20,8 +20,8 @@ IMPLEMENTED = [
     "home",
     "try_",
     "dashboard",
-    # "settings",
-    # "view",
+    "settings",
+    "view",
 ]
 
 
