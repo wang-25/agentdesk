@@ -91,7 +91,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Response
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Request, Response
+from fastapi.exceptions import RequestValidationError
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
@@ -153,6 +154,33 @@ security.install_security(app)
 #   已被接管的页面走新外壳，未接管的继续用本文件里的旧实现 ——
 #   所以阶段之间服务始终可用，不会出现"改到一半打不开"。
 _WEB = web.mount(app)
+
+
+# ============================================================
+# 422 里不回显密钥类字段
+# ============================================================
+# ★ 这是设置页那次改动暴露出来的一个真实泄漏路径：
+#   FastAPI 的 `RequestValidationError` 默认会把**校验失败的那个值**
+#   原样放进 `detail[].input`。对 `password` / `token` 字段，那就是把密码
+#   直接回给客户端 —— devtools、反向代理日志、前端错误上报全都看得到。
+#   前端"不复述 input"只能遮住页面，遮不住 HTTP 响应体本身。
+#
+#   只对密钥类字段抹掉 `input`，其余字段与默认行为逐字节一致
+#   （改全局错误格式是另一件事，不该顺手做）。
+_SECRET_FIELDS = ("password", "token", "key")
+
+
+@app.exception_handler(RequestValidationError)
+async def _validation_error_without_secrets(request: Request, exc: RequestValidationError):
+    errors = []
+    for err in exc.errors():
+        err = dict(err)
+        loc = err.get("loc") or ()
+        if loc and str(loc[-1]).lower() in _SECRET_FIELDS:
+            err.pop("input", None)
+            err["input"] = "[已隐去]"
+        errors.append(err)
+    return JSONResponse(status_code=422, content={"detail": errors})
 
 # ============================================================
 # 可观测：日志格式 + 请求 ID + HTTP 指标（M4）

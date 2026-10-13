@@ -28,11 +28,20 @@
        而不是靠"记得转义"或"记得别拼错变量"
     3. **前端白名单取值**：`/settings/api` 确实会返回完整令牌（读接口的语义没变，
        它有鉴权 + 有对账测试兜底），但本页的 JS **只读** `auth_enabled` / `token_len`
-       与 `ops` 的 `backend/targets/targets_raw/hosts_env/known_hosts` ——
-       不读 `auth.token`、不读 `auth.token_masked`、不读 `ops.key`。
+       与 `ops` 的 `backend/targets/targets_raw/hosts_env/known_hosts/credentials` ——
+       不读 `auth.token`、不读 `auth.token_masked`。
        没有"记得删掉那一行"的步骤，只有"不许取"这一条
     4. 令牌的**新值**只在用户主动输入时存在；保存成功后只存进本机 localStorage
        （与旧页一致），服务端的响应里只回掩码给提示语用 —— 页面不渲染它
+    5. **主机的密码只写不读**（「SSH 登录」卡）：`ops.credentials[].key` 是私钥
+       **路径**（文件系统上的位置，不是密钥内容），所以它可以回填、可以编辑、
+       而且必须**原样回传** —— POST /settings/ops 的语义是"没给的字段 = 空值"，
+       不回传就会把用户配好的目标/全局私钥冲掉。
+       而**密码在 `/settings/api` 的响应里根本不存在**，只有 `password_set: bool`。
+       于是密码只可能来自"用户刚敲进去的那一次"：它只进 `input.value` 与请求体，
+       提交后立刻 `input.value = ""`，绝不过 innerHTML / console / localStorage / URL。
+       失败回执（400/422）也只取 `loc` + `msg`，**绝不复述 `input`** ——
+       FastAPI 的 422 会把出错的那个值原样放在 `detail[].input` 里，那正是密码
 
 【数据从哪来（全部是已有接口，零后端改动）】
     /settings/api   访问令牌状态 + 工具层数据源（要令牌；本地免鉴权时公开）
@@ -73,6 +82,9 @@ DEFS = {
              "所有接口都要求 `X-API-Key`。页面是空壳，数据仍由接口那一步保护。"),
     "token": ("令牌状态只显示「已设置 / 未设置」，永不回显令牌本身 —— "
               "连掩码后的前缀都不显示。前缀对判断强度没有帮助，但会泄密。"),
+    "creds": ("每台主机一份 SSH 凭据：认证方式（私钥 / 密码）+ 该主机自己的私钥路径。"
+              "统计里的「N 台用密码」指这些主机的认证方式是密码 —— "
+              "密码本身永不出现在这里，页面只知道「有没有设置」。"),
     "quota": ("每日额度 = `DAILY_QUOTA`，进程内计数：单进程（`--workers 1`）下准确，"
               "多 worker 会各算各的。它统计的是花钱的调用，不是所有请求。"),
     "notify": ("通知渠道由 `NOTIFY_CHANNELS` 点名决定 —— 只有被点名的渠道才会被构造，"
@@ -180,6 +192,8 @@ SUMMARY_TILES = (
     ("plays", "处置剧本", DEFS["plays"]),
     ("sandbox", "沙箱隔离", DEFS["sandbox"]),
     ("model", "模型", DEFS["model"]),
+    # ↓ 可选的第八格：一眼看出"凭据配了几台、有几台靠密码"（浏览器拿到接口后填）
+    ("creds", "SSH 凭据", DEFS["creds"]),
 )
 
 
@@ -400,9 +414,12 @@ def _limits_card() -> str:
 def _settings_form() -> str:
     """工具层数据源（唯一一处"真的能改"的表单，与旧页能力一致）。
 
-    ★ 私钥路径输入框**永远留空**：旧页把当前路径回填进去（`$('key').value = ops.key`），
+    ★ 这里的私钥路径是**全局兜底**（每台主机自己的那把在「SSH 登录」卡里编辑），
+      输入框**永远留空**：旧页把当前路径回填进来（`$('key').value = ops.key`），
       本页不回填、也不把当前值渲染出来 —— 需要保留就留空（服务端语义：留空 = 不修改）。
       想知道"现在配的有没有"，看左边的徽标。
+      ★ 而"回车保存时原样回传"是另一回事：凭据卡的请求体必须带上当前的全局
+      `key`（否则一次保存凭据就会把它冲成空值）——它从接口快照里取，不从这个输入框取。
     """
     body = (
         '<div class="btnrow">'
@@ -432,6 +449,47 @@ def _settings_form() -> str:
         + '<p class="hint" id="persist">持久化位置载入中…</p>'
     )
     return card(body, title="工具层数据源", desc="改完运行时立即生效，并写回 .env（自动备份）")
+
+
+def _credentials_card() -> str:
+    """「SSH 登录（每台主机一份凭据）」—— 本页唯一会碰到密码的地方。
+
+    【为什么服务端只渲染一具空壳】
+    凭据清单的唯一来源是 `/settings/api` 的 `ops.credentials`，所以这里
+    **一个主机名、一条路径都不写**：行的内容全部由前端按接口返回渲染。
+    服务端渲染时因此结构上碰不到凭据表（也就碰不到密码）——
+    "页面 HTML 里没有密码"是**结构上成立**的，而不是"记得别拼错变量"。
+
+    【密码的三条界面规则（与服务端同一套语义，缺一不可）】
+    · **只写不读**：密码输入框永远不回显，只有 placeholder + 徽标「已设置 / 未设置」
+    · **留空 = 不修改**：只改私钥路径时密码不会被抹掉
+      （"保存一次就丢密码"是最容易让人放弃这个功能的那种 bug）
+    · **要清空必须显式说**：勾「清除密码」→ `clear_password: true`
+
+    【没有目标的行】
+    `target` 为 null = 这台主机在清单里但没有 SSH 目标（连不上）。
+    那一行的控件整行停用、并打「尚未配置目标」徽标：它不参与保存
+    （提交时该行留空 = 服务端语义的"不改这项"，不会把它已有的密码弄丢）。
+    """
+    body = (
+        '<div id="credSummary" class="hint">载入中…</div>'
+        + '<div id="credRows">' + skeleton("100%", "72px") + "</div>"
+        + '<div class="btnrow">'
+        + button("保存全部凭据", size="sm", attrs='id="saveCreds"')
+        + "</div>"
+        + '<div id="credMsg"></div>'
+        + note("三件事写在这里，因为弄错任何一件都会让人再也不敢用这个功能："
+               "<b>密码只写不读</b>（页面只能显示「已设置 / 未设置」，回显不了值）；"
+               "<b>留空 = 不修改</b>（只改私钥路径不会把已保存的密码弄丢）；"
+               "<b>清空要显式勾</b>「清除密码」。编辑框里的私钥是<b>路径</b>"
+               "（文件在哪儿），不是密钥内容。")
+        + note("这一栏的按钮把<b>所有行</b>一起提交，但没动过的行保持原值；"
+               "带「尚未配置目标」徽标的主机连不上，也不参与保存 —— "
+               "要让它能连，先去「工具层数据源」里给它配 "
+               "<code>名=user@地址[:端口]</code>。", "warn")
+    )
+    return card(body, title="SSH 登录（每台主机一份凭据）",
+                desc="数据源 /settings/api 的 ops.credentials")
 
 
 def _footer_details() -> str:
@@ -507,6 +565,11 @@ def _body() -> str:
     <h2>安全与限额</h2>
     <div class="grid c2">{_security_section()}
       {_settings_form()}</div>
+  </section>
+
+  <section class="section">
+    <h2>SSH 登录</h2>
+    {_credentials_card()}
   </section>
 
   <section class="section">
@@ -745,8 +808,9 @@ document.addEventListener("DOMContentLoaded", function () {
 
   /* ---------- 主流程：每一项独立取数，互不拖垮 ---------- */
   // ★ 真实 AGENT_TOKEN / DEEPSEEK_API_KEY 的值**永远不取**：
-  //    不取 auth.token、不取 auth.token_masked、不取 ops.key。
-  //    没有值被写进 DOM，也就不存在"忘了删掉那一行"。
+  //    不取 auth.token、不取 auth.token_masked。
+  //    ops.key 是私钥**路径**（不是密钥内容），凭据卡要原样回传它 ——
+  //    见上方「密码只写不读」那一段。
   function load() {
     var h = headers();
     var secOk = false;
@@ -761,15 +825,22 @@ document.addEventListener("DOMContentLoaded", function () {
           note("err", "取配置失败：" + fail(r, "设置接口"), "warn");
         }
         renderOps(null);
+        renderCreds(null);
         return;
       }
       secOk = true;
       var ops = r.data.ops || {};
+      /* ★ 凭据卡的请求体要**原样**带上这四个字段：POST /settings/ops 的语义是
+         "没给的字段 = 空值"，少带一个就会把用户配好的目标 / 全局私钥 / 清单冲掉。
+         所以这里存一份快照 —— 它只用于回传，界面不显示、也不允许在这里编辑。 */
+      OPS = { backend: ops.backend, targets_raw: ops.targets_raw,
+              key: ops.key, hosts_env: ops.hosts_env };
+      renderCreds(ops.credentials);
       renderOps({
         backend: ops.backend,
         targets: ops.targets,
         known_hosts: ops.known_hosts,
-        /* ★ 只把"有没有配"这一个布尔交出去 —— 路径本身不进 DOM */
+        /* ★ 只把"有没有配"这一个布尔交出去 —— 全局私钥的路径不进这一栏 */
         key_configured: !!(ops.key && String(ops.key).length),
         raw_targets: ops.targets_raw
       });
@@ -784,6 +855,7 @@ document.addEventListener("DOMContentLoaded", function () {
     }).catch(function () {
       note("err", "取配置失败：请求本身出错（服务没起来或网络断了）。", "warn");
       renderOps(null);
+      renderCreds(null);
     });
 
     fetchJson("/health", { headers: h }).then(function (r) {
@@ -883,6 +955,265 @@ document.addEventListener("DOMContentLoaded", function () {
       });
     };
   }
+
+  /* ============================================================
+     SSH 凭据（每台主机一份）：私钥路径 / 密码
+     ------------------------------------------------------------
+     ★ 密码只写不读 —— 四条通道全堵上：
+        ① 接口不回显（只有 password_set），所以密码**无从**被渲染
+        ② 密码只进 input.value 与请求体；innerHTML 里只出现静态文字
+        ③ 提交后（成功或失败）立刻 input.value = ""，只留 placeholder
+        ④ 失败回执只取 loc/msg，**不复述 detail[].input**（422 会带密码！）
+     ★ 私钥是**路径**：回填、编辑、原样回传都是对的（不给 = 被清空）。
+     ============================================================ */
+  var CREDS = [];        /* 接口给的凭据视图（永远不含密码字段） */
+  var OPS = null;        /* 原样回传用的数据源快照（见 load() 里的说明） */
+
+  function credNoteHtml(text, tone) {
+    var ic = tone === "warn" ? "\u26a0" : (tone === "ok" ? "\u2713" : "\u25b8");
+    var cls = "note" + (tone ? " " + tone : "");
+    return '<div class="' + cls + '"><span class="ic">' + ic + "</span><span>"
+      + text + "</span></div>";
+  }
+  function credMsg(parts) {
+    var el = $("credMsg");
+    if (el) el.innerHTML = parts.join("");
+  }
+  function credPwdBadge(set) {
+    return badgeHtml(set ? "已设置" : "未设置", set ? "ok" : "neutral");
+  }
+  /* 目标 → `user@host:port`；没有目标返回 null（这一行连不上、也不参与保存） */
+  function targetText(t) {
+    if (!t) return null;
+    return String(t.user || "") + "@" + String(t.host || "")
+      + (t.port ? ":" + t.port : "");
+  }
+
+  /* 一行的**结构**（服务端渲染不出来：行的内容只有接口知道）
+     版式：主机名 + 目标 / 认证方式 | 私钥路径 / 密码（两列，窄屏自动堆叠） */
+  function credRowHtml(c, i) {
+    var tt = targetText(c.target);
+    return '<div class="field" id="credRow-' + i + '">'
+      + '<label class="f">' + AD.esc(c.host) + " "
+      + (tt === null ? badgeHtml("尚未配置目标", "warn")
+                     : '<span class="hint">' + AD.esc(tt) + "</span>")
+      + "</label>"
+      + '<div class="grid c2">'
+      + '<div><label class="f" for="credAuth-' + i + '">认证方式</label>'
+      + '<select id="credAuth-' + i + '" aria-label="认证方式">'
+      + '<option value="key">私钥</option>'
+      + '<option value="password">密码</option></select></div>'
+      + '<div><label class="f" for="credKey-' + i + '">私钥路径</label>'
+      + '<input type="text" id="credKey-' + i + '" class="mono" '
+      + 'placeholder="选「私钥」时生效；留空 = 不修改"></div>'
+      + '<div><label class="f" for="credPwd-' + i + '">密码 '
+      + credPwdBadge(!!c.password_set) + "</label>"
+      + '<div class="btnrow">'
+      /* ★ 密码框：没有 value、没有回填，autocomplete 关掉（免得浏览器把管理员
+         自己的密码自动填进来，一保存就把它写到 .env 里去了） */
+      + '<input type="password" id="credPwd-' + i + '" class="mono" '
+      + 'autocomplete="new-password" aria-label="密码" placeholder="'
+      + (c.password_set ? "已设置（留空表示不修改）" : "未填写") + '">'
+      + (c.password_set
+         ? '<label class="switch"><input type="checkbox" id="credClear-' + i
+           + '"> 清除密码</label>'
+         : "")
+      + "</div></div></div></div>";
+  }
+
+  /* 认证方式切换：选「密码」时私钥框禁用但**保留值**（切回来还在，别清空） */
+  function toggleCredAuth(i) {
+    var row = $("credRow-" + i), sel = $("credAuth-" + i), keyEl = $("credKey-" + i);
+    if (!row || !sel || !keyEl) return;
+    if (row.getAttribute("data-notarget") === "1") return;   /* 整行已停用 */
+    keyEl.disabled = (sel.value !== "key");
+  }
+
+  /* 逐行**填值**：值只走 .value（密钥类字段绝不进 innerHTML） */
+  function fillCredRow(c, i) {
+    var row = $("credRow-" + i), sel = $("credAuth-" + i);
+    var keyEl = $("credKey-" + i), pwdEl = $("credPwd-" + i);
+    var clr = $("credClear-" + i);
+    var noTarget = !c.target;
+    if (row) row.setAttribute("data-notarget", noTarget ? "1" : "0");
+    if (sel) sel.value = (c.auth === "password") ? "password" : "key";
+    if (keyEl) keyEl.value = c.key || "";   /* 路径：可以显示 */
+    if (pwdEl) pwdEl.value = "";            /* ★ 密码：永远是空的 */
+    if (clr) clr.checked = false;           /* 清除是"这一次的动作"，不是状态 */
+    if (noTarget) {
+      var ctrls = row ? row.querySelectorAll("select,input") : [];
+      for (var k = 0; k < ctrls.length; k++) ctrls[k].disabled = true;
+      return;
+    }
+    toggleCredAuth(i);
+  }
+
+  function renderCreds(list) {
+    var box = $("credRows");
+    if (!box) return;
+    if (!list) {                                  /* 取不到 ≠ 没有主机 */
+      CREDS = [];
+      box.innerHTML = AD.empty("取不到凭据清单", "需要令牌或被拒绝");
+      setText("credSummary", "取不到凭据清单 —— 先解决取数，再谈保存。");
+      setText("k-creds", DASH);
+      if ($("saveCreds")) $("saveCreds").disabled = true;
+      return;
+    }
+    CREDS = list;
+    var pwdN = 0, noT = 0, i;
+    for (i = 0; i < CREDS.length; i++) {
+      if (CREDS[i].password_set) pwdN++;
+      if (!CREDS[i].target) noT++;
+    }
+    setText("k-creds", CREDS.length
+      ? CREDS.length + " 台 · " + pwdN + " 台用密码" : "没有主机");
+    setText("credSummary", "共 " + CREDS.length + " 台主机 · 密码已设置 " + pwdN + " 台"
+      + (noT ? " · " + noT + " 台尚未配置目标（不参与保存）" : ""));
+    if (!CREDS.length) {
+      box.innerHTML = AD.empty("没有主机",
+        "先在「工具层数据源」里配 SSH 目标或主机清单，再回来配凭据");
+      if ($("saveCreds")) $("saveCreds").disabled = true;
+      return;
+    }
+    var html = "";
+    for (i = 0; i < CREDS.length; i++) html += credRowHtml(CREDS[i], i);
+    box.innerHTML = html;
+    for (i = 0; i < CREDS.length; i++) {
+      fillCredRow(CREDS[i], i);
+      bindCredRow(i);
+    }
+    /* 一行都连不上的时候，这个按钮什么也做不了 */
+    if ($("saveCreds")) $("saveCreds").disabled = (noT === CREDS.length);
+  }
+  function bindCredRow(i) {
+    var sel = $("credAuth-" + i);
+    if (sel) sel.onchange = function () { toggleCredAuth(i); };
+  }
+
+  /* 收集请求体里的 credentials：**只读 DOM 的值**，不做任何猜测 */
+  function collectCreds() {
+    var out = [], i;
+    for (i = 0; i < CREDS.length; i++) {
+      var c = CREDS[i];
+      if (!c.target) {
+        /* 没有目标的行整行留空 = 服务端语义的"不改这项"
+           （auth/key 留空不改，password 留空不改，clear_password=false）——
+           它已有的密码因此不会被这次保存顺手抹掉。 */
+        out.push({ host: c.host, auth: "", key: "", password: "",
+                   clear_password: false });
+        continue;
+      }
+      var sel = $("credAuth-" + i), keyEl = $("credKey-" + i);
+      var pwdEl = $("credPwd-" + i), clr = $("credClear-" + i);
+      var auth = sel ? sel.value : "key";
+      out.push({
+        host: c.host,
+        auth: auth,
+        /* 私钥路径只在「私钥」方式下提交（选密码时那句 key 留空 = 不改） */
+        key: (auth === "key" && keyEl) ? (keyEl.value || "").trim() : "",
+        /* ★ 密码原样提交、**不 trim**（密码里可以有空格）；留空 = 不修改 */
+        password: pwdEl ? (pwdEl.value || "") : "",
+        clear_password: !!(clr && clr.checked)
+      });
+    }
+    return out;
+  }
+
+  /* 提交后立刻清空所有密码框：只在 placeholder 里留状态 */
+  function clearPwdInputs() {
+    for (var i = 0; i < CREDS.length; i++) {
+      var el = $("credPwd-" + i);
+      if (el) el.value = "";
+    }
+  }
+
+  /* 失败信息：400 是 detail 字符串；422 的 detail 是列表，**只取 loc + msg**。
+     ★ FastAPI 的 422 里每个错误项都有一个 `input`，那正是用户填的值 ——
+       密码校验失败时它就是密码。所以这里一个字段一个字段地挑，绝不整块塞进页面。 */
+  function credErrText(detail, status) {
+    if (typeof detail === "string" && detail) return detail;
+    if (detail && detail.length) {
+      var parts = [], i;
+      for (i = 0; i < detail.length && i < 4; i++) {
+        var e = detail[i] || {};
+        parts.push((e.loc || []).join(".") + "：" + (e.msg || "校验不通过"));
+      }
+      if (parts.length) return parts.join("；");
+    }
+    return "HTTP " + status;
+  }
+
+  function submitCreds() {
+    var btn = $("saveCreds");
+    if (!OPS) {
+      credMsg([credNoteHtml("还没取到配置（需要令牌，或服务没起来）—— "
+        + "先解决取数，再保存凭据。", "warn")]);
+      return;
+    }
+    var creds = collectCreds(), over = [], i;
+    for (i = 0; i < creds.length; i++) {
+      /* 服务端的硬上限是 500 字符（超了会 422）。在这里先拦一次：
+         既不把密码送去撞一个"会把 input 回显出来"的错误，也不白丢一次保存。 */
+      if (creds[i].password.length > 500) over.push(creds[i].host);
+    }
+    if (over.length) {
+      credMsg([credNoteHtml("密码超过 500 字符（" + AD.esc(over.join("、"))
+        + "）—— 已中止，什么都没有提交。", "warn")]);
+      return;
+    }
+    var label = btn ? btn.innerHTML : "";
+    if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spin"></span> 保存中…'; }
+    var prev = CREDS.slice();
+    fetchJson("/settings/ops", {
+      method: "POST", headers: headers(true),
+      body: JSON.stringify({
+        /* ★ 这四项**原样回传**（来自 /settings/api 的快照）：它们不属于这张卡，
+           改一个字就会把用户配好的 SSH 目标 / 全局私钥 / 主机清单冲成空值 */
+        backend: OPS.backend,
+        targets: OPS.targets_raw,
+        key: OPS.key,
+        hosts: OPS.hosts_env,
+        credentials: creds
+      })
+    }).then(function (r) {
+      clearPwdInputs();                  /* ★ 成败都清：密码不留在一个可被读走的地方 */
+      if (btn) { btn.disabled = false; btn.innerHTML = label; }
+      if (!r.ok) {
+        credMsg([credNoteHtml("保存失败："
+          + AD.esc(credErrText(r.data && r.data.detail, r.status)), "warn")]);
+        return;
+      }
+      var data = r.data || {};
+      /* 回执里不会说"哪台改了"，那就自己比：认证方式 / 私钥路径 / 新密码 / 清除 */
+      var changed = [], k;
+      for (k = 0; k < creds.length; k++) {
+        var e = creds[k], old = null, j;
+        for (j = 0; j < prev.length; j++) if (prev[j].host === e.host) old = prev[j];
+        if (!old) continue;
+        var newAuth = e.auth || old.auth;
+        if (e.password.length || e.clear_password || newAuth !== old.auth
+            || (e.key && e.key !== (old.key || ""))) changed.push(e.host);
+      }
+      credMsg([
+        credNoteHtml("已保存" + (changed.length
+          ? "：" + AD.esc(changed.join("、")) : "（各行的值都没有变化）")
+          + "。" + AD.esc(data.persist || ""), "ok"),
+        /* ★ warning 必须显示：例如"配了密码登录但还没填密码"
+           —— 不显示的话用户要到每次查询认证失败时才知道 */
+        data.warning ? credNoteHtml(AD.esc(data.warning), "warn") : ""
+      ]);
+      if (data.credentials && data.credentials.length) renderCreds(data.credentials);
+      else load();
+    }).catch(function () {
+      clearPwdInputs();
+      if (btn) { btn.disabled = false; btn.innerHTML = label; }
+      credMsg([credNoteHtml("保存失败：请求本身出错（服务没起来或网络断了）。", "warn")]);
+    });
+  }
+
+  if ($("saveCreds")) $("saveCreds").onclick = submitCreds;
+  /* 这里**不预先渲染**：服务端已经放好了骨架 + "载入中…"，
+     取数结果一到（load() 里）再决定是"每台主机一行"还是"取不到"。 */
 
   load();
 });

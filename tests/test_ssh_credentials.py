@@ -424,3 +424,26 @@ def test_warning_when_password_mode_has_no_password(settings_client):
     r = _save(client, [{"host": "db-01", "auth": "password"}])
     assert r.status_code == 200
     assert "warning" in r.json() and "db-01" in r.json()["warning"]
+
+
+def test_validation_errors_do_not_echo_the_password(settings_client):
+    """★ 422 里也不能回显密码。
+
+    FastAPI 默认会把**校验失败的那个值**放进 `detail[].input` ——
+    前端可以"不复述 input"，但 HTTP 响应体本身仍然带着密码：
+    devtools、反向代理日志、前端错误上报全都看得到。
+    所以脱敏必须做在服务端（`app/main.py` 的异常处理器）。
+
+    触发方式：密码超过字段上限（500）—— 这正是最容易真实发生的一种
+    （粘贴错了一长串东西进去）。
+    """
+    client, _m, _tmp = settings_client
+    long_pw = "TOPSECRET-" + "x" * 600
+    r = _save(client, [{"host": "db-01", "auth": "password", "password": long_pw}])
+    assert r.status_code == 422
+    assert "TOPSECRET" not in r.text, "422 把密码原样回显了"
+    # 其余结构保持 FastAPI 原样（只抹掉密钥类字段的 input）
+    detail = r.json()["detail"][0]
+    assert detail["type"] == "string_too_long"
+    assert detail["input"] == "[已隐去]"
+    assert "ctx" in detail and detail["loc"][-1] == "password"

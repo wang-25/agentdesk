@@ -186,7 +186,7 @@ code,.mono{font-family:var(--mono);font-size:.92em;background:var(--bg);
 /* ---------- 表单 ---------- */
 label.f{display:block;font-size:var(--fs-xs);color:var(--text-3);
   margin:0 0 var(--s2);font-weight:560}
-textarea,select,input[type=text],input[type=number]{width:100%;font:inherit;
+textarea,select,input[type=text],input[type=number],input[type=password]{width:100%;font:inherit;
   color:var(--text);background:var(--surface);border:1px solid var(--border-strong);
   border-radius:var(--r-ctl);padding:10px 12px;transition:.14s}
 textarea{resize:vertical;min-height:104px;line-height:1.6}

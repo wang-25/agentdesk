@@ -117,7 +117,15 @@ def test_two_real_processes_cannot_both_consume_the_same_ticket(tmp_path, store)
 
     procs = [subprocess.Popen([sys.executable, "-c", code],
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                              text=True, cwd=str(PROJECT_ROOT))
+                              # ★ 必须显式指定编码。不指定时 Windows 上父进程会用
+                              #   系统 locale（GBK）去解子进程的 UTF-8 输出 ——
+                              #   子进程一旦打印中文（拒绝原因里就有中文），
+                              #   父进程直接 UnicodeDecodeError，stdout 变成空，
+                              #   于是断言以"应当恰好一个成功，实际 ['<no stdout>']"
+                              #   这种**看不出真因**的方式失败。
+                              #   实测：带着 PYTHONIOENCODING=utf-8 跑全量时必现。
+                              text=True, encoding="utf-8", errors="replace",
+                              cwd=str(PROJECT_ROOT))
              for _ in range(2)]
     time.sleep(0.6)                    # 给两个子进程时间把状态折进内存
     go.write_text("go", encoding="utf-8")
