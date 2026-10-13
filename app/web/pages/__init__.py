@@ -17,8 +17,8 @@ import importlib
 
 # 已由 app/web 接管的页面模块（每阶段追加一个）
 IMPLEMENTED = [
-    # "home",
-    # "try_",
+    "home",
+    "try_",
     # "dashboard",
     # "settings",
     # "view",
