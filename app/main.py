@@ -636,18 +636,24 @@ def _mask_token(v: str) -> str:
     return v[:4] + "…" + v[-4:]
 
 
-def _persist_env(updates: dict) -> str:
+def _persist_env(updates: dict, remove: list = None) -> str:
     """把键值对写回项目根 .env（存在才写；先备份上一份）。
 
     返回说明字符串：写到了哪里 / 为什么没写。**只改认识的键**，
     其它行原样保留 —— .env 里还有 DEEPSEEK_API_KEY 这些不能碰的东西。
+
+    `remove`：这些键**整行删掉**（不是置空）。用于"删掉一台主机"时
+    清理它的凭据 —— 置空会在 .env 里留下一串孤儿键名，
+    下次有人看到 `OPS_SSH_PASSWORD_B64_CACHE_01=` 还得猜它是什么。
     """
     env_path = PROJECT_ROOT / ".env"
     if not env_path.exists():
         return "项目根目录没有 .env，改动只在本次运行内生效（重启后还原）"
     text = env_path.read_text(encoding="utf-8")
     (env_path.parent / ".env.bak.settings").write_text(text, encoding="utf-8")
-    lines_out = text.splitlines()
+    drop = set(remove or [])
+    lines_out = [ln for ln in text.splitlines()
+                 if not any(ln.startswith(k + "=") for k in drop)]
     for k, v in updates.items():
         hit = False
         for i, ln in enumerate(lines_out):
@@ -828,6 +834,9 @@ class SettingsOpsRequest(BaseModel):
     credentials: list[SSHCredentialIn] = Field(
         default_factory=list,
         description="每台主机各自的凭据；不传就沿用全局 key 与之前保存的密码")
+    remove_hosts: list[str] = Field(
+        default_factory=list,
+        description="要删掉的主机名：清理它的凭据并（由调用方）从目标/清单里去掉")
 
 
 def _persist_credential(host: str, cred: "SSHCredentialIn") -> dict:
@@ -899,6 +908,28 @@ def settings_ops(req: SettingsOpsRequest):
         cred_updates.update(got.pop("updates", {}))
         cred_feedback.append(got)
 
+    # 删掉的主机：清理它的凭据变量。**整行删掉**（见 _persist_env 的说明），
+    # 否则 .env 里会留下一串孤儿键名，下次看到还得猜它是什么。
+    remove_keys: list = []
+    removed: list = []
+    for host in req.remove_hosts:
+        host = (host or "").strip()
+        if not host:
+            continue
+        # ★ fail-loud：既说"删掉它"又把它留在目标/清单里，是自相矛盾的请求。
+        #   放过去的结果是"凭据没了但还在清单里"，下次查询才报认证失败。
+        if host in targets or host in [h.strip() for h in (req.hosts or "").split(",")
+                                       if h.strip()]:
+            raise HTTPException(400, detail=(
+                f"{host} 既要删掉、又还在目标或清单里 —— 请二选一。"
+                f"（先从 targets/hosts 里去掉，再在 remove_hosts 里带上它）"))
+        suffix = _ops._cred_suffix(host)
+        for field in ("AUTH", "KEY", "PASSWORD", "PASSWORD_B64"):
+            key = f"OPS_SSH_{field}_{suffix}"
+            remove_keys.append(key)
+            os.environ.pop(key, None)
+        removed.append(host)
+
     _ops.BACKEND = backend
     _ops.SSH_TARGETS = targets
     _ops.SSH_KEY = (req.key or "").strip()
@@ -922,13 +953,15 @@ def settings_ops(req: SettingsOpsRequest):
         "OPS_SSH_KEY": _ops.SSH_KEY,
         **({"OPS_HOSTS": hosts_env} if hosts_env else {"OPS_HOSTS": ""}),
         **cred_updates,
-    })
+    }, remove=remove_keys)
     resp = {"ok": True, "backend": backend,
             "known_hosts": list(_ops.KNOWN_HOSTS), "persist": persisted}
     if cred_feedback:
         # ★ 回执里只有"这台主机用什么登录、密钥/密码是否已配置"，
         #   **永远没有密码本身**（见 _persist_credential 的三条纪律）
         resp["credentials"] = _credentials_view()
+    if removed:
+        resp["removed"] = removed
     # ★ 实测踩过的坑（2026-09-30）：key 留空保存后，ssh 每次查询都
     #   Permission denied，而 responses 里只有 ok=true —— 用户要到
     #   前端查不出数据才回头找原因。不阻止（有人的 ssh 靠默认路径/

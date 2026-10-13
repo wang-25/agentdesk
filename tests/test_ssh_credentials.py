@@ -591,3 +591,89 @@ def test_ssh_test_endpoint_does_not_persist_anything(settings_client, monkeypatc
     assert (tmp / ".env").read_text(encoding="utf-8") == before
     assert ops.credentials_for("db-01")["password"] == "", \
         "测试不该把密码留在内存里的凭据表里"
+
+
+# ============================================================
+# 六、增删主机（用户的抱怨：只有一台主机，却显示三行）
+# ============================================================
+# 背景：凭据卡把两类名字混在一起显示了 ——
+#   · `OPS_SSH_TARGETS`  能连的（有地址）
+#   · `OPS_HOSTS`        资产清单里的名字（让 Agent 知道队里有哪几台，
+#                        否则问"db-01 也慢吗"时它会把 db-01 当不存在而丢掉）
+# 所以视图里必须能区分：`target` 为 None 就是"只在清单里"。
+def test_credential_view_distinguishes_connectable_from_inventory(settings_client):
+    client, _m, _tmp = settings_client
+    rows = {r["host"]: r for r in client.get("/settings/api").json()["ops"]["credentials"]}
+    assert rows["web-01"]["target"] is not None, "配了目标的是可连接的"
+    assert rows["db-01"]["target"] is not None
+    # 清单里多一个没有目标的名字
+    client.post("/settings/ops", json={
+        "backend": "ssh", "targets": "web-01=root@1.1.1.1:22,db-01=ops@1.1.1.2:22",
+        "key": "", "hosts": "web-01,db-01,cache-01", "credentials": []})
+    rows = {r["host"]: r for r in client.get("/settings/api").json()["ops"]["credentials"]}
+    assert rows["cache-01"]["target"] is None, "只在清单里的必须 target=None，UI 靠它分组"
+
+
+def test_removing_a_host_deletes_its_credential_lines(settings_client):
+    """★ 删除要**整行删掉**，不是置空。
+
+    置空会在 .env 里留下一串孤儿键名（`OPS_SSH_PASSWORD_B64_CACHE_01=`），
+    下次有人看到还得猜它是什么。
+    """
+    client, _m, tmp = settings_client
+    _save(client, [{"host": "db-01", "auth": "password", "password": "bye"}])
+    env = (tmp / ".env").read_text(encoding="utf-8")
+    assert "DB_01" in env, "先确认凭据确实写进去了"
+
+    r = client.post("/settings/ops", json={
+        "backend": "ssh", "targets": "web-01=root@1.1.1.1:22",
+        "key": "", "hosts": "web-01", "credentials": [], "remove_hosts": ["db-01"]})
+    assert r.status_code == 200, r.text
+    assert r.json()["removed"] == ["db-01"]
+
+    env = (tmp / ".env").read_text(encoding="utf-8")
+    assert "DB_01" not in env, "被删主机的凭据行必须整行消失"
+    assert ops.credentials_for("db-01")["password"] == "", "内存里也要清掉"
+
+
+def test_removing_a_host_keeps_unrelated_env_lines(settings_client):
+    """★ 只碰认识的键：.env 里还有 DEEPSEEK_API_KEY 这类不能动的东西。"""
+    client, _m, tmp = settings_client
+    (tmp / ".env").write_text(
+        "OPS_BACKEND=ssh\nDEEPSEEK_API_KEY=sk-keep-me\n# 注释也要留住\n",
+        encoding="utf-8")
+    client.post("/settings/ops", json={
+        "backend": "ssh", "targets": "web-01=root@1.1.1.1:22", "key": "",
+        "hosts": "web-01", "credentials": [], "remove_hosts": ["db-01"]})
+    env = (tmp / ".env").read_text(encoding="utf-8")
+    assert "sk-keep-me" in env and "# 注释也要留住" in env
+
+
+def test_removing_a_host_that_is_still_a_target_is_rejected(settings_client):
+    """★ 自相矛盾要当场拒绝：又要删、又还留在 targets 里。
+
+    放过去的结果是"凭据没了但主机还在清单里"，下次查询才报认证失败 ——
+    又是一个延迟暴露的故障。
+    """
+    client, _m, _tmp = settings_client
+    r = client.post("/settings/ops", json={
+        "backend": "ssh", "targets": "db-01=ops@1.1.1.2:22", "key": "",
+        "hosts": "", "credentials": [], "remove_hosts": ["db-01"]})
+    assert r.status_code == 400
+    assert "二选一" in r.json()["detail"]
+
+
+def test_adding_a_host_with_its_own_password(settings_client):
+    """添加主机 = 把新条目拼进 targets/hosts，并可顺手带上它的凭据。"""
+    client, _m, tmp = settings_client
+    r = client.post("/settings/ops", json={
+        "backend": "ssh", "targets": "web-01=root@1.1.1.1:22,new-01=ops@1.1.1.9:2222",
+        "key": "", "hosts": "web-01,new-01",
+        "credentials": [{"host": "new-01", "auth": "password", "password": "newpw"}]})
+    assert r.status_code == 200, r.text
+    rows = {x["host"]: x for x in r.json()["credentials"]}
+    assert rows["new-01"]["target"]["port"] == 2222
+    assert rows["new-01"]["auth"] == "password" and rows["new-01"]["password_set"] is True
+    env = (tmp / ".env").read_text(encoding="utf-8")
+    assert "new-01=ops@1.1.1.9:2222" in env
+    assert "newpw" not in env, "密码仍然只以 base64 落盘"

@@ -1056,7 +1056,7 @@ document.addEventListener("DOMContentLoaded", function () {
       /* 「测试登录」：用**这一行当前填的值**试一次真登录；没有目标的行连不上，
          按钮照样渲染（停用 + title 说明原因），比"这个功能有时不存在"清楚 */
       + '<button type="button" class="btn ghost sm" id="credTest-' + i
-      + '" style="position:relative">测试登录</button>'
+      + '">测试登录</button>'
       + "</div>"
       /* 测试结果就地写在这一行（不用 alert）：内容只有 ✅/❌ + 中文原因 */
       + '<div class="hint" id="credTestStatus-' + i + '"></div>'
@@ -1113,12 +1113,13 @@ document.addEventListener("DOMContentLoaded", function () {
     var el = $("credTestStatus-" + i);
     if (!el) return;
     el.textContent = text;
+    /* 颜色走 CSS 类（`.hint.ok` / `.hint.warn`），不写内联样式 ——
+       内联样式在这个项目里是禁止的（样式只有 app.css 一处来源） */
     el.className = "hint" + (tone ? " " + tone : "");
-    el.style.color = tone === "ok" ? "var(--ok)"
-      : (tone === "warn" ? "var(--err)" : "");
   }
-  function testNote(i, text, tone) {
-    var extra = (tone === "warn") ? "\uff08已清空密码框，避免密码留在页面上\uff09" : "";
+  function testNote(i, text, tone, pwdCleared) {
+    var extra = (tone === "warn" && pwdCleared)
+      ? "\uff08你刚敲的密码已从输入框清掉，不留在页面上\uff09" : "";
     setRowTest(i, text + extra, tone);
   }
 
@@ -1159,8 +1160,7 @@ document.addEventListener("DOMContentLoaded", function () {
       var d = r.data || {};
       if (!r.ok) {
         /* 400：detail 是字符串，原样显示；422：只取 loc + msg（里面的 input 是密码） */
-        testNote(i, "\u274c " + (credErrText(d && d.detail, r.status)
-          || "接口返回 HTTP " + r.status), "warn");
+        testNote(i, "\u274c " + credErrText(d && d.detail, r.status), "warn", !!pwd);
         if (cb) cb(null);
         return;
       }
@@ -1171,7 +1171,7 @@ document.addEventListener("DOMContentLoaded", function () {
         if (cb) cb(true);
         return;
       }
-      testNote(i, "\u274c " + (d.reason || "登录失败（回执里没有原因）"), "warn");
+      testNote(i, "\u274c " + (d.reason || "登录失败（回执里没有原因）"), "warn", !!pwd);
       if (cb) cb(false);
     }).catch(function () {
       TESTING[i] = false;
