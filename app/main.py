@@ -111,6 +111,7 @@ from app.observability import langfuse_export, tracer as obs
 from app.plays import PlayError as PlayConfigError
 from app.plays import render as render_play
 from app.plays import store as plays_store
+from app import web
 
 # 配了 LANGFUSE_* 环境变量才生效；没配就是本地记录模式，功能不受影响
 langfuse_export.install()
@@ -139,6 +140,19 @@ app = FastAPI(
 # 公网安全层：token 鉴权 + 限流 + 每日额度。
 # AUTH_ENABLED=0（默认）时完全放行，本地开发行为不变。
 security.install_security(app)
+
+# ============================================================
+# UI 层（app/web/）：设计系统 + 统一外壳 + 各页面
+# ============================================================
+# ★ 为什么把 UI 拆出去：这里曾经有 **49% 的代码是 UI**（1475 / 3039 行），
+#   5 个页面各自带一份重复的 <style>，改一处颜色要翻 3000 行、翻 5 个地方，
+#   于是必然漂移（原界面里卡片与提示条的圆角就是不一致的）。
+#   现在版式只有 app/web/layout.py 一处、样式只有 static/app.css 一处。
+#
+# ★ 阶段式接管（见 app/web/pages/__init__.py 的 IMPLEMENTED）：
+#   已被接管的页面走新外壳，未接管的继续用本文件里的旧实现 ——
+#   所以阶段之间服务始终可用，不会出现"改到一半打不开"。
+_WEB = web.mount(app)
 
 # ============================================================
 # 可观测：日志格式 + 请求 ID + HTTP 指标（M4）
