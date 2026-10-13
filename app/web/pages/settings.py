@@ -466,12 +466,38 @@ def _credentials_card() -> str:
       （"保存一次就丢密码"是最容易让人放弃这个功能的那种 bug）
     · **要清空必须显式说**：勾「清除密码」→ `clear_password: true`
 
+    【★ 两类主机分开显示 —— 这是这张卡最重要的一次修正】
+    `.env` 里有**两份不是一回事**的东西（`app/tools/ops.py` 的 `_resolve_hosts`
+    有完整说明）：
+        · `OPS_SSH_TARGETS=web-01=root@1.1.1.1` → 真能连的（1 台）
+        · `OPS_HOSTS=web-01,db-01,cache-01` → **资产清单**：只是让 Agent 知道
+          "队里有哪几台机器"，否则问"db-01 也慢吗"时它会把 db-01 当不存在的名字丢掉
+    旧版把两者混成一列显示，于是"我只有一台主机，为什么有 3 个配置"——
+    对**凭据**而言这是误导：清单里的名字没有地址、连不上、也没有凭据可配。
+
+    所以本卡按接口给的 `target` 分组（**只看这个字段**，不靠名字/地址猜）：
+        · `target != null` → 「可连接的主机」：认证方式 / 私钥路径 / 密码 /
+          测试登录 / 状态，每行多一个「移除」
+        · `target == null` → 「只在清单里的名字（不可连接）」：折叠在
+          `<details class="acc">` 里，每行两个动作 —— 「配置目标」（把名字预填进
+          下面的「添加主机」表单）与「移出清单」（从 `OPS_HOSTS` 去掉）
+
     【没有目标的行】
     `target` 为 null = 这台主机在清单里但没有 SSH 目标（连不上）。
-    那一行的控件整行停用、并打「尚未配置目标」徽标：它不参与保存
-    （提交时该行留空 = 服务端语义的"不改这项"，不会把它已有的密码弄丢）。
-    它同时**也不能测**（没有地址就没得连）—— 所以那一行的「测试登录」按钮是灰的，
-    并把原因写在 title 里，而不是"点了没反应"。
+    它**不参与凭据保存**（提交时它的那一项留空 = 服务端语义的"不改这项"，
+    不会把它已有的密码弄丢），也**不能测**（没有地址就没得连）。
+    它现在的形态是折叠组里的两行文字 + 两个按钮，不再是"一整行停用的输入框"——
+    那种形态正是"我为什么会有 3 个配置"的来源。
+
+    【增删一台主机 = 合并 targets/hosts + （删的时候）remove_hosts】
+    服务端 `POST /settings/ops` 的 `targets` / `hosts` 是**全量替换**，而且
+    `remove_hosts` 是 **fail-loud** 的：要删的名字如果还留在 `targets` 或
+    `hosts` 里，直接 400。所以前端必须先算好再提交：
+        · 添加 = 现有 targets 条目 + `名=user@地址[:端口]`，hosts = 现有名单 ∪ {名}
+        · 移除 = targets 去掉它、hosts 去掉它、`remove_hosts:[名]`（三者一致）
+        · 移出清单 = 只从 hosts 去掉它（targets 不动），并清掉它可能残留的凭据行
+    两个动作都走**与保存凭据同一套确认条**（`#credConfirm`）：本地校验 → 确认条
+    列出将要变成什么 → 确认后才发那一个请求。
 
     【两件让"提交成功 ≠ 登得上"这件事可见的东西】
     · 每行一个「测试登录」：用**这一行当前输入的值**试一次真登录（`POST /settings/ssh/test`），
@@ -492,6 +518,39 @@ def _credentials_card() -> str:
         + '<div class="btnrow">'
         + button("保存全部凭据", size="sm", attrs='id="saveCreds"')
         + "</div>"
+        # 「添加主机」= 把 名=user@地址[:端口] 合并进 targets 与 hosts，再走保存。
+        # ★ 这张表单是**空的**，所以服务端渲染它不涉及任何密钥（密码框永远没有 value）。
+        + '<details class="acc" id="addHostWrap">'
+        + "<summary>添加主机（主机名 + user@地址[:端口]）</summary>"
+        + '<p class="hint">点「添加主机」不会立刻写盘：先出下面的确认条，'
+          "确认后才与保存凭据走同一个请求。名字会同时进 "
+          "<code>OPS_SSH_TARGETS</code>（能连）与 <code>OPS_HOSTS</code>"
+          "（Agent 知道队里有这几台）。</p>"
+        + '<div class="field"><label class="f" for="newHost">主机名</label>'
+          '<input type="text" id="newHost" class="mono" autocomplete="off" '
+          'placeholder="web-01（字母 / 数字 / 点 / 连字符，最长 64）" '
+          'aria-label="新主机名"></div>'
+        + '<div class="grid c2">'
+        + '<div><label class="f" for="newTarget">目标（user@地址[:端口]）</label>'
+          '<input type="text" id="newTarget" class="mono" autocomplete="off" '
+          'placeholder="root@192.168.1.10:22" aria-label="新主机目标"></div>'
+        + '<div><label class="f" for="newAuth">认证方式（可选）</label>'
+          '<select id="newAuth" aria-label="新主机认证方式">'
+          '<option value="key">私钥</option>'
+          '<option value="password">密码</option></select></div>'
+        + '<div><label class="f" for="newKey">私钥路径（可选）</label>'
+          '<input type="text" id="newKey" class="mono" autocomplete="off" '
+          'placeholder="留空 = 用全局私钥路径" aria-label="新主机私钥路径"></div>'
+        + '<div><label class="f" for="newPwd">密码（可选，只写不读）</label>'
+          '<input type="password" id="newPwd" class="mono" '
+          'autocomplete="new-password" placeholder="留空 = 不设置" '
+          'aria-label="新主机密码"></div>'
+        + "</div>"
+        + '<div class="btnrow">'
+        + button("添加主机", size="sm", attrs='id="addHost"')
+        + "</div>"
+        + '<div class="hint" id="addMsg"></div>'
+        + "</details>"
         + '<div id="credConfirm" class="card tight" hidden></div>'
         + '<div id="credMsg"></div>'
         + note("三件事写在这里，因为弄错任何一件都会让人再也不敢用这个功能："
@@ -499,19 +558,28 @@ def _credentials_card() -> str:
                "<b>留空 = 不修改</b>（只改私钥路径不会把已保存的密码弄丢）；"
                "<b>清空要显式勾</b>「清除密码」。编辑框里的私钥是<b>路径</b>"
                "（文件在哪儿），不是密钥内容。")
-        + note("这一栏的按钮把<b>所有行</b>一起提交，但没动过的行保持原值；"
-               "带「尚未配置目标」徽标的主机连不上，也不参与保存 —— "
-               "要让它能连，先去「工具层数据源」里给它配 "
-               "<code>名=user@地址[:端口]</code>。", "warn")
+        + note("<b>两类主机不要混在一起看</b>：上面「可连接的主机」来自 "
+               "<code>OPS_SSH_TARGETS</code>，有地址、能连、凭据归它们；"
+               "折叠的「只在清单里的名字」来自 <code>OPS_HOSTS</code>，"
+               "<b>只影响 Agent 怎么描述环境</b>（问「db-01 也慢吗」时不会被当成"
+               "不存在的名字丢掉），它们<b>没有地址所以连不上，也不参与凭据保存</b>。"
+               "要让清单里的一个名字变成能连的，点它的「配置目标」补上 "
+               "<code>user@地址[:端口]</code>。", "warn")
         + note("每行的<b>「测试登录」</b>用你<b>当前填的值</b>试一次真登录"
                "（只读一条 <code>hostname</code>，不改任何配置、不落盘）："
                "填完先测、通了再保存，就不必等到某天认证失败才发现配错了。"
                "框里<b>留空 = 用这台主机已保存的那一项</b>，所以「存了但不确定」"
-               "也可以直接测。<b>保存会先列一份「将要改动」让你确认</b>，"
-               "确认后保存，并把所有能连的主机各测一遍。")
+               "也可以直接测。<b>保存 / 添加 / 移除都会先出确认条</b>"
+               "（移除的那条会说清删掉什么），确认后保存，并把所有能连的主机各测一遍。")
+        + note("「移除」删的是一台主机的<b>全部三样东西</b>：SSH 目标、主机清单条目、"
+               "以及已保存的私钥路径与密码 —— 服务端把 <code>.env</code> 里对应那几行"
+               "<b>整行删掉</b>（原文件先备份）。「移出清单」只从 "
+               "<code>OPS_HOSTS</code> 去掉名字，不动 SSH 目标。", "warn")
     )
     return card(body, title="SSH 登录（每台主机一份凭据）",
-                desc="数据源 /settings/api 的 ops.credentials")
+                desc="可连接的（配了地址、有凭据）与只在清单里的名字"
+                     "（只影响 Agent 怎么描述环境，没有地址、连不上、不参与保存）"
+                     "分开显示 · 数据源 /settings/api 的 ops.credentials")
 
 
 def _footer_details() -> str:
@@ -833,9 +901,13 @@ document.addEventListener("DOMContentLoaded", function () {
   //    不取 auth.token、不取 auth.token_masked。
   //    ops.key 是私钥**路径**（不是密钥内容），凭据卡要原样回传它 ——
   //    见上方「密码只写不读」那一段。
-  function load() {
+  function load(afterSettings) {
     var h = headers();
     var secOk = false;
+    /* 取数完成之后要接着做的事（添加/移除主机成功后要"重渲染 + 就地测新主机"）：
+       走回调而不是自己去拼 DOM —— 结构变了就**重新取一次接口**，
+       免得页面上留着两份互相矛盾的 targets/hosts。 */
+    function finish() { if (afterSettings) afterSettings(); }
 
     fetchJson("/settings/api", { headers: h }).then(function (r) {
       if (!r.ok) {
@@ -848,15 +920,19 @@ document.addEventListener("DOMContentLoaded", function () {
         }
         renderOps(null);
         renderCreds(null);
+        finish();
         return;
       }
       secOk = true;
       var ops = r.data.ops || {};
-      /* ★ 凭据卡的请求体要**原样**带上这四个字段：POST /settings/ops 的语义是
+      /* ★ 凭据卡的请求体要**原样**带上这几个字段：POST /settings/ops 的语义是
          "没给的字段 = 空值"，少带一个就会把用户配好的目标 / 全局私钥 / 清单冲掉。
-         所以这里存一份快照 —— 它只用于回传，界面不显示、也不允许在这里编辑。 */
+         所以这里存一份快照 —— 它只用于回传与"增删前后的对账"，界面不显示它。
+         `known_hosts` 是**服务端解析后的名单**：`OPS_HOSTS` 为空时它是
+         "目标名 / 默认三台"，移除一个名字要用它兜底（否则删除会被静默吞掉）。 */
       OPS = { backend: ops.backend, targets_raw: ops.targets_raw,
-              key: ops.key, hosts_env: ops.hosts_env };
+              key: ops.key, hosts_env: ops.hosts_env,
+              known_hosts: ops.known_hosts || [] };
       renderCreds(ops.credentials);
       renderOps({
         backend: ops.backend,
@@ -874,10 +950,12 @@ document.addEventListener("DOMContentLoaded", function () {
       }
       setText("persist", "持久化位置：" + (r.data.env_file || DASH) +
         " · 每次修改前把上一份备份为 .env.bak.settings");
+      finish();
     }).catch(function () {
       note("err", "取配置失败：请求本身出错（服务没起来或网络断了）。", "warn");
       renderOps(null);
       renderCreds(null);
+      finish();
     });
 
     fetchJson("/health", { headers: h }).then(function (r) {
@@ -1025,7 +1103,9 @@ document.addEventListener("DOMContentLoaded", function () {
   }
 
   /* 一行的**结构**（服务端渲染不出来：行的内容只有接口知道）
-     版式：主机名 + 目标 / 认证方式 | 私钥路径 / 密码（两列，窄屏自动堆叠） */
+     版式：主机名 + 目标 / 认证方式 | 私钥路径 / 密码（两列，窄屏自动堆叠）
+     ★ 只有 `target != null` 的行走这里 —— 也就是"能连的"那一组。
+       每行末尾多一个「移除」（走确认条，见 askRemove）。 */
   function credRowHtml(c, i) {
     var tt = targetText(c.target);
     return '<div class="field" id="credRow-' + i + '">'
@@ -1053,49 +1133,55 @@ document.addEventListener("DOMContentLoaded", function () {
          ? '<label class="switch"><input type="checkbox" id="credClear-' + i
            + '"> 清除密码</label>'
          : "")
-      /* 「测试登录」：用**这一行当前填的值**试一次真登录；没有目标的行连不上，
-         按钮照样渲染（停用 + title 说明原因），比"这个功能有时不存在"清楚 */
+      /* 「测试登录」：用**这一行当前填的值**试一次真登录（只读一条 hostname） */
       + '<button type="button" class="btn ghost sm" id="credTest-' + i
       + '">测试登录</button>'
+      /* 「移除」：删掉它的目标 / 清单条目 / 已保存的私钥与密码。
+         `data-credact` 而不是新类名 —— 样式只有 app.css 一处来源，
+         新增类名要连带新增 CSS，这里用数据属性把"动作"和"样式"分开。 */
+      + '<button type="button" class="btn ghost sm" data-credact="remove" '
+      + 'data-i="' + i + '">移除</button>'
       + "</div>"
       /* 测试结果就地写在这一行（不用 alert）：内容只有 ✅/❌ + 中文原因 */
       + '<div class="hint" id="credTestStatus-' + i + '"></div>'
       + "</div></div></div>";
   }
 
+  /* `target == null` 的行（只在清单里的名字）的**结构**：
+     它没有地址、连不上、也不参与凭据保存 —— 所以**不给**输入框，
+     只给两个动作：「配置目标」（把名字预填进下面的添加表单）与「移出清单」。 */
+  function nameRowHtml(c, i) {
+    return '<div class="field" id="credRow-' + i + '" data-notarget="1">'
+      + '<label class="f">' + AD.esc(c.host) + " "
+      + badgeHtml("只在清单里", "neutral") + "</label>"
+      + '<div class="btnrow">'
+      + '<button type="button" class="btn ghost sm" data-credact="config" '
+      + 'data-i="' + i + '">配置目标</button>'
+      + '<button type="button" class="btn ghost sm" data-credact="unlist" '
+      + 'data-i="' + i + '">移出清单</button>'
+      + "</div></div>";
+  }
+
   /* 认证方式切换：选「密码」时私钥框禁用但**保留值**（切回来还在，别清空） */
   function toggleCredAuth(i) {
     var row = $("credRow-" + i), sel = $("credAuth-" + i), keyEl = $("credKey-" + i);
     if (!row || !sel || !keyEl) return;
-    if (row.getAttribute("data-notarget") === "1") return;   /* 整行已停用 */
+    if (row.getAttribute("data-notarget") === "1") return;   /* 折叠组不是这种行 */
     keyEl.disabled = (sel.value !== "key");
   }
 
-  /* 逐行**填值**：值只走 .value（密钥类字段绝不进 innerHTML） */
+  /* 逐行**填值**：值只走 .value（密钥类字段绝不进 innerHTML）。
+     ★ 只对「可连接的主机」调用 —— 没有目标的行不在这里，它走 `nameRowHtml`
+       （两行文字 + 两个按钮，没有输入框，也就没有"整行停用的表单"那种误导）。 */
   function fillCredRow(c, i) {
     var row = $("credRow-" + i), sel = $("credAuth-" + i);
     var keyEl = $("credKey-" + i), pwdEl = $("credPwd-" + i);
     var clr = $("credClear-" + i);
-    var noTarget = !c.target;
-    if (row) row.setAttribute("data-notarget", noTarget ? "1" : "0");
+    if (row) row.setAttribute("data-notarget", "0");
     if (sel) sel.value = (c.auth === "password") ? "password" : "key";
     if (keyEl) keyEl.value = c.key || "";   /* 路径：可以显示 */
     if (pwdEl) pwdEl.value = "";            /* ★ 密码：永远是空的 */
     if (clr) clr.checked = false;           /* 清除是"这一次的动作"，不是状态 */
-    if (noTarget) {
-      var ctrls = row ? row.querySelectorAll("select,input") : [];
-      for (var k = 0; k < ctrls.length; k++) ctrls[k].disabled = true;
-      /* 没有目标就没得连：测试按钮也停用，并把**原因**写在 title 上
-         （灰按钮 + 有理由，胜过"点了没反应"） */
-      var tb = $("credTest-" + i);
-      if (tb) {
-        tb.disabled = true;
-        tb.title = "这台主机还没有 SSH 目标，没有地址可连 —— "
-          + "先去「工具层数据源」配 名=user@地址[:端口]";
-      }
-      setRowTest(i, "\u25b8 没有 SSH 目标 —— 不能测（不参与保存）", "");
-      return;
-    }
     toggleCredAuth(i);
   }
 
@@ -1196,31 +1282,68 @@ document.addEventListener("DOMContentLoaded", function () {
     }
     CREDS = list;
     PENDING_BASE = list.slice();   /* 确认条的比对基准：就是这一次渲染用的视图 */
-    var pwdN = 0, noT = 0, i;
-    for (i = 0; i < CREDS.length; i++) {
-      if (CREDS[i].password_set) pwdN++;
-      if (!CREDS[i].target) noT++;
-    }
+    var pwdN = 0, i;
+    var groups = splitGroups();
+    var connN = groups.conn.length, nameN = groups.names.length;
+    for (i = 0; i < CREDS.length; i++) if (CREDS[i].password_set) pwdN++;
+    /* ★ 统计分开说：混在一起正是"我只有一台主机，为什么有 3 个配置"的来源 */
     setText("k-creds", CREDS.length
-      ? CREDS.length + " 台 · " + pwdN + " 台用密码" : "没有主机");
-    setText("credSummary", "共 " + CREDS.length + " 台主机 · 密码已设置 " + pwdN + " 台"
-      + (noT ? " · " + noT + " 台尚未配置目标（不参与保存）" : ""));
+      ? "可连 " + connN + " 台 · 名单 " + nameN + " 个" : "没有主机");
+    setText("credSummary", "可连接 " + connN + " 台"
+      + (connN ? "（" + pwdN + " 台用密码）" : "")
+      + (nameN ? " · 清单里另有 " + nameN + " 个名字（未配地址，不参与保存）" : ""));
     if (!CREDS.length) {
       box.innerHTML = AD.empty("没有主机",
-        "先在「工具层数据源」里配 SSH 目标或主机清单，再回来配凭据");
+        "用下面的「添加主机」配一台：名字 + user@地址[:端口]");
       if ($("saveCreds")) $("saveCreds").disabled = true;
       return;
     }
     var html = "";
-    for (i = 0; i < CREDS.length; i++) html += credRowHtml(CREDS[i], i);
+    if (connN) {
+      for (i = 0; i < groups.conn.length; i++) {
+        html += credRowHtml(CREDS[groups.conn[i]], groups.conn[i]);
+      }
+    } else {
+      html += AD.empty("没有可连接的主机",
+        "下面清单里的名字都没有地址 —— 用「添加主机」补一个 user@地址[:端口]");
+    }
+    if (nameN) {
+      /* 折叠组：默认收起。说明必须写清"这些名字**不是**凭据" —— 这句话就是
+         用户看到 3 行时缺的那句解释 */
+      html += '<details class="acc"><summary>只在清单里的名字（不可连接）· '
+        + nameN + " 个</summary>"
+        + '<p class="hint">这些名字只影响 <b>Agent 知道队里有哪几台机器</b>'
+        + "（问「db-01 也慢吗」时它不会被当成不存在的名字丢掉）；"
+        + "它们<b>没有地址，所以连不上、也不参与凭据保存</b>。"
+        + "「配置目标」会把名字预填进下面的添加表单，补上 "
+        + "<code>user@地址[:端口]</code> 后它就变成上面那组能连的主机。</p>";
+      for (i = 0; i < groups.names.length; i++) {
+        html += nameRowHtml(CREDS[groups.names[i]], groups.names[i]);
+      }
+      html += "</details>";
+    }
     box.innerHTML = html;
     for (i = 0; i < CREDS.length; i++) {
-      fillCredRow(CREDS[i], i);
+      /* 折叠组没有输入框要填值，但**每一行都要绑动作按钮** ——
+         「配置目标 / 移出清单」就在折叠组里，漏绑的话按钮点了没反应 */
+      if (CREDS[i].target) fillCredRow(CREDS[i], i);
       bindCredRow(i);
     }
     /* 一行都连不上的时候，这个按钮什么也做不了 */
-    if ($("saveCreds")) $("saveCreds").disabled = (noT === CREDS.length);
+    if ($("saveCreds")) $("saveCreds").disabled = (connN === 0);
   }
+
+  /* 「可连接」与「只在清单里」的分组：**只看接口给的 `target`**。
+     不看名字、不看有没有私钥/密码 —— 服务端就是这么分的
+     （`_credentials_view`：`target` 为 null 就是"清单里但连不上"）。 */
+  function splitGroups() {
+    var conn = [], names = [], i;
+    for (i = 0; i < CREDS.length; i++) {
+      if (CREDS[i].target) conn.push(i); else names.push(i);
+    }
+    return { conn: conn, names: names };
+  }
+
   function bindCredRow(i) {
     var sel = $("credAuth-" + i);
     if (sel) sel.onchange = function () { toggleCredAuth(i); };
@@ -1230,6 +1353,26 @@ document.addEventListener("DOMContentLoaded", function () {
       /* 确认条显示时、或保存+连测期间：不许再点（点两次会打两次 SSH 连接） */
       if (PENDING || SAVING) tb.disabled = true;
     }
+    /* 行内动作按钮（移除 / 配置目标 / 移出清单）：用 data 属性认动作，
+       不新增类名（样式只有 app.css 一处来源，见文件头纪律） */
+    var row = $("credRow-" + i);
+    if (!row) return;
+    var acts = row.querySelectorAll("[data-credact]");
+    for (var k = 0; k < acts.length; k++) {
+      bindCredAction(acts[k]);
+    }
+  }
+
+  function bindCredAction(btn) {
+    var act = btn.getAttribute("data-credact");
+    var i = parseInt(btn.getAttribute("data-i"), 10);
+    btn.setAttribute("data-label", btn.innerHTML);
+    btn.onclick = function () {
+      if (SAVING || PENDING) return;          /* 确认条在 / 正在提交：一律不接新动作 */
+      if (act === "remove") askRemove(i);
+      else if (act === "unlist") askUnlist(i);
+      else if (act === "config") prefillAdd(i);
+    };
   }
 
   /* 收集请求体里的 credentials：**只读 DOM 的值**，不做任何猜测 */
@@ -1261,12 +1404,16 @@ document.addEventListener("DOMContentLoaded", function () {
     return out;
   }
 
-  /* 提交后立刻清空所有密码框：只在 placeholder 里留状态 */
+  /* 提交后立刻清空所有密码框：只在 placeholder 里留状态。
+     ★ 含「添加主机」表单里的那个密码框 —— 它同样是"用户刚敲的一次性值" */
   function clearPwdInputs() {
-    for (var i = 0; i < CREDS.length; i++) {
-      var el = $("credPwd-" + i);
+    var i, el;
+    for (i = 0; i < CREDS.length; i++) {
+      el = $("credPwd-" + i);
       if (el) el.value = "";
     }
+    el = $("newPwd");
+    if (el) el.value = "";
   }
 
   /* 失败信息：400 是 detail 字符串；422 的 detail 是列表，**只取 loc + msg**。
@@ -1328,14 +1475,23 @@ document.addEventListener("DOMContentLoaded", function () {
       if (!e.host) continue;
       var oldC = prevCreds(e.host);
       if (!oldC) continue;                       /* 接口没给过的行：无可比对 */
-      if (!oldC.target) {                        /* 没有目标的行 = "不改这项" */
-        out.push({ host: e.host, items: ["没有 SSH 目标：这一行不参与保存"] });
-        continue;
-      }
+      /* ★ 只在清单里的名字（target 为 null）：整项留空 = "不改这项"，
+         它**不是一条改动** —— 列进"将要改动"会让人以为保存动了 3 台主机 */
+      if (!oldC.target) continue;
       var items = credChangeItems(e, oldC);
       if (items.length) out.push({ host: e.host, items: items });
     }
     return out;
+  }
+  /* 这一次提交里"不参与保存"的名字有几个（只在清单里、没有地址的那些）——
+     确认条用它把那句"另有 N 个名字不参与保存"说清楚。 */
+  function credsSkipped(creds) {
+    var n = 0, i;
+    for (i = 0; i < creds.length; i++) {
+      var oldC = prevCreds(creds[i].host);
+      if (oldC && !oldC.target) n++;
+    }
+    return n;
   }
   /* 保存成功之后把基准推进一步（**不再取一次接口**）：否则下一次确认条会拿
      "上一次进页面时"的旧值比对，把已经保存过的改动又列一遍 ——
@@ -1361,30 +1517,301 @@ document.addEventListener("DOMContentLoaded", function () {
       if (tb && !tb.title) tb.disabled = !on;    /* 没有目标的行保持停用 */
     }
   }
+  /* 「保存全部凭据」/「添加主机」/ 每行的「移除·配置目标·移出清单」：
+     确认条显示时、提交期间一律停用（同一次改动不许被点两遍）。
+     `busy` 给出"正在提交的那个按钮"，它单独显示转圈（`.btn > .spin` 有居中样式）。 */
+  function setActionButtons(on, busy) {
+    var list = [], b, i;
+    var ids = ["saveCreds", "addHost"];
+    for (i = 0; i < ids.length; i++) {
+      b = $(ids[i]);
+      if (b) list.push(b);
+    }
+    var acts = document.querySelectorAll("[data-credact]");
+    for (i = 0; i < acts.length; i++) list.push(acts[i]);
+    for (i = 0; i < list.length; i++) {
+      b = list[i];
+      b.disabled = !on;
+      if (b === busy) b.innerHTML = '<span class="spin"></span> 保存中…';
+      else if (b.getAttribute("data-label")) b.innerHTML = b.getAttribute("data-label");
+    }
+  }
   function hideConfirm() {
     var box = $("credConfirm");
     if (box) { box.hidden = true; box.innerHTML = ""; }
     PENDING = null;
     enableTestButtons(true);
+    setActionButtons(true, null);
   }
 
-  function showConfirm(creds) {
+  /* ============================================================
+     增删主机：targets / hosts 的**合并与对账**
+     ------------------------------------------------------------
+     `POST /settings/ops` 的 `targets` / `hosts` 是**全量替换**，
+     而 `remove_hosts` 是 **fail-loud** 的：要删的名字只要还留在 targets 或
+     hosts 里，服务端直接 400（"既要删掉、又还在目标或清单里"）。
+     所以下面这几个函数是唯一的"算请求体"的地方 —— 确认条显示什么，
+     提交的就是什么（同一份数据，不重新算第二遍）。
+     ============================================================ */
+  /* `web-01=root@1.1.1.1:22,db-01=ops@10.0.0.9` → [{name, spec}] */
+  function targetEntries() {
+    var raw = (OPS && OPS.targets_raw) ? String(OPS.targets_raw) : "";
+    var parts = raw.split(","), out = [], i;
+    for (i = 0; i < parts.length; i++) {
+      var s = parts[i].trim();
+      if (!s) continue;
+      var eq = s.indexOf("=");
+      if (eq < 0) { out.push({ name: "", spec: s }); continue; }
+      out.push({ name: s.slice(0, eq).trim(), spec: s.slice(eq + 1).trim() });
+    }
+    return out;
+  }
+  function entriesRaw(list) {                    /* 合并回 `名=user@地址[:端口]` */
+    var out = [], i;
+    for (i = 0; i < list.length; i++) {
+      out.push(list[i].name + "=" + list[i].spec);
+    }
+    return out.join(",");
+  }
+  function splitNames(raw) {                    /* `a,b , c` → ["a","b","c"] */
+    var parts = String(raw || "").split(","), out = [], i;
+    for (i = 0; i < parts.length; i++) {
+      if (parts[i].trim()) out.push(parts[i].trim());
+    }
+    return out;
+  }
+  /* 现在的名单：优先用 `OPS_HOSTS`；它是空的话用**服务端解析后的** known_hosts
+     （目标名或默认三台）—— 不然"移出清单"会写回一个空名单，删了等于没删 */
+  function currentHosts() {
+    var raw = (OPS && OPS.hosts_env) ? String(OPS.hosts_env) : "";
+    if (raw) return splitNames(raw);
+    return (OPS && OPS.known_hosts) ? OPS.known_hosts.slice() : [];
+  }
+  function hostsWithout(name) {
+    var list = currentHosts(), out = [], i;
+    for (i = 0; i < list.length; i++) if (list[i] !== name) out.push(list[i]);
+    return out;
+  }
+  function withHost(list, name) {
+    var out = splitNames(list.join(",")), i;
+    for (i = 0; i < out.length; i++) if (out[i] === name) return out;
+    out.push(name);
+    return out;
+  }
+  function credIndexOf(host) {
+    for (var i = 0; i < CREDS.length; i++) if (CREDS[i].host === host) return i;
+    return -1;
+  }
+  function joinText(list, empty) {
+    return list.length ? AD.esc(list.join("、")) : AD.esc(empty);
+  }
+
+  /* ============================================================
+     添加主机：本地校验 → 合并进 targets/hosts → 确认条 → 提交
+     ------------------------------------------------------------
+     ★ 校验在**发请求之前**：名字的字符集 / 目标里必须有 `@` / 端口 1–65535 /
+       重名。本地拦掉就不会出现"填错了 → 服务端 400 → 还得重填一遍"。
+     ============================================================ */
+  var HOSTNAME_RE = /^[A-Za-z0-9.-]{1,64}$/;
+
+  function addNote(text, tone) {
+    var el = $("addMsg");
+    if (!el) return;
+    el.className = "hint" + (tone ? " " + tone : "");   /* 颜色走类，不写内联样式 */
+    el.textContent = text;
+  }
+
+  /* 返回一句中文错误；合法则返回空串 */
+  function validateAdd(name, spec) {
+    if (!name) return "请先填主机名（例如 web-01）。";
+    if (!HOSTNAME_RE.test(name)) {
+      return "主机名只能用字母、数字、点和连字符，长度 1–64（例如 web-01）。";
+    }
+    if (!spec) return "请填目标：user@地址[:端口]，例如 root@192.168.1.10:22。";
+    var at = spec.indexOf("@");
+    if (at <= 0 || at === spec.length - 1) {
+      return "目标要写成 user@地址[:端口]（必须有 @ 且 @ 后面有地址），"
+        + "例如 root@192.168.1.10:22。";
+    }
+    var addr = spec.slice(at + 1);
+    var colon = addr.indexOf(":");
+    var host = colon < 0 ? addr : addr.slice(0, colon);
+    var port = colon < 0 ? "" : addr.slice(colon + 1);
+    if (!host) return "目标里 @ 后面没有地址。";
+    if (port) {
+      if (!/^\d+$/.test(port)) return "端口只能是数字（1–65535），现在填的是「" + port + "」。";
+      var p = parseInt(port, 10);
+      if (!(p >= 1 && p <= 65535)) return "端口要在 1–65535 之间（现在是 " + port + "）。";
+    }
+    var names = [], entries = targetEntries(), i;
+    for (i = 0; i < entries.length; i++) names.push(entries[i].name);
+    if (names.indexOf(name) >= 0) {
+      return "主机 " + name + " 已经有 SSH 目标了 —— 直接改上面那一行，"
+        + "或者先「移除」它再加。";
+    }
+    if (currentHosts().indexOf(name) >= 0) {
+      return "主机 " + name + " 已经在主机清单里了 —— 它就在「只在清单里的名字」里，"
+        + "点它的「配置目标」即可。";
+    }
+    return "";
+  }
+
+  function requestAdd() {
+    if (!OPS) {
+      addNote("还没取到配置（需要令牌，或服务没起来）—— 先解决取数，再添加主机。", "warn");
+      return;
+    }
+    if (SAVING || PENDING) return;
+    var name = ($("newHost") ? ($("newHost").value || "") : "").trim();
+    var spec = ($("newTarget") ? ($("newTarget").value || "") : "").trim();
+    var bad = validateAdd(name, spec);
+    if (bad) { addNote(bad, "warn"); return; }
+    var pwdEl = $("newPwd");
+    var pwd = pwdEl ? (pwdEl.value || "") : "";
+    if (pwd.length > 500) {          /* 服务端上限 500：本地先拦，不白丢一次提交 */
+      addNote("密码超过 500 字符 —— 已中止，什么都没有提交。", "warn");
+      return;
+    }
+    var authEl = $("newAuth"), keyEl = $("newKey");
+    var auth = authEl && authEl.value === "password" ? "password" : "key";
+    var key = (auth === "key" && keyEl) ? (keyEl.value || "").trim() : "";
+    var entries = targetEntries();
+    entries.push({ name: name, spec: spec });
+    var hosts = withHost(currentHosts(), name);
+    addNote("", "");
+    showConfirm({
+      kind: "add",
+      host: name,
+      targetText: spec,
+      /* 只带这一台的凭据：其它主机一个字段都不提交 = 服务端的"不改这项" */
+      creds: [{ host: name, auth: auth, key: key, password: pwd,
+                clear_password: false }],
+      targets: entriesRaw(entries),
+      hosts: hosts.join(","),
+      remove_hosts: [],
+      summary: credNoteHtml("添加主机 <b>" + AD.esc(name) + "</b>（"
+        + AD.esc(spec) + "）：把它合并进 SSH 目标与主机清单，写回 .env"
+        + "（原文件先备份为 .env.bak.settings）。<br>"
+        + '<div class="hint">SSH 目标 → ' + AD.esc(entriesRaw(entries)) + "</div>"
+        + '<div class="hint">主机清单 → ' + AD.esc(hosts.join(",")) + "</div>"
+        + '<div class="hint">认证方式 → ' + (auth === "password" ? "密码" : "私钥")
+        + (key ? " · 私钥路径 → " + AD.esc(clip(key, 120)) : "")
+        + (pwd.length ? " · 密码 → 已设置（" + pwd.length + " 字符，不回显）" : "")
+        + "</div>", "warn")
+    });
+  }
+
+  /* 「配置目标」：把名字预填进添加表单，让用户补 user@地址[:端口] */
+  function prefillAdd(i) {
+    var c = CREDS[i];
+    if (!c) return;
+    if ($("newHost")) $("newHost").value = c.host;
+    if ($("newTarget")) { $("newTarget").value = ""; }
+    if ($("addHostWrap")) $("addHostWrap").open = true;
+    addNote("给 " + c.host + " 补一个 user@地址[:端口]（例如 root@192.168.1.10:22），"
+      + "再点「添加主机」—— 它会从「只在清单里的名字」变成可连接的主机。", "");
+    if ($("newTarget")) $("newTarget").focus();
+  }
+
+  /* ============================================================
+     移除 / 移出清单：都要**先确认**（复用同一套 #credConfirm）
+     ============================================================ */
+  /* 这一行上某个动作的按钮（提交时用来显示转圈，完成后按 data-label 还原） */
+  function credActionBtn(i, act) {
+    var row = $("credRow-" + i);
+    return row ? row.querySelector('[data-credact="' + act + '"]') : null;
+  }
+
+  function askRemove(i) {
+    var c = CREDS[i];
+    if (!c || !c.target || !OPS) return;
+    var name = c.host;
+    var entries = targetEntries(), keep = [], k;
+    for (k = 0; k < entries.length; k++) {
+      if (entries[k].name !== name) keep.push(entries[k]);
+    }
+    var hosts = hostsWithout(name);
+    /* fail-loud 的两条：ssh 后端必须有目标；删最后一台一定是坏主意。
+       在本地就把它说清楚，而不是让用户去撞服务端的 400。 */
+    if (OPS.backend === "ssh" && !keep.length) {
+      credMsg([credNoteHtml("不能移除 <b>" + AD.esc(name) + "</b>：它是当前"
+        + "<b>唯一</b>的 SSH 目标，而 ssh 后端至少要留一个目标"
+        + "（服务端会拒绝保存）。先「添加主机」加一台，"
+        + "或到「工具层数据源」把后端改成 mock / local。", "warn")]);
+      return;
+    }
+    showConfirm({
+      kind: "remove",
+      host: name,
+      btn: credActionBtn(i, "remove"),
+      creds: [],
+      targets: entriesRaw(keep),
+      hosts: hosts.join(","),
+      remove_hosts: [name],
+      summary: credNoteHtml("移除 <b>" + AD.esc(name) + "</b>：将删除它的目标、"
+        + "清单条目、以及已保存的私钥/密码 —— 服务端把 .env 里对应那几行"
+        + "<b>整行删掉</b>（原文件先备份为 .env.bak.settings）。<br>"
+        + '<div class="hint">SSH 目标 → ' + joinText(
+            keep.map(function (e) { return e.name + "=" + e.spec; }), "（空）") + "</div>"
+        + '<div class="hint">主机清单 → ' + joinText(hosts, "（空）") + "</div>", "warn")
+    });
+  }
+
+  function askUnlist(i) {
+    var c = CREDS[i];
+    if (!c || c.target || !OPS) return;
+    var name = c.host;
+    var hosts = hostsWithout(name);
+    showConfirm({
+      kind: "unlist",
+      host: name,
+      btn: credActionBtn(i, "unlist"),
+      creds: [],
+      targets: OPS.targets_raw,       /* 它不是目标：targets 一个字都不动 */
+      hosts: hosts.join(","),
+      remove_hosts: [name],           /* 顺手清掉它可能残留的凭据行，别留孤儿键 */
+      summary: credNoteHtml("把 <b>" + AD.esc(name) + "</b> 移出主机清单："
+        + "从 OPS_HOSTS 去掉它（Agent 以后不会再提到这个名字），"
+        + "并清掉它可能残留的凭据行。它<b>没有可连接的地址</b>，"
+        + "所以不涉及任何能连的主机。<br>"
+        + '<div class="hint">SSH 目标 → 不变（' + AD.esc(OPS.targets_raw || "（空）")
+        + "）</div>"
+        + '<div class="hint">主机清单 → ' + joinText(hosts, "（空）") + "</div>", "warn")
+    });
+  }
+
+  /* ============================================================
+     确认条：**一个动作一条**（保存凭据 / 添加 / 移除 / 移出清单共用）
+     ------------------------------------------------------------
+     · `plan` 就是**将要提交的请求体**（targets/hosts/remove_hosts/creds）
+       —— 确认条显示什么，提交的就是什么，不重新算第二遍
+     · 保存凭据时没有 `summary`，这里才去比对 PENDING_BASE 列"将要改动"
+     · ★ 只说**状态**不说值：密码一律是「已设置（N 字符，不回显）」
+     · 不动任何服务端状态：真正的请求在 doSave() 里，只有「确认保存」才走到
+     ============================================================ */
+  function showConfirm(plan) {
     var box = $("credConfirm");
     if (!box) return;
-    var changes = configChanges(creds), body = "", i, j;
-    if (!changes.length) {
-      body = credNoteHtml("没有改动 —— 各行的值与已保存的一致，"
-        + "这次保存不会改变任何东西。", "");
-    } else {
-      var lines = "";
-      for (i = 0; i < changes.length; i++) {
-        for (j = 0; j < changes[i].items.length; j++) {
-          lines += '<div class="hint">' + AD.esc(changes[i].host) + "："
-            + AD.esc(changes[i].items[j]) + "</div>";
+    var body = plan.summary, i, j;
+    if (!body) {
+      var changes = configChanges(plan.creds || []);
+      var skipped = credsSkipped(plan.creds || []);
+      var tail = skipped
+        ? "（另有 " + skipped + " 个只在清单里的名字没有地址，这次不参与保存）" : "";
+      if (!changes.length) {
+        body = credNoteHtml("没有改动 —— 各行的值与已保存的一致，"
+          + "这次保存不会改变任何东西。" + tail, "");
+      } else {
+        var lines = "";
+        for (i = 0; i < changes.length; i++) {
+          for (j = 0; j < changes[i].items.length; j++) {
+            lines += '<div class="hint">' + AD.esc(changes[i].host) + "："
+              + AD.esc(changes[i].items[j]) + "</div>";
+          }
         }
+        body = credNoteHtml("将要把 <b>" + changes.length + " 台主机</b>的改动写进 .env"
+          + "（原文件先备份为 .env.bak.settings）：<br>" + lines + tail, "warn");
       }
-      body = credNoteHtml("将要把 <b>" + changes.length + " 台主机</b>的改动写进 .env"
-        + "（原文件先备份为 .env.bak.settings）：<br>" + lines, "warn");
     }
     box.innerHTML = body
       + '<div class="btnrow">'
@@ -1392,8 +1819,9 @@ document.addEventListener("DOMContentLoaded", function () {
       + '<button type="button" class="btn ghost sm" id="credConfirmNo">取消</button>'
       + "</div>";
     box.hidden = false;
-    PENDING = creds;                             /* 确认之后要提交的那一份载荷 */
+    PENDING = plan;                              /* 确认之后要提交的那一份载荷 */
     enableTestButtons(false);
+    setActionButtons(false, null);
     var go = $("credConfirmGo"), no = $("credConfirmNo");
     if (go) go.onclick = function () {
       var payload = PENDING;
@@ -1425,12 +1853,49 @@ document.addEventListener("DOMContentLoaded", function () {
         + "）—— 已中止，什么都没有提交。", "warn")]);
       return;
     }
-    showConfirm(creds);
+    /* 保存凭据：targets / hosts 原样不动（快照回传），也不删任何主机。
+       这一份 plan 就是请求体 —— 确认条与提交用的是同一个对象。 */
+    showConfirm({
+      kind: "creds",
+      host: "",
+      creds: creds,
+      targets: OPS.targets_raw,
+      hosts: OPS.hosts_env,
+      remove_hosts: []
+    });
   }
 
   /* 保存成功的回执。★ warning 必须显示：例如"配了密码登录但还没填密码"
      —— 不显示的话用户要到每次查询认证失败时才知道 */
-  function afterSave(data, creds, prev) {
+  function afterSave(data, plan, prev) {
+    /* ★ 增 / 删 走各自那句回执：它们改的是**结构**（多了或少了主机），
+       所以重新取一次接口（load()），而不是自己拼 DOM —— 免得页面上留下
+       两份互相矛盾的 targets/hosts。 */
+    if (plan.kind !== "creds") {
+      var head;
+      if (plan.kind === "add") {
+        head = credNoteHtml("已添加主机 <b>" + AD.esc(plan.host) + "</b>（"
+          + AD.esc(plan.targetText) + "）：已合并进 SSH 目标与主机清单。"
+          + AD.esc(data.persist || ""), "ok");
+      } else if (plan.kind === "remove") {
+        head = credNoteHtml("已移除主机 <b>" + AD.esc(plan.host) + "</b>："
+          + "它的目标、清单条目、已保存的私钥/密码都已删除，这一行不会再出现。"
+          + AD.esc(data.persist || ""), "ok");
+      } else {
+        head = credNoteHtml("已把 <b>" + AD.esc(plan.host) + "</b> 移出主机清单"
+          + "（Agent 以后不会再提到这个名字）。" + AD.esc(data.persist || ""), "ok");
+      }
+      credMsg([head,
+               data.warning ? credNoteHtml(AD.esc(data.warning), "warn") : ""]);
+      load(function () {
+        /* 新加的那台就地测一次登录（结果写它自己那一行，不动上面的回执） */
+        if (plan.kind !== "add") return;
+        var ix = credIndexOf(plan.host);
+        if (ix >= 0) testRow(ix, null);
+      });
+      return;
+    }
+    var creds = plan.creds;
     /* 回执里不会说"哪台改了"，那就自己比：认证方式 / 私钥路径 / 新密码 / 清除 */
     var changed = [], k;
     for (k = 0; k < creds.length; k++) {
@@ -1473,47 +1938,62 @@ document.addEventListener("DOMContentLoaded", function () {
     });
   }
 
-  function doSave(creds) {
-    var btn = $("saveCreds");
-    if (!creds) return;
-    var label = btn ? btn.getAttribute("data-label") : "";
+  /* 唯一发 POST /settings/ops 的地方。`plan` 就是确认条上显示的那一份：
+     保存凭据 / 添加主机 / 移除主机 / 移出清单 走的是**同一个请求形态**，
+     区别只在 targets / hosts / remove_hosts / credentials 这四个字段。 */
+  function doSave(plan) {
+    if (!plan || !OPS) return;
+    /* 转圈转在**用户点的那个按钮**上（移除就在那一行的「移除」上）；
+       还原由 setActionButtons 按 `data-label` 做，不需要在这里记一份 */
+    var btn = plan.btn || (plan.kind === "add" ? $("addHost") : $("saveCreds"));
     SAVING = true;
     enableTestButtons(false);
-    if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spin"></span> 保存中…'; }
+    setActionButtons(false, btn);
     var prev = PENDING_BASE.slice();
     fetchJson("/settings/ops", {
       method: "POST", headers: headers(true),
       body: JSON.stringify({
-        /* ★ 这四项**原样回传**（来自 /settings/api 的快照）：它们不属于这张卡，
-           改一个字就会把用户配好的 SSH 目标 / 全局私钥 / 主机清单冲成空值 */
+        /* ★ backend / key **原样回传**（来自 /settings/api 的快照）：它们不属于
+           这张卡，改一个字就会把用户配好的后端与全局私钥冲成空值。
+           targets / hosts 则是"算好的新值"（增删时已经合并过）——
+           服务端对这两个字段是**全量替换**，所以不能只发增删的那一条。 */
         backend: OPS.backend,
-        targets: OPS.targets_raw,
+        targets: plan.targets,
         key: OPS.key,
-        hosts: OPS.hosts_env,
-        credentials: creds
+        hosts: plan.hosts,
+        credentials: plan.creds || [],
+        remove_hosts: plan.remove_hosts || []
       })
     }).then(function (r) {
       SAVING = false;
       clearPwdInputs();                  /* ★ 成败都清：密码不留在一个可被读走的地方 */
-      if (btn) { btn.disabled = false; btn.innerHTML = AD.esc(label); }
+      if (btn) btn.disabled = false;
+      setActionButtons(true, null);
+      enableTestButtons(true);           /* 失败时也把「测试登录」放回来 */
       if (!r.ok) {
         credMsg([credNoteHtml("保存失败："
           + AD.esc(credErrText(r.data && r.data.detail, r.status)), "warn")]);
         return;                          /* ★ 保存失败不测试：先把配置改对 */
       }
-      afterSave(r.data || {}, creds, prev);
+      afterSave(r.data || {}, plan, prev);
     }).catch(function () {
       SAVING = false;
       clearPwdInputs();
-      if (btn) { btn.disabled = false; btn.innerHTML = AD.esc(label); }
+      if (btn) btn.disabled = false;
+      setActionButtons(true, null);
+      enableTestButtons(true);
       credMsg([credNoteHtml("保存失败：请求本身出错（服务没起来或网络断了）。", "warn")]);
     });
   }
 
-  /* 保存按钮只是"请求确认"：真正的提交在确认条的「确认保存」上 */
+  /* 两个按钮都只是"请求确认"：真正的提交在确认条的「确认保存」上 */
   if ($("saveCreds")) {
     $("saveCreds").setAttribute("data-label", $("saveCreds").innerHTML);
     $("saveCreds").onclick = requestSave;
+  }
+  if ($("addHost")) {
+    $("addHost").setAttribute("data-label", $("addHost").innerHTML);
+    $("addHost").onclick = requestAdd;
   }
   /* 这里**不预先渲染**：服务端已经放好了骨架 + "载入中…"，
      取数结果一到（load() 里）再决定是"每台主机一行"还是"取不到"。 */
