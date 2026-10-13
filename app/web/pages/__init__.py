@@ -19,7 +19,7 @@ import importlib
 IMPLEMENTED = [
     "home",
     "try_",
-    # "dashboard",
+    "dashboard",
     # "settings",
     # "view",
 ]
