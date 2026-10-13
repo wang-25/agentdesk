@@ -470,6 +470,21 @@ def _credentials_card() -> str:
     `target` 为 null = 这台主机在清单里但没有 SSH 目标（连不上）。
     那一行的控件整行停用、并打「尚未配置目标」徽标：它不参与保存
     （提交时该行留空 = 服务端语义的"不改这项"，不会把它已有的密码弄丢）。
+    它同时**也不能测**（没有地址就没得连）—— 所以那一行的「测试登录」按钮是灰的，
+    并把原因写在 title 里，而不是"点了没反应"。
+
+    【两件让"提交成功 ≠ 登得上"这件事可见的东西】
+    · 每行一个「测试登录」：用**这一行当前输入的值**试一次真登录（`POST /settings/ssh/test`），
+      结果就地写在该行（`<span id="credTest-<i>">`），不用 alert 弹窗。
+      留空的字段 = 用这台主机已保存的那一项，所以"存了但不确定"可以直接测。
+    · 保存前先出「将要改动」确认条（`#credConfirm`），确认后才发 `POST /settings/ops`；
+      保存成功后**串行**把所有有目标的主机各测一次，逐行填结果 + 回执区一句汇总。
+
+    【这两处新增的代码为什么**碰不到密码**】
+    · 确认清单说的是「密码 → 已设置」这种**状态**，从不写用户敲的值（见 js 的 credChanges）
+    · 测试结果只来自「`reason` / 远端主机名 / 延迟」三个字段 —— 回执里本来就没有密码
+    · 测试成功后立刻清空该行密码框（它已经用掉了），失败保留让用户改完重试；
+      测试与保存两处收尾都调 clearPwdInputs()
     """
     body = (
         '<div id="credSummary" class="hint">载入中…</div>'
@@ -477,6 +492,7 @@ def _credentials_card() -> str:
         + '<div class="btnrow">'
         + button("保存全部凭据", size="sm", attrs='id="saveCreds"')
         + "</div>"
+        + '<div id="credConfirm" class="card tight" hidden></div>'
         + '<div id="credMsg"></div>'
         + note("三件事写在这里，因为弄错任何一件都会让人再也不敢用这个功能："
                "<b>密码只写不读</b>（页面只能显示「已设置 / 未设置」，回显不了值）；"
@@ -487,6 +503,12 @@ def _credentials_card() -> str:
                "带「尚未配置目标」徽标的主机连不上，也不参与保存 —— "
                "要让它能连，先去「工具层数据源」里给它配 "
                "<code>名=user@地址[:端口]</code>。", "warn")
+        + note("每行的<b>「测试登录」</b>用你<b>当前填的值</b>试一次真登录"
+               "（只读一条 <code>hostname</code>，不改任何配置、不落盘）："
+               "填完先测、通了再保存，就不必等到某天认证失败才发现配错了。"
+               "框里<b>留空 = 用这台主机已保存的那一项</b>，所以「存了但不确定」"
+               "也可以直接测。<b>保存会先列一份「将要改动」让你确认</b>，"
+               "确认后保存，并把所有能连的主机各测一遍。")
     )
     return card(body, title="SSH 登录（每台主机一份凭据）",
                 desc="数据源 /settings/api 的 ops.credentials")
@@ -957,17 +979,30 @@ document.addEventListener("DOMContentLoaded", function () {
   }
 
   /* ============================================================
-     SSH 凭据（每台主机一份）：私钥路径 / 密码
+     SSH 凭据（每台主机一份）：私钥路径 / 密码 / 测试登录
      ------------------------------------------------------------
-     ★ 密码只写不读 —— 四条通道全堵上：
+     ★ 密码只写不读 —— 五条通道全堵上：
         ① 接口不回显（只有 password_set），所以密码**无从**被渲染
         ② 密码只进 input.value 与请求体；innerHTML 里只出现静态文字
         ③ 提交后（成功或失败）立刻 input.value = ""，只留 placeholder
         ④ 失败回执只取 loc/msg，**不复述 detail[].input**（422 会带密码！）
+        ⑤ 测试登录的**结果文字只来自 reason / remote / latency_ms**，
+           请求体本身从不进 DOM；测完清空密码框，测不了也不把它的值打到页面上
      ★ 私钥是**路径**：回填、编辑、原样回传都是对的（不给 = 被清空）。
      ============================================================ */
   var CREDS = [];        /* 接口给的凭据视图（永远不含密码字段） */
   var OPS = null;        /* 原样回传用的数据源快照（见 load() 里的说明） */
+  /* 测试登录的并发闸：一行一个在跑，就不许再点（同一行点两次会发两次连接） */
+  var TESTING = {};
+  /* 保存流程的两个状态：确认条显示时不能改行；保存+连测期间一切按钮停用 */
+  var PENDING = null;    /* 已确认、等待（或正在）提交的凭据数组 */
+  var SAVING = false;
+  /* 只读一条 hostname；0 = 服务端默认 8 秒（接口上限 60） */
+  var TEST_TIMEOUT = 0;
+  /* 确认条的比对基准：**每一次渲染或成功保存之后**刷新成"服务端现在是什么"。
+     声明放在这里（在 renderCreds 之前）是有意的 —— 它必须在使用之前就初始化，
+     免得将来有人不小心让 renderCreds 在赋值语句之前跑起来。 */
+  var PENDING_BASE = [];
 
   function credNoteHtml(text, tone) {
     var ic = tone === "warn" ? "\u26a0" : (tone === "ok" ? "\u2713" : "\u25b8");
@@ -1018,7 +1053,14 @@ document.addEventListener("DOMContentLoaded", function () {
          ? '<label class="switch"><input type="checkbox" id="credClear-' + i
            + '"> 清除密码</label>'
          : "")
-      + "</div></div></div></div>";
+      /* 「测试登录」：用**这一行当前填的值**试一次真登录；没有目标的行连不上，
+         按钮照样渲染（停用 + title 说明原因），比"这个功能有时不存在"清楚 */
+      + '<button type="button" class="btn ghost sm" id="credTest-' + i
+      + '" style="position:relative">测试登录</button>'
+      + "</div>"
+      /* 测试结果就地写在这一行（不用 alert）：内容只有 ✅/❌ + 中文原因 */
+      + '<div class="hint" id="credTestStatus-' + i + '"></div>'
+      + "</div></div></div>";
   }
 
   /* 认证方式切换：选「密码」时私钥框禁用但**保留值**（切回来还在，别清空） */
@@ -1043,9 +1085,102 @@ document.addEventListener("DOMContentLoaded", function () {
     if (noTarget) {
       var ctrls = row ? row.querySelectorAll("select,input") : [];
       for (var k = 0; k < ctrls.length; k++) ctrls[k].disabled = true;
+      /* 没有目标就没得连：测试按钮也停用，并把**原因**写在 title 上
+         （灰按钮 + 有理由，胜过"点了没反应"） */
+      var tb = $("credTest-" + i);
+      if (tb) {
+        tb.disabled = true;
+        tb.title = "这台主机还没有 SSH 目标，没有地址可连 —— "
+          + "先去「工具层数据源」配 名=user@地址[:端口]";
+      }
+      setRowTest(i, "\u25b8 没有 SSH 目标 —— 不能测（不参与保存）", "");
       return;
     }
     toggleCredAuth(i);
+  }
+
+  /* ============================================================
+     测试登录：立刻回答"我填的私钥/密码到底通不通"
+     ------------------------------------------------------------
+     · 请求体 = **这一行当前的值**（auth / key / password）；框里留空 =
+       用这台主机已保存的那一项 —— 所以"存了但不确定"直接点就行
+     · 结果只来自回执的 reason / remote / latency_ms；**请求体本身不进 DOM**
+     · 400 的 detail 是字符串（原样显示，已经是对人友好的中文）；
+       422 只取 loc + msg（绝不复述 input，那里可能是密码）
+     · 测试**不改服务端任何状态**（接口不落盘），也不改本行任何控件的值
+     ============================================================ */
+  function setRowTest(i, text, tone) {
+    var el = $("credTestStatus-" + i);
+    if (!el) return;
+    el.textContent = text;
+    el.className = "hint" + (tone ? " " + tone : "");
+    el.style.color = tone === "ok" ? "var(--ok)"
+      : (tone === "warn" ? "var(--err)" : "");
+  }
+  function testNote(i, text, tone) {
+    var extra = (tone === "warn") ? "\uff08已清空密码框，避免密码留在页面上\uff09" : "";
+    setRowTest(i, text + extra, tone);
+  }
+
+  function runTests(ids, done) {
+    var at = 0, ok = 0, miss = 0;
+    function step() {
+      if (at >= ids.length) { done(ok, miss); return; }
+      var i = ids[at++];
+      /* 串行：一台测完再测下一台（别并发打一堆 SSH 连接出去） */
+      testRow(i, function (good) {
+        if (good === null) miss++; else if (good) ok++;
+        step();
+      });
+    }
+    step();
+  }
+
+  function testRow(i, cb) {
+    var c = CREDS[i], tb = $("credTest-" + i);
+    if (!c || !c.target || TESTING[i] || SAVING) return;
+    TESTING[i] = true;
+    var sel = $("credAuth-" + i), keyEl = $("credKey-" + i);
+    var pwdEl = $("credPwd-" + i);
+    var auth = sel ? sel.value : "key";
+    var key = (auth === "key" && keyEl) ? (keyEl.value || "").trim() : "";
+    /* ★ 密码原样送出、不 trim（密码里可以有空格）；留空 = 用已保存的那个 */
+    var pwd = pwdEl ? (pwdEl.value || "") : "";
+    if (tb) { tb.disabled = true; tb.innerHTML = '<span class="spin"></span>'; }
+    setRowTest(i, "测试中\u2026 登录一次，最多 8 秒", "");
+    fetchJson("/settings/ssh/test", {
+      method: "POST", headers: headers(true),
+      body: JSON.stringify({ host: c.host, auth: auth, key: key,
+                             password: pwd, timeout: TEST_TIMEOUT })
+    }).then(function (r) {
+      TESTING[i] = false;
+      if (tb) tb.disabled = false;
+      if (pwdEl && pwd) pwdEl.value = "";     /* ★ 用掉就清掉，别留在 DOM 里 */
+      var d = r.data || {};
+      if (!r.ok) {
+        /* 400：detail 是字符串，原样显示；422：只取 loc + msg（里面的 input 是密码） */
+        testNote(i, "\u274c " + (credErrText(d && d.detail, r.status)
+          || "接口返回 HTTP " + r.status), "warn");
+        if (cb) cb(null);
+        return;
+      }
+      if (d.ok) {
+        /* 成功 = 真的落到目标机器上了：报远端主机名而不只是"连上了" */
+        setRowTest(i, "\u2705 通 \u00b7 " + (d.latency_ms || 0) + " ms \u00b7 远端主机名 "
+          + (d.remote || "(未返回)") + "\uff08此行已确认\uff09", "ok");
+        if (cb) cb(true);
+        return;
+      }
+      testNote(i, "\u274c " + (d.reason || "登录失败（回执里没有原因）"), "warn");
+      if (cb) cb(false);
+    }).catch(function () {
+      TESTING[i] = false;
+      if (tb) tb.disabled = false;
+      if (pwdEl && pwd) pwdEl.value = "";
+      setRowTest(i,
+        "\u274c 测试没发出去：请求本身出错（服务没起来或网络断了）", "warn");
+      if (cb) cb(null);
+    });
   }
 
   function renderCreds(list) {
@@ -1060,6 +1195,7 @@ document.addEventListener("DOMContentLoaded", function () {
       return;
     }
     CREDS = list;
+    PENDING_BASE = list.slice();   /* 确认条的比对基准：就是这一次渲染用的视图 */
     var pwdN = 0, noT = 0, i;
     for (i = 0; i < CREDS.length; i++) {
       if (CREDS[i].password_set) pwdN++;
@@ -1088,6 +1224,12 @@ document.addEventListener("DOMContentLoaded", function () {
   function bindCredRow(i) {
     var sel = $("credAuth-" + i);
     if (sel) sel.onchange = function () { toggleCredAuth(i); };
+    var tb = $("credTest-" + i);
+    if (tb) {
+      tb.onclick = function () { testRow(i, null); };
+      /* 确认条显示时、或保存+连测期间：不许再点（点两次会打两次 SSH 连接） */
+      if (PENDING || SAVING) tb.disabled = true;
+    }
   }
 
   /* 收集请求体里的 credentials：**只读 DOM 的值**，不做任何猜测 */
@@ -1143,13 +1285,135 @@ document.addEventListener("DOMContentLoaded", function () {
     return "HTTP " + status;
   }
 
-  function submitCreds() {
-    var btn = $("saveCreds");
+  /* ============================================================
+     保存前确认：**先把"将要改动什么"列出来**，确认之后才真的提交
+     ------------------------------------------------------------
+     · 比对基准 = `PENDING_BASE`（上一次渲染这一卡时接口给的视图）。
+       比对发生在**收集到的请求体**与它之间，所以"变了没有"与"提交什么"
+       是同一份数据算出来的，不会出现"确认条说的"和"实际提交的"不一致。
+     · ★ 这里只说**状态**不说值：「密码 → 已设置」而不是把用户敲的密码写出来。
+     · 不动任何服务端状态：真正的请求在 doSave() 里，只有「确认保存」才走到。
+     ============================================================ */
+  function prevCreds(host) {
+    for (var i = 0; i < PENDING_BASE.length; i++) {
+      if (PENDING_BASE[i].host === host) return PENDING_BASE[i];
+    }
+    return null;
+  }
+  function clip(v, n) {
+    v = String(v === undefined || v === null ? "" : v);
+    return v.length > n ? v.slice(0, n) + "\u2026" : v;
+  }
+  /* 一条改动 = 描述**哪个字段**从什么变成什么；密码只说"已设置/清除"，不说值 */
+  function credChangeItems(newC, oldC) {
+    var items = [], oldAuth = oldC.auth === "password" ? "password" : "key";
+    var newAuth = newC.auth === "password" ? "password" : "key";
+    /* 私钥**路径**可以显示（它是文件在哪儿，不是密钥内容） */
+    if (newAuth !== oldAuth) {
+      items.push("认证方式 → " + (newAuth === "password" ? "密码" : "私钥"));
+    }
+    if (newAuth === "key" && newC.key && newC.key !== (oldC.key || "")) {
+      items.push("私钥路径 → " + clip(newC.key, 120));
+    }
+    if (newC.clear_password) items.push("清除密码");
+    else if (newC.password.length) {
+      items.push("密码 → 已设置（" + newC.password.length + " 字符，不回显）");
+    }
+    return items;
+  }
+  function configChanges(creds) {
+    var out = [], i;
+    for (i = 0; i < creds.length; i++) {
+      var e = creds[i];
+      if (!e.host) continue;
+      var oldC = prevCreds(e.host);
+      if (!oldC) continue;                       /* 接口没给过的行：无可比对 */
+      if (!oldC.target) {                        /* 没有目标的行 = "不改这项" */
+        out.push({ host: e.host, items: ["没有 SSH 目标：这一行不参与保存"] });
+        continue;
+      }
+      var items = credChangeItems(e, oldC);
+      if (items.length) out.push({ host: e.host, items: items });
+    }
+    return out;
+  }
+  /* 保存成功之后把基准推进一步（**不再取一次接口**）：否则下一次确认条会拿
+     "上一次进页面时"的旧值比对，把已经保存过的改动又列一遍 ——
+     而用户会以为自己重复改了什么。行没动过的话这一步是恒等变换。 */
+  function applySavedToBase(creds) {
+    var i, j;
+    for (i = 0; i < creds.length; i++) {
+      var e = creds[i];
+      for (j = 0; j < PENDING_BASE.length; j++) {
+        var b = PENDING_BASE[j];
+        if (b.host !== e.host || !b.target) continue;
+        if (e.auth) b.auth = e.auth;                 /* 留空 = 不改这项 */
+        if (e.auth === "key" && e.key) b.key = e.key;
+        if (e.clear_password) b.password_set = false;
+        else if (e.password.length) b.password_set = true;
+      }
+    }
+  }
+
+  function enableTestButtons(on) {
+    for (var i = 0; i < CREDS.length; i++) {
+      var tb = $("credTest-" + i);
+      if (tb && !tb.title) tb.disabled = !on;    /* 没有目标的行保持停用 */
+    }
+  }
+  function hideConfirm() {
+    var box = $("credConfirm");
+    if (box) { box.hidden = true; box.innerHTML = ""; }
+    PENDING = null;
+    enableTestButtons(true);
+  }
+
+  function showConfirm(creds) {
+    var box = $("credConfirm");
+    if (!box) return;
+    var changes = configChanges(creds), body = "", i, j;
+    if (!changes.length) {
+      body = credNoteHtml("没有改动 —— 各行的值与已保存的一致，"
+        + "这次保存不会改变任何东西。", "");
+    } else {
+      var lines = "";
+      for (i = 0; i < changes.length; i++) {
+        for (j = 0; j < changes[i].items.length; j++) {
+          lines += '<div class="hint">' + AD.esc(changes[i].host) + "："
+            + AD.esc(changes[i].items[j]) + "</div>";
+        }
+      }
+      body = credNoteHtml("将要把 <b>" + changes.length + " 台主机</b>的改动写进 .env"
+        + "（原文件先备份为 .env.bak.settings）：<br>" + lines, "warn");
+    }
+    box.innerHTML = body
+      + '<div class="btnrow">'
+      + '<button type="button" class="btn sm" id="credConfirmGo">确认保存</button>'
+      + '<button type="button" class="btn ghost sm" id="credConfirmNo">取消</button>'
+      + "</div>";
+    box.hidden = false;
+    PENDING = creds;                             /* 确认之后要提交的那一份载荷 */
+    enableTestButtons(false);
+    var go = $("credConfirmGo"), no = $("credConfirmNo");
+    if (go) go.onclick = function () {
+      var payload = PENDING;
+      hideConfirm();
+      doSave(payload);
+    };
+    if (no) no.onclick = function () {           /* ★ 取消：一个保存请求都不发 */
+      hideConfirm();
+      credMsg([credNoteHtml("已取消 —— 什么都没有提交。", "")]);
+    };
+  }
+
+  /* 收集 + 本地校验（超长密码先在本地拦掉），然后进确认条 */
+  function requestSave() {
     if (!OPS) {
       credMsg([credNoteHtml("还没取到配置（需要令牌，或服务没起来）—— "
         + "先解决取数，再保存凭据。", "warn")]);
       return;
     }
+    if (SAVING || PENDING) return;
     var creds = collectCreds(), over = [], i;
     for (i = 0; i < creds.length; i++) {
       /* 服务端的硬上限是 500 字符（超了会 422）。在这里先拦一次：
@@ -1161,9 +1425,62 @@ document.addEventListener("DOMContentLoaded", function () {
         + "）—— 已中止，什么都没有提交。", "warn")]);
       return;
     }
-    var label = btn ? btn.innerHTML : "";
+    showConfirm(creds);
+  }
+
+  /* 保存成功的回执。★ warning 必须显示：例如"配了密码登录但还没填密码"
+     —— 不显示的话用户要到每次查询认证失败时才知道 */
+  function afterSave(data, creds, prev) {
+    /* 回执里不会说"哪台改了"，那就自己比：认证方式 / 私钥路径 / 新密码 / 清除 */
+    var changed = [], k;
+    for (k = 0; k < creds.length; k++) {
+      var e = creds[k], old = null, j;
+      for (j = 0; j < prev.length; j++) if (prev[j].host === e.host) old = prev[j];
+      if (!old || !old.target) continue;
+      var newAuth = e.auth || old.auth;
+      if (e.password.length || e.clear_password || newAuth !== old.auth
+          || (e.key && e.key !== (old.key || ""))) changed.push(e.host);
+    }
+    applySavedToBase(creds);         /* ★ 基准前移：下次确认条只列"还没保存的" */
+    credMsg([
+      credNoteHtml("已保存" + (changed.length
+        ? "：" + AD.esc(changed.join("、")) : "（各行的值都没有变化）")
+        + "。" + AD.esc(data.persist || ""), "ok"),
+      data.warning ? credNoteHtml(AD.esc(data.warning), "warn") : ""
+    ]);
+    if (data.credentials && data.credentials.length) renderCreds(data.credentials);
+    else load();
+    testAllAfterSave();
+  }
+
+  /* 保存成功之后：对所有**有目标**的主机各测一次登录 —— 这才是"到底通不通"的答案 */
+  function testAllAfterSave() {
+    var ids = [], i;
+    for (i = 0; i < CREDS.length; i++) {
+      if (CREDS[i].target) ids.push(i);
+    }
+    if (!ids.length) return;
+    credMsg([credNoteHtml("已保存。正在<b>逐台测试登录</b>（串行，每台最多 8 秒）…", "")]);
+    runTests(ids, function (ok, miss) {
+      var bad = ids.length - ok - miss;
+      credMsg([
+        credNoteHtml("已保存：逐台测过 " + ids.length + " 台，连通 <b>" + ok + "/"
+          + ids.length + "</b>"
+          + (bad ? " · 不通 " + bad + " 台（原因见各行）" : "")
+          + (miss ? " · " + miss + " 台没能测（请求没发出去）" : ""),
+          ok === ids.length ? "ok" : "warn")
+      ]);
+    });
+  }
+
+  function doSave(creds) {
+    var btn = $("saveCreds");
+    if (!creds) return;
+    var label = btn ? btn.getAttribute("data-label") : "";
+    SAVING = true;
+    enableTestButtons(false);
     if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spin"></span> 保存中…'; }
-    var prev = CREDS.slice();
+    var prev = PENDING_BASE.slice();
     fetchJson("/settings/ops", {
       method: "POST", headers: headers(true),
       body: JSON.stringify({
@@ -1176,42 +1493,28 @@ document.addEventListener("DOMContentLoaded", function () {
         credentials: creds
       })
     }).then(function (r) {
+      SAVING = false;
       clearPwdInputs();                  /* ★ 成败都清：密码不留在一个可被读走的地方 */
-      if (btn) { btn.disabled = false; btn.innerHTML = label; }
+      if (btn) { btn.disabled = false; btn.innerHTML = AD.esc(label); }
       if (!r.ok) {
         credMsg([credNoteHtml("保存失败："
           + AD.esc(credErrText(r.data && r.data.detail, r.status)), "warn")]);
-        return;
+        return;                          /* ★ 保存失败不测试：先把配置改对 */
       }
-      var data = r.data || {};
-      /* 回执里不会说"哪台改了"，那就自己比：认证方式 / 私钥路径 / 新密码 / 清除 */
-      var changed = [], k;
-      for (k = 0; k < creds.length; k++) {
-        var e = creds[k], old = null, j;
-        for (j = 0; j < prev.length; j++) if (prev[j].host === e.host) old = prev[j];
-        if (!old) continue;
-        var newAuth = e.auth || old.auth;
-        if (e.password.length || e.clear_password || newAuth !== old.auth
-            || (e.key && e.key !== (old.key || ""))) changed.push(e.host);
-      }
-      credMsg([
-        credNoteHtml("已保存" + (changed.length
-          ? "：" + AD.esc(changed.join("、")) : "（各行的值都没有变化）")
-          + "。" + AD.esc(data.persist || ""), "ok"),
-        /* ★ warning 必须显示：例如"配了密码登录但还没填密码"
-           —— 不显示的话用户要到每次查询认证失败时才知道 */
-        data.warning ? credNoteHtml(AD.esc(data.warning), "warn") : ""
-      ]);
-      if (data.credentials && data.credentials.length) renderCreds(data.credentials);
-      else load();
+      afterSave(r.data || {}, creds, prev);
     }).catch(function () {
+      SAVING = false;
       clearPwdInputs();
-      if (btn) { btn.disabled = false; btn.innerHTML = label; }
+      if (btn) { btn.disabled = false; btn.innerHTML = AD.esc(label); }
       credMsg([credNoteHtml("保存失败：请求本身出错（服务没起来或网络断了）。", "warn")]);
     });
   }
 
-  if ($("saveCreds")) $("saveCreds").onclick = submitCreds;
+  /* 保存按钮只是"请求确认"：真正的提交在确认条的「确认保存」上 */
+  if ($("saveCreds")) {
+    $("saveCreds").setAttribute("data-label", $("saveCreds").innerHTML);
+    $("saveCreds").onclick = requestSave;
+  }
   /* 这里**不预先渲染**：服务端已经放好了骨架 + "载入中…"，
      取数结果一到（load() 里）再决定是"每台主机一行"还是"取不到"。 */
 
