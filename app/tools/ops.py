@@ -36,6 +36,7 @@
 
 import json
 import base64
+import logging
 import os
 import re
 import subprocess
@@ -243,6 +244,74 @@ def credentials_for(host: str) -> dict:
 
 
 # ============================================================
+# 零·一·C、测试登录
+# ============================================================
+# 【为什么要有它】
+#   用户的真实困扰：**"我提交私钥/密码，不知道成功没"** ——
+#   保存成功只证明"写进配置了"，不证明"登得上"。
+#   而登录失败的表现是**延迟的**：等你去问一句机器状态、拿到
+#   Permission denied，才知道配错了。中间隔着一整天。
+#
+# 【两条纪律】
+#   ① **走真实执行路径**：直接调 `_exec`，与查询用的是同一段代码。
+#      自己另写一条"简化版连接"就等于测了另一套代码，通过了也不代表查询能成。
+#   ② **只做只读、一次、极短**：一条 `hostname`，超时默认 8 秒。
+#      不留任何副作用（不写文件、不动配置）。
+def test_login(host: str, cred: dict = None, timeout: int = None) -> dict:
+    """试一次登录，返回结构化结果（**永不抛异常给调用方**）。
+
+    返回：`{ok, host, auth, latency_ms, remote, reason?}`
+      · `ok=True` 时 `remote` 是远端主机名（证明真的落在目标机器上）
+      · `ok=False` 时 `reason` 是给**人看**的原因，且**绝不含密码**
+    """
+    import time as _time
+
+    host = (host or "").strip()
+    if BACKEND != "ssh":
+        return {"ok": False, "host": host, "auth": "",
+                "reason": f"当前数据源是 {BACKEND}，不是 ssh —— "
+                          f"先在设置页把「数据源」切成 ssh"}
+    if host not in SSH_TARGETS:
+        return {"ok": False, "host": host, "auth": "",
+                "reason": f"这台主机没有配置 SSH 目标（可在设置页的"
+                          f"「数据源」里加：{host}=user@地址）。"
+                          f"当前已配置：{sorted(SSH_TARGETS) or '空'}"}
+
+    use = cred or credentials_for(host)
+    auth = use.get("auth") or "key"
+    if auth == "password" and not use.get("password"):
+        # 不抛异常：这是**用户要看到的结论**，不是程序错误
+        return {"ok": False, "host": host, "auth": auth,
+                "reason": "这台主机配的是密码登录，但还没有密码。"
+                          "填上密码后再测（密码只写不读，页面上看不到原值）"}
+    if auth == "key" and not use.get("key"):
+        # 私钥留空仍然可能通（ssh 会走默认密钥路径/agent），所以只提示不拦
+        pass
+
+    limit = timeout or max(SSH_CONNECT_TIMEOUT, 8)
+    started = _time.monotonic()
+    try:
+        rc, out = _exec(["hostname"], host=host, timeout=limit, cred=use)
+    except ToolError as e:
+        return {"ok": False, "host": host, "auth": auth,
+                "latency_ms": int((_time.monotonic() - started) * 1000),
+                "reason": str(e)}
+    except Exception as e:                      # pragma: no cover - 兜底
+        return {"ok": False, "host": host, "auth": auth,
+                "latency_ms": int((_time.monotonic() - started) * 1000),
+                "reason": f"未知错误：{type(e).__name__}: {e}"}
+
+    latency = int((_time.monotonic() - started) * 1000)
+    remote = (out or "").strip().splitlines()[0] if (out or "").strip() else ""
+    if rc != 0:
+        return {"ok": False, "host": host, "auth": auth, "latency_ms": latency,
+                "reason": f"登录上了，但命令返回码 {rc}：{remote[:200] or '（无输出）'}"}
+    return {"ok": True, "host": host, "auth": auth, "latency_ms": latency,
+            "remote": remote or "（远端未返回主机名）",
+            "target": SSH_TARGETS.get(host)}
+
+
+# ============================================================
 # 零·二、审计出口
 # ============================================================
 # ★ 和 `app/notify/events.py` 里的 `set_audit_hook` / `_audit` 是**同一款**：
@@ -347,6 +416,14 @@ KNOWN_HOSTS = _resolve_hosts()
 # 凭据表：主机 → {auth, key, password}。放在这里是因为它要同时覆盖
 # `SSH_TARGETS`（能连的）与 `KNOWN_HOSTS`（清单里的）。
 _CREDENTIALS = _parse_credentials(_credential_hosts())
+
+# ★ 把 paramiko 的日志压到 WARNING。
+#   它默认在 INFO 级打印连接与认证过程（实测："Connected (version 2.0…)"
+#   "Authentication (password) failed."）。内容本身不含密码，但：
+#     ① 在我们这套 root=INFO 的日志里纯属噪音，会淹没自己的日志
+#     ② 认证过程的细节不该进日志文件（日志会被收集、转发、长期保存）
+#   默认 root 是 WARNING 时看不出区别，所以这里显式设一次。
+logging.getLogger("paramiko").setLevel(logging.WARNING)
 
 # 主机角色说明。只是给模型的语义提示，让它能把「网站访问慢」对上某台主机。
 # 是可选的：清单里换成别的名字照样工作，只是少一点语义线索。
@@ -638,11 +715,16 @@ def _exec_via_paramiko(cmd: list, target: dict, cred: dict, limit: int) -> tuple
     return rc, out
 
 
-def _exec(cmd: list, host: str = None, timeout: int = None) -> tuple:
+def _exec(cmd: list, host: str = None, timeout: int = None,
+          cred: dict = None) -> tuple:
     """把一条命令送到"它该去的地方"执行。返回 (rc, 输出文本)。
 
     这是唯一的运输层出口。上面的解析器只调用它，
     不关心命令究竟跑在本机还是远端 —— 这就是两种后端能共用解析器的原因。
+
+    `cred`：显式指定凭据（不传就用这台主机已保存的）。
+    只有"测试登录"用它 —— 见 `test_login`：**测试必须走真实执行路径**，
+    否则测的是另一套代码，通过了也不代表查询能成。
     """
     if BACKEND == "ssh":
         target = SSH_TARGETS.get(host or "")
@@ -651,7 +733,7 @@ def _exec(cmd: list, host: str = None, timeout: int = None) -> tuple:
                 f"主机 {host!r} 没有配置 SSH 目标。请在 OPS_SSH_TARGETS 里补上"
                 f"（当前已配置：{list(SSH_TARGETS) or '空'}）"
             )
-        cred = credentials_for(host or "")
+        cred = cred or credentials_for(host or "")
         limit = timeout or SSH_TIMEOUT
 
         # 密码认证走 paramiko（为什么，见 _exec_via_paramiko 的注释）

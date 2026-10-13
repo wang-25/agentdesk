@@ -76,6 +76,7 @@ AgentDesk 服务入口
     GET  /settings/api             当前令牌（明文，见安全模型注释）与数据源
     POST /settings/token           修改令牌：运行时生效 + 写回 .env
     POST /settings/ops             切换 mock/local/ssh 与 SSH 目标/私钥/清单
+    POST /settings/ssh/test        试一次登录（只读一条 hostname）：配的私钥/密码通不通
     POST /agent/ask/stream        Agent 诊断的 SSE 流式版（实时编排过程）
 
 服务起来后打开 http://127.0.0.1:8000/docs 有自动生成的交互式文档。
@@ -727,6 +728,65 @@ def _settings_snapshot() -> dict:
 def settings_api():
     """当前令牌（含完整值，见上方安全模型说明）与数据源配置。"""
     return _settings_snapshot()
+
+
+class SSHLoginTestRequest(BaseModel):
+    """测试登录的入参。
+
+    `auth` / `key` / `password` **留空 = 用这台主机已保存的那一项** ——
+    这样"存了密码但不确定对不对"可以直接点测试，不用重新敲一遍密码。
+    """
+    host: str = Field(min_length=1, max_length=64, description="要测试的主机")
+    auth: str = Field(default="", description="key | password；留空=用已保存的")
+    key: str = Field(default="", max_length=500, description="私钥路径；留空=用已保存的")
+    password: str = Field(default="", max_length=500,
+                          description="密码；留空=用已保存的（**永不回显**）")
+    timeout: int = Field(default=0, ge=0, le=60, description="秒；0=用默认")
+
+
+@app.post("/settings/ssh/test")
+def settings_ssh_test(req: "SSHLoginTestRequest"):
+    """**试一次登录** —— 回答"我配的私钥/密码到底通不通"。
+
+    【为什么值得专门做一个接口】
+    "保存成功"只证明配置写进去了，**不证明登得上**。而登录失败的表现是延迟的：
+    等你哪天问一句机器状态、拿到 Permission denied，才知道当初配错了。
+    所以这里给一个"立刻告诉我通不通"的动作。
+
+    【三条边界】
+    ① **只读且只有一次**：远端只跑一条 `hostname`，超时默认 8 秒，不留任何副作用；
+       走的还是查询用的那条 `_exec` —— 测的是真路径，不是另一套简化版。
+    ② **不落盘**：测试不写 `.env`、不改内存里的凭据（想保存得另外点保存）。
+    ③ **回执里没有密码**：只有 `ok / auth / latency_ms / remote / reason`。
+       原因文字也经过脱敏（`_exec_via_paramiko` 的报错本身就不含密码）。
+
+    【能不能被拿来探测内网】
+    只能测 `OPS_SSH_TARGETS` 里**已经配好的**主机，**不能指定任意地址** ——
+    目标从配置来，不从请求来。开了鉴权这个接口要令牌（不在免鉴权清单里）。
+    """
+    from app.tools import ops as _ops
+
+    host = req.host.strip()
+    if host not in _ops.SSH_TARGETS:
+        raise HTTPException(400, detail=(
+            f"{host} 不在已配置的 SSH 目标里，没法测试。"
+            f"先在上面把目标加上（{host}=user@地址），当前已配置："
+            f"{sorted(_ops.SSH_TARGETS) or '空'}"))
+
+    auth = (req.auth or "").strip().lower()
+    if auth and auth not in ("key", "password"):
+        raise HTTPException(400, detail="认证方式只能是 key 或 password")
+
+    # 已保存的凭据打底，请求里给了的就覆盖（留空 = 沿用已保存的）
+    cred = dict(_ops.credentials_for(host))
+    if auth:
+        cred["auth"] = auth
+    if req.key.strip():
+        cred["key"] = req.key.strip()
+    if req.password:
+        cred["password"] = req.password
+
+    return _ops.test_login(host, cred=cred, timeout=req.timeout or None)
 
 
 class SettingsTokenRequest(BaseModel):

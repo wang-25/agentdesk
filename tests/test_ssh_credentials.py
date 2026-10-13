@@ -447,3 +447,147 @@ def test_validation_errors_do_not_echo_the_password(settings_client):
     assert detail["type"] == "string_too_long"
     assert detail["input"] == "[已隐去]"
     assert "ctx" in detail and detail["loc"][-1] == "password"
+
+
+# ============================================================
+# 五、测试登录（回答"我配的私钥/密码到底通不通"）
+# ============================================================
+def test_login_runs_one_readonly_command_on_the_real_path(ssh_env, monkeypatch):
+    """★ 测试登录必须走**真实执行路径**（同一个 `_exec`）。
+
+    另写一条"简化版连接"就等于测了另一套代码 —— 通过了也不代表查询能成。
+    顺带断言：远端只跑一条 `hostname`（只读、无副作用），且能报出远端主机名
+    （这才是"真的落到了那台机器上"的证据）。
+    """
+    monkeypatch.setenv("OPS_SSH_KEY", "C:/keys/global")
+    ssh_env("web-01=root@1.1.1.1:22")
+    seen: dict = {}
+
+    def fake_exec(cmd, host=None, timeout=None, cred=None):
+        seen.update(cmd=cmd, host=host, timeout=timeout, cred=cred)
+        return 0, "simosheng\n"
+
+    monkeypatch.setattr(ops, "_exec", fake_exec)
+    got = ops.test_login("web-01")
+    assert got["ok"] is True and got["remote"] == "simosheng"
+    assert got["auth"] == "key" and got["latency_ms"] >= 0
+    assert seen["cmd"] == ["hostname"], "只读、只有一条命令"
+    assert seen["host"] == "web-01" and seen["cred"]["key"] == "C:/keys/global"
+
+
+def test_login_uses_the_password_you_just_typed(ssh_env, monkeypatch):
+    """请求里给的密码优先于已保存的 —— 这正是"提交后不知道成功没"要的：
+    敲完直接测，不必先保存。"""
+    ssh_env("db-01=ops@1.1.1.2:22")
+    seen = {}
+
+    def fake_exec(cmd, host=None, timeout=None, cred=None):
+        seen["cred"] = cred
+        return 0, "dbhost\n"
+
+    monkeypatch.setattr(ops, "_exec", fake_exec)
+    got = ops.test_login("db-01", cred={"auth": "password",
+                                        "key": "", "password": "typed-just-now"})
+    assert got["ok"] is True and seen["cred"]["password"] == "typed-just-now"
+
+
+def test_login_reports_a_readable_reason_when_auth_fails(ssh_env, monkeypatch):
+    """认证失败是**结论**，不是异常 —— 调用方要能直接显示给人看。"""
+    ssh_env("web-01=root@1.1.1.1:22")
+
+    def boom(cmd, host=None, timeout=None, cred=None):
+        raise ops.ToolError("root@1.1.1.1 密码认证失败。密码只写不读，请回设置页重新填一次。")
+
+    monkeypatch.setattr(ops, "_exec", boom)
+    got = ops.test_login("web-01", cred={"auth": "password", "key": "", "password": "x"})
+    assert got["ok"] is False
+    assert "密码认证失败" in got["reason"]
+    assert "x" not in got["reason"], "原因里不能夹带密码"
+    assert got["latency_ms"] >= 0
+
+
+def test_login_refuses_a_host_that_is_not_configured(ssh_env):
+    ssh_env("web-01=root@1.1.1.1:22")
+    got = ops.test_login("nope-99")
+    assert got["ok"] is False and "没有配置 SSH 目标" in got["reason"]
+
+
+def test_login_explains_when_password_is_missing(ssh_env):
+    ssh_env("db-01=ops@1.1.1.2:22")
+    got = ops.test_login("db-01", cred={"auth": "password", "key": "", "password": ""})
+    assert got["ok"] is False and "还没有密码" in got["reason"]
+
+
+def test_login_explains_when_backend_is_not_ssh(ssh_env, monkeypatch):
+    ssh_env("web-01=root@1.1.1.1:22")
+    monkeypatch.setattr(ops, "BACKEND", "mock")
+    got = ops.test_login("web-01")
+    assert got["ok"] is False and "不是 ssh" in got["reason"]
+
+
+# ---- 接口层 ----
+def _test_login(client, **body):
+    return client.post("/settings/ssh/test", json=body)
+
+
+def test_ssh_test_endpoint_reports_success(settings_client, monkeypatch):
+    client, _m, _tmp = settings_client
+    monkeypatch.setattr(ops, "_exec", lambda cmd, **kw: (0, "simosheng\n"))
+    r = _test_login(client, host="web-01")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is True and body["remote"] == "simosheng"
+    assert body["auth"] == "key" and "password" not in body
+
+
+def test_ssh_test_endpoint_falls_back_to_saved_credentials(settings_client, monkeypatch):
+    """留空 = 用已保存的：存了密码但不确定，点一下就能测。"""
+    client, _m, _tmp = settings_client
+    _save(client, [{"host": "db-01", "auth": "password", "password": "saved-pw"}])
+    seen = {}
+
+    def fake_exec(cmd, host=None, timeout=None, cred=None):
+        seen["cred"] = cred
+        return 0, "dbhost\n"
+
+    monkeypatch.setattr(ops, "_exec", fake_exec)
+    r = _test_login(client, host="db-01")
+    assert r.status_code == 200 and r.json()["ok"] is True
+    assert seen["cred"]["password"] == "saved-pw", "应当回退到已保存的密码"
+    assert "saved-pw" not in r.text
+
+
+def test_ssh_test_endpoint_never_echoes_the_password(settings_client, monkeypatch):
+    client, _m, _tmp = settings_client
+    secret = "TOP-SECRET-pw"
+    monkeypatch.setattr(
+        ops, "_exec",
+        lambda cmd, **kw: (_ for _ in ()).throw(ops.ToolError("认证失败")))
+    r = _test_login(client, host="db-01", auth="password", password=secret)
+    assert r.status_code == 200 and r.json()["ok"] is False
+    assert secret not in r.text
+
+
+def test_ssh_test_endpoint_rejects_unknown_host(settings_client):
+    client, _m, _tmp = settings_client
+    r = _test_login(client, host="nope-99")
+    assert r.status_code == 400
+    assert "不在已配置的 SSH 目标里" in r.json()["detail"]
+
+
+def test_ssh_test_endpoint_rejects_bad_auth(settings_client):
+    client, _m, _tmp = settings_client
+    r = _test_login(client, host="web-01", auth="kerberos")
+    assert r.status_code == 400
+    assert "key 或 password" in r.json()["detail"]
+
+
+def test_ssh_test_endpoint_does_not_persist_anything(settings_client, monkeypatch):
+    """★ 测试就是测试：不写 .env，不改已保存的凭据。"""
+    client, _m, tmp = settings_client
+    monkeypatch.setattr(ops, "_exec", lambda cmd, **kw: (0, "h\n"))
+    before = (tmp / ".env").read_text(encoding="utf-8")
+    _test_login(client, host="db-01", auth="password", password="not-to-be-saved")
+    assert (tmp / ".env").read_text(encoding="utf-8") == before
+    assert ops.credentials_for("db-01")["password"] == "", \
+        "测试不该把密码留在内存里的凭据表里"
