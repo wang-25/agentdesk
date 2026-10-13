@@ -437,7 +437,7 @@ agentdesk/
 ├── pyproject.toml          工具链配置（ruff / pytest / mypy；**不是**打包配置）
 ├── Dockerfile              生产镜像（非 root + 健康检查 + workers=1）
 ├── docker-compose.yml      生产编排（内存硬上限 + 端口只绑回环）
-├── requirements.txt        直接依赖仅 9 个
+├── requirements.txt        直接依赖仅 10 个
 └── requirements-dev.txt    开发依赖 3 个（pytest / ruff / mypy）
 ```
 
@@ -445,7 +445,7 @@ agentdesk/
 
 ## 技术栈
 
-直接依赖 **9 个**，其余全部手写：
+直接依赖 **10 个**，其余全部手写：
 
 | 层    | 选型                                    | 为什么                                |
 | ---- | ------------------------------------- | ---------------------------------- |

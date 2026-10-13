@@ -35,6 +35,7 @@
 """
 
 import json
+import base64
 import os
 import re
 import subprocess
@@ -120,6 +121,125 @@ def _parse_ssh_targets(raw: str) -> dict:
 
 
 SSH_TARGETS = _parse_ssh_targets(os.getenv("OPS_SSH_TARGETS"))
+
+
+# ============================================================
+# 零·一·B、SSH 凭据（每台主机一份，全局兜底）
+# ============================================================
+# 【为什么是"每台主机一份"】
+#   真实运维里每台机器的登录方式不一样：web-01 用私钥、db-01 只有密码、
+#   跳板机用另一把密钥。全局一份凭据逼着所有人共用一个身份。
+#
+# 【环境变量命名怎么定的】
+#   主机名里可能有 `-`（web-01），而环境变量名不允许 `-`，
+#   所以统一规范化：**大写 + 非字母数字换成 `_`**。
+#
+#       web-01  →  OPS_SSH_AUTH_WEB_01 / OPS_SSH_KEY_WEB_01 / OPS_SSH_PASSWORD_WEB_01
+#
+#   不带后缀的全局变量（OPS_SSH_KEY / OPS_SSH_AUTH / OPS_SSH_PASSWORD）
+#   作为**兜底默认**：不配任何新变量时，行为与改动前**完全一致**。
+#
+# 【为什么密钥类字段还要支持 base64】
+#   设置页要把密码写回 .env，而密码里可能有 `#`、空格、引号、单引号 ——
+#   python-dotenv 对这些的处理规则各不相同，写坏了会**静默读错**
+#   （在 `#` 处被截断、首尾空格被吃掉）。所以：
+#       机器写的一律 base64（`..._B64_<主机>` 后缀）
+#       人肉手写的明文也认（明文优先）
+#   两种写法并存是有意的：一个给人读，一个给机器写。
+SSH_AUTH_DEFAULT = (os.getenv("OPS_SSH_AUTH") or "key").strip().lower()
+SSH_PASSWORD = os.getenv("OPS_SSH_PASSWORD") or ""
+
+_CRED_UNSAFE_RE = re.compile(r"[^A-Z0-9]")
+_VALID_AUTH = ("key", "password")
+
+
+def _cred_suffix(host: str) -> str:
+    """主机名 → 环境变量后缀：`web-01` → `WEB_01`。"""
+    return _CRED_UNSAFE_RE.sub("_", (host or "").strip().upper())
+
+
+def _cred_env(host: str, field: str) -> str:
+    """读一台主机的一个凭据字段（明文优先，其次 base64）。
+
+    ★ base64 解不开时**直接抛错**而不是当作没配：
+      "以为配了、其实没配上"会在半夜以 `认证失败` 的形式出现，
+      而真正的错因（.env 里那串 base64 被截断了）谁也看不出来。
+      配置错属于"启动就该失败"。
+    """
+    suffix = _cred_suffix(host)
+    plain = (os.getenv(f"OPS_SSH_{field}_{suffix}") or "").strip()
+    if plain:
+        return plain
+    raw = (os.getenv(f"OPS_SSH_{field}_B64_{suffix}") or "").strip()
+    if not raw:
+        return ""
+    try:
+        return base64.b64decode(raw, validate=True).decode("utf-8")
+    except Exception as e:
+        raise ValueError(
+            f"OPS_SSH_{field}_B64_{suffix} 不是合法的 base64（{e}）。"
+            f"它由设置页写入；手写的话请确认没有换行或截断。") from e
+
+
+def _parse_credentials(hosts: list) -> dict:
+    """把每台主机的凭据折成 `{host: {"auth", "key", "password"}}`。"""
+    out = {}
+    suffix_owner = {}
+    for host in hosts:
+        suffix = _cred_suffix(host)
+        per_host_used = any(
+            os.getenv(f"OPS_SSH_{f}_{suffix}") or os.getenv(f"OPS_SSH_{f}_B64_{suffix}")
+            for f in ("AUTH", "KEY", "PASSWORD"))
+        owner = suffix_owner.get(suffix)
+        # 只有"两边都真的配了"才算冲突：没配的名字撞车是无害的
+        if owner and owner != host and per_host_used:
+            raise ValueError(
+                f"主机名 {owner!r} 与 {host!r} 规范化后都是 {suffix!r}，"
+                f"它们的凭据会互相覆盖。请改名，或不要同时给这两台配凭据。")
+        suffix_owner.setdefault(suffix, host)
+
+        auth = (_cred_env(host, "AUTH") or SSH_AUTH_DEFAULT).lower()
+        if auth not in _VALID_AUTH:
+            raise ValueError(
+                f"{host} 的认证方式 {auth!r} 不认识，只能是 key 或 password"
+                f"（来自 OPS_SSH_AUTH_{suffix} 或全局 OPS_SSH_AUTH）")
+        out[host] = {
+            "auth": auth,
+            "key": _cred_env(host, "KEY") or SSH_KEY,
+            "password": _cred_env(host, "PASSWORD") or SSH_PASSWORD,
+        }
+    return out
+
+
+def _credential_hosts() -> list:
+    """需要准备凭据的主机：SSH 目标 + 已知清单（去重，保持顺序）。"""
+    hosts = list(SSH_TARGETS)
+    for h in KNOWN_HOSTS:
+        if h not in hosts:
+            hosts.append(h)
+    return hosts
+
+
+# ★ 凭据表在 `KNOWN_HOSTS` 定义之后才建（见下方 `_CREDENTIALS = ...`）——
+#   它要同时覆盖"能连的"和"清单里有的"，早于 KNOWN_HOSTS 建表就会漏掉后者。
+
+
+def reload_credentials() -> None:
+    """重新从环境读凭据。
+
+    设置页保存后必须调它 —— 否则会出现"配置已经写进 .env、内存里还是旧的"
+    这种只有重启才生效的假象。
+    """
+    global _CREDENTIALS
+    _CREDENTIALS = _parse_credentials(_credential_hosts())
+
+
+def credentials_for(host: str) -> dict:
+    """取某台主机的凭据；没配过就退回全局默认。"""
+    host = (host or "").strip()
+    if host in _CREDENTIALS:
+        return _CREDENTIALS[host]
+    return {"auth": SSH_AUTH_DEFAULT, "key": SSH_KEY, "password": SSH_PASSWORD}
 
 
 # ============================================================
@@ -223,6 +343,10 @@ def _resolve_hosts() -> list:
 
 
 KNOWN_HOSTS = _resolve_hosts()
+
+# 凭据表：主机 → {auth, key, password}。放在这里是因为它要同时覆盖
+# `SSH_TARGETS`（能连的）与 `KNOWN_HOSTS`（清单里的）。
+_CREDENTIALS = _parse_credentials(_credential_hosts())
 
 # 主机角色说明。只是给模型的语义提示，让它能把「网站访问慢」对上某台主机。
 # 是可选的：清单里换成别的名字照样工作，只是少一点语义线索。
@@ -440,6 +564,80 @@ def _remote_command(cmd: list) -> str:
     return " ".join(_remote_quote(a) for a in cmd)
 
 
+def _exec_via_paramiko(cmd: list, target: dict, cred: dict, limit: int) -> tuple:
+    """用 paramiko 走**密码认证**执行一条命令。返回 (rc, 输出文本)。
+
+    【为什么密码这条路不走 `ssh` 命令行】
+    CLI 要免交互地喂密码只能靠 askpass，而"强制使用 askpass"的开关
+    （`SSH_ASKPASS_REQUIRE`）在 Windows 版 OpenSSH 上**不存在**
+    （实测报 `Bad configuration option: ssh_askpass_require`；sshpass 也不是哪儿都有）。
+    更要紧的是：**CLI 一旦弹交互提示就是永久挂起** ——
+    这正是现有代码把 `BatchMode=yes` 写死要避免的事。
+    paramiko 是库，没有"等待输入"这个状态，认证成败都是明确的返回。
+
+    【主机指纹策略与 CLI 保持一致（accept-new）】
+    `load_system_host_keys()` + `AutoAddPolicy()`：
+      · 没见过的主机 → 记下来（首次连接的便利）
+      · 记录过但指纹变了 → paramiko 抛 `BadHostKeyException`，**绝不静默接受**
+        （AutoAddPolicy 只在"查不到记录"时生效，不会覆盖已记录且不一致的）
+    """
+    import socket
+
+    import paramiko
+
+    remote = _remote_command(cmd)
+    client = paramiko.SSHClient()
+    client.load_system_host_keys()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    try:
+        client.connect(
+            hostname=target["host"], port=target["port"],
+            username=target["user"], password=cred["password"],
+            timeout=SSH_CONNECT_TIMEOUT, banner_timeout=SSH_CONNECT_TIMEOUT,
+            auth_timeout=SSH_CONNECT_TIMEOUT,
+            # 只允许密码：否则会先试 ssh-agent / 本地私钥，
+            # 出现"配了密码却因为一把旧私钥登录成功"这种极难排查的情况。
+            allow_agent=False, look_for_keys=False,
+        )
+    except paramiko.BadHostKeyException as e:
+        raise ToolError(
+            f"{target['host']} 的主机指纹变了（记录的是 "
+            f"{e.expected_key.get_fingerprint().hex()}，实际是 "
+            f"{e.key.get_fingerprint().hex()}）。这可能是重装或换机器，"
+            f"也可能是中间人 —— 确认无误后删掉 known_hosts 里对应那行再试。"
+        ) from None
+    except paramiko.AuthenticationException:
+        raise ToolError(
+            f"{target['user']}@{target['host']} 密码认证失败。"
+            f"密码只写不读（页面上看不到原值），请回设置页重新填一次。"
+        ) from None
+    except (paramiko.SSHException, socket.error, OSError) as e:
+        raise ToolError(
+            f"连接 {target['user']}@{target['host']}:{target['port']} 失败：{e}"
+        ) from e
+    except Exception as e:                      # pragma: no cover - 兜底
+        raise ToolError(f"连接 {target['host']} 时出现未预期的错误：{e}") from e
+
+    try:
+        _, stdout, stderr = client.exec_command(remote, timeout=limit)
+        try:
+            out = stdout.read().decode("utf-8", "replace").strip()
+            err = stderr.read().decode("utf-8", "replace").strip()
+            rc = stdout.channel.recv_exit_status()
+        except (socket.timeout, TimeoutError):
+            raise ToolError(f"命令超时（{limit}s）：{' '.join(cmd)}") from None
+    except paramiko.SSHException as e:
+        raise ToolError(f"在 {target['host']} 上执行失败：{e}") from e
+    finally:
+        client.close()
+
+    # 与 CLI 通道同一套约定：**只有失败时**才把 stderr 附上
+    #（成功还吐 stderr 的，基本只剩客户端告警，混进输出会污染解析器）
+    if rc != 0 and err:
+        out = (out + "\n" + err).strip() if out else err
+    return rc, out
+
+
 def _exec(cmd: list, host: str = None, timeout: int = None) -> tuple:
     """把一条命令送到"它该去的地方"执行。返回 (rc, 输出文本)。
 
@@ -453,10 +651,23 @@ def _exec(cmd: list, host: str = None, timeout: int = None) -> tuple:
                 f"主机 {host!r} 没有配置 SSH 目标。请在 OPS_SSH_TARGETS 里补上"
                 f"（当前已配置：{list(SSH_TARGETS) or '空'}）"
             )
+        cred = credentials_for(host or "")
+        limit = timeout or SSH_TIMEOUT
+
+        # 密码认证走 paramiko（为什么，见 _exec_via_paramiko 的注释）
+        if cred["auth"] == "password":
+            if not cred["password"]:
+                raise ToolError(
+                    f"{host} 配的是密码登录，但没有密码 —— 每次查询都会认证失败。"
+                    f"请在设置页填上这台主机的密码，"
+                    f"或设 OPS_SSH_PASSWORD_B64_{_cred_suffix(host)}。")
+            return _exec_via_paramiko(cmd, target, cred, limit)
+
         argv = [
             "ssh",
             # BatchMode=yes：绝不弹密码提示。自动化里一旦弹提示就是永久挂起，
             # 比直接报错难查得多 —— 宁可立刻失败。
+            # （密码认证的主机到不了这里，它走 paramiko。）
             "-o", "BatchMode=yes",
             "-o", f"ConnectTimeout={SSH_CONNECT_TIMEOUT}",
             # 首次连接自动记录指纹，之后严格校验。
@@ -467,12 +678,11 @@ def _exec(cmd: list, host: str = None, timeout: int = None) -> tuple:
             "-o", "LogLevel=ERROR",
             "-p", str(target["port"]),
         ]
-        if SSH_KEY:
-            argv += ["-i", SSH_KEY]
+        if cred["key"]:
+            argv += ["-i", cred["key"]]
         argv.append(f"{target['user']}@{target['host']}")
         # ★ 远端命令作为**单个参数**传入，且已逐参数加引号 —— 见 _remote_quote
         argv.append(_remote_command(cmd))
-        limit = timeout or SSH_TIMEOUT
     else:
         argv = cmd
         limit = timeout or 10

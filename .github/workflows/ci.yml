@@ -59,16 +59,16 @@ jobs:
           python-version: "3.12"
           cache: pip
 
-      - name: 安装依赖（运行时 9 个 + 开发 3 个）
+      - name: 安装依赖（运行时 10 个 + 开发 3 个）
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt -r requirements-dev.txt
 
-      - name: 运行时依赖数量守卫（README 宣称 9 个）
+      - name: 运行时依赖数量守卫（README 宣称 10 个）
         run: |
           n=$(grep -vcE '^\s*(#|$)' requirements.txt)
           echo "requirements.txt 里有效依赖行数：$n"
-          test "$n" -le 9 || { echo "-> 运行时依赖变多了，README 的『9 个』需要同步改"; exit 1; }
+          test "$n" -le 10 || { echo "-> 运行时依赖变多了，README 的『10 个』需要同步改"; exit 1; }
 
       - name: ruff（lint）
         run: ruff check tests

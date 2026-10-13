@@ -633,6 +633,35 @@ def _persist_env(updates: dict) -> str:
             "容器部署时 compose 的 env_file 读同一份")
 
 
+def _credentials_view() -> list:
+    """每台主机的凭据视图。
+
+    ★ **绝不含密码**：只有 `password_set: bool`。
+      私钥**路径**是显示的（不显示就没法编辑），它本来就是文件系统路径、
+      不是密钥内容；而 `/settings/api` 从 P4 之前就一直在返回 `ops.key`，
+      这里保持一致。
+
+    ★ 排序：先列"能连的"（已配 SSH 目标），再列"清单里但没配目标的"。
+      运维真正关心的是前者。
+    """
+    from app.tools import ops as _ops
+
+    hosts = sorted(_ops._CREDENTIALS,
+                   key=lambda h: (h not in _ops.SSH_TARGETS, h))
+    out = []
+    for host in hosts:
+        cred = _ops.credentials_for(host)
+        out.append({
+            "host": host,
+            "target": _ops.SSH_TARGETS.get(host),
+            "auth": cred["auth"],
+            "key": cred["key"],
+            "key_configured": bool(cred["key"]),
+            "password_set": bool(cred["password"]),
+        })
+    return out
+
+
 def _settings_snapshot() -> dict:
     from app.tools import ops as _ops
     env_path = PROJECT_ROOT / ".env"
@@ -657,24 +686,13 @@ def _settings_snapshot() -> dict:
             "key": _ops.SSH_KEY,
             "hosts_env": (os.getenv("OPS_HOSTS") or "").strip(),
             "known_hosts": list(_ops.KNOWN_HOSTS),
+            # ★ 每台主机的凭据视图：认证方式 + 私钥路径 + "密码是否已配置"。
+            #   密码本身**永远不在这里**（见 _credentials_view 的说明）。
+            "credentials": _credentials_view(),
         },
         "env_file": "项目根 .env（可持久化）" if env_path.exists()
                     else "无 .env（改动仅本次运行生效）",
     }
-
-
-@app.get("/settings", response_class=HTMLResponse, include_in_schema=False)
-def settings_page(response: Response):
-    """设置页壳：数据由 /settings/api 出（开了鉴权时同样要令牌）。"""
-    html = _SETTINGS_HTML
-    for k, v in (
-        ("__NEEDS_TOKEN__", "true" if security.AUTH_ENABLED else "false"),
-        ("__TOKEN_MASKED__", _mask_token(security.AGENT_TOKEN)),
-        ("__BASE_CSS__", _BASE_CSS),
-    ):
-        html = html.replace(k, v)
-    response.headers["Cache-Control"] = "no-store, must-revalidate"
-    return HTMLResponse(html)
 
 
 @app.get("/settings/api")
@@ -704,11 +722,68 @@ def settings_token(req: SettingsTokenRequest):
             "persist": persisted}
 
 
+class SSHCredentialIn(BaseModel):
+    """一台主机的凭据（**密码只写不读**：请求里带，响应里永远没有）。"""
+    host: str = Field(min_length=1, max_length=64, description="逻辑主机名，如 web-01")
+    auth: str = Field(default="", description="key | password；留空=不改这项")
+    key: str = Field(default="", max_length=500, description="私钥路径；留空=不改")
+    password: str = Field(default="", max_length=500,
+                          description="密码；留空=不改（想清空请用 clear_password）")
+    clear_password: bool = Field(default=False, description="显式清除这台主机已保存的密码")
+
+
 class SettingsOpsRequest(BaseModel):
     backend: str = Field(description="mock | local | ssh")
     targets: str = Field(default="", description="web-01=root@1.2.3.4:22,db-01=ops@10.0.0.9")
-    key: str = Field(default="", description="SSH 私钥路径（ssh 后端用）")
+    key: str = Field(default="", description="SSH 私钥路径（全局默认，ssh 后端用）")
     hosts: str = Field(default="", description="可选：显式主机清单，逗号分隔；留空=自动推导")
+    credentials: list[SSHCredentialIn] = Field(
+        default_factory=list,
+        description="每台主机各自的凭据；不传就沿用全局 key 与之前保存的密码")
+
+
+def _persist_credential(host: str, cred: "SSHCredentialIn") -> dict:
+    """把一台主机的凭据写进环境与 .env，返回**不含密钥**的回执。
+
+    【三条纪律】
+    ① **密码只写不读**：回执里只有 `password_set: bool`，永远不回显原值 ——
+       回了显就等于把密码复制到浏览器历史、代理日志、截图里。
+    ② **留空 = 不修改**：表单原样提交不会把已保存的密码抹掉
+       （"保存一次就丢密码"是最容易让人放弃功能的那种 bug）。
+       真要清空必须显式 `clear_password=true`。
+    ③ 密码用 base64 写 `.env`（键名带 `_B64_`）：密码里可能有 `#`、空格、
+       引号、单引号，明文写进去会被 dotenv **静默解析错**（在 # 处截断等）。
+    """
+    from app.tools import ops as _ops
+
+    suffix = _ops._cred_suffix(host)
+    auth = (cred.auth or "").strip().lower()
+    if auth and auth not in ("key", "password"):
+        raise HTTPException(400, detail=f"{host} 的认证方式只能是 key 或 password")
+
+    updates: dict = {}
+    live: dict = {}
+    if auth:
+        updates[f"OPS_SSH_AUTH_{suffix}"] = auth
+        live[f"OPS_SSH_AUTH_{suffix}"] = auth
+    if cred.key.strip():
+        updates[f"OPS_SSH_KEY_{suffix}"] = cred.key.strip()
+        live[f"OPS_SSH_KEY_{suffix}"] = cred.key.strip()
+    if cred.clear_password:
+        updates[f"OPS_SSH_PASSWORD_B64_{suffix}"] = ""
+        live[f"OPS_SSH_PASSWORD_B64_{suffix}"] = ""
+    elif cred.password:
+        import base64 as _b64
+        encoded = _b64.b64encode(cred.password.encode("utf-8")).decode("ascii")
+        updates[f"OPS_SSH_PASSWORD_B64_{suffix}"] = encoded
+        live[f"OPS_SSH_PASSWORD_B64_{suffix}"] = encoded
+
+    os.environ.update(live)
+    if not updates:
+        return {"host": host, "changed": False,
+                "persist": "没有要改的字段（auth/key/password 都留空了）"}
+    return {"host": host, "changed": True, "env_keys": sorted(updates),
+            "updates": updates}          # 密码在这里是 base64，由调用方写入 .env
 
 
 @app.post("/settings/ops")
@@ -726,7 +801,15 @@ def settings_ops(req: SettingsOpsRequest):
     try:
         targets = _ops._parse_ssh_targets(targets_raw) if targets_raw else {}
     except ValueError as e:
-        raise HTTPException(400, detail=f"目标格式不对：{e}")
+        raise HTTPException(400, detail=f"目标格式不对：{e}") from e
+
+    # 每台主机的凭据：先在内存里定稿，任何一台校验不过就整批拒绝（不留半套配置）
+    cred_updates: dict = {}
+    cred_feedback: list = []
+    for c in req.credentials:
+        got = _persist_credential(c.host.strip(), c)
+        cred_updates.update(got.pop("updates", {}))
+        cred_feedback.append(got)
 
     _ops.BACKEND = backend
     _ops.SSH_TARGETS = targets
@@ -743,22 +826,36 @@ def settings_ops(req: SettingsOpsRequest):
     os.environ["OPS_BACKEND"] = backend
     os.environ["OPS_SSH_TARGETS"] = targets_raw
     os.environ["OPS_SSH_KEY"] = _ops.SSH_KEY
+    # 换后端/换目标后凭据表也要重算（含刚写进环境的那批）
+    _ops.reload_credentials()
     persisted = _persist_env({
         "OPS_BACKEND": backend,
         "OPS_SSH_TARGETS": targets_raw,
         "OPS_SSH_KEY": _ops.SSH_KEY,
         **({"OPS_HOSTS": hosts_env} if hosts_env else {"OPS_HOSTS": ""}),
+        **cred_updates,
     })
     resp = {"ok": True, "backend": backend,
             "known_hosts": list(_ops.KNOWN_HOSTS), "persist": persisted}
+    if cred_feedback:
+        # ★ 回执里只有"这台主机用什么登录、密钥/密码是否已配置"，
+        #   **永远没有密码本身**（见 _persist_credential 的三条纪律）
+        resp["credentials"] = _credentials_view()
     # ★ 实测踩过的坑（2026-09-30）：key 留空保存后，ssh 每次查询都
     #   Permission denied，而 responses 里只有 ok=true —— 用户要到
     #   前端查不出数据才回头找原因。不阻止（有人的 ssh 靠默认路径/
     #   agent 转发就能通），但必须把后果说明白。
-    if backend == "ssh" and not _ops.SSH_KEY:
+    if backend == "ssh" and not _ops.SSH_KEY and not any(
+            c["auth"] == "key" and c["key"] for c in resp.get("credentials", [])):
         resp["warning"] = ("未配置私钥：ssh 将退回 ssh 客户端的默认密钥搜索路径，"
                            "大概率每次查询都 Permission denied。"
                            "如果连不上，回到本页把私钥路径填上。")
+    # 密码登录但没密码：与上面同类，必须当场说清（否则每次查询都认证失败）
+    missing_pwd = [c["host"] for c in resp.get("credentials", [])
+                   if c["auth"] == "password" and not c["password_set"]]
+    if missing_pwd:
+        resp["warning"] = (f"这些主机配的是密码登录但还没填密码：{missing_pwd} —— "
+                           f"每次查询都会认证失败，请在本页补上密码。")
     return resp
 
 

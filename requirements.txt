@@ -38,6 +38,16 @@ jieba>=0.42
 # Pulls in langchain-core, langgraph-checkpoint, langsmith, etc.
 langgraph>=0.2
 
+# ---------- SSH ----------
+# SSH client library, used ONLY for password-authenticated hosts.
+# Key auth still goes through the `ssh` CLI (already installed, and
+# BatchMode=yes keeps automation from hanging on a prompt).
+# A password cannot be fed to the CLI non-interactively on Windows:
+# the switch that forces askpass (SSH_ASKPASS_REQUIRE) does not exist
+# in Win32-OpenSSH, and sshpass is not available everywhere.
+# A library has no "waiting for input" state to hang in.
+paramiko>=3.4
+
 # ---------- MCP ----------
 # Official Model Context Protocol SDK. Exposes the 6 tools in
 # app/tools/ops.py to any MCP client (Cursor, Claude Desktop, ...).
