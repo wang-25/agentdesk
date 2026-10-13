@@ -386,3 +386,84 @@ def test_execute_refuses_an_expired_ticket_with_409(client_with_store):
 def test_execute_unknown_ticket_is_404(client):
     r = client.post("/approvals/ap-nope/execute", json={"by": "sre-zhang"})
     assert r.status_code == 404
+
+
+# ============================================================
+# 五、路由表的守门用例（补一个真实事故留下的盲区）
+# ============================================================
+def _declared_routes() -> set:
+    """从 main.py 的模块文档字符串里解析路由表。
+
+    格式是人工维护的表格，形如：
+
+        GET  /metrics/summary           成本与延迟聚合看板
+        DELETE /sessions/{id}           清空一个会话（返回删掉几轮）
+    """
+    import re
+
+    doc = main.__doc__ or ""
+    found = set()
+    for m in re.finditer(r"^\s+(GET|POST|PUT|PATCH|DELETE)\s+(/\S*)", doc, re.M):
+        found.add((m.group(1), m.group(2)))
+    return found
+
+
+def _actual_routes() -> set:
+    out = set()
+    for r in main.app.routes:
+        path = getattr(r, "path", None)
+        for method in (getattr(r, "methods", None) or []):
+            if method in ("HEAD", "OPTIONS"):
+                continue
+            out.add((method, path))
+    return out
+
+
+def _norm_path(path: str) -> str:
+    """把路径参数名归一化：`/sessions/{session_id}` → `/sessions/{}`。
+
+    ★ 文档里为了简洁写成 `{id}`，而代码里是 `{session_id}` ——
+      契约是"这个位置有个路径参数"，不是参数叫什么名字。
+      第一版没归一化，于是 9 条真实存在的路由被报成"缺失"
+      （**假红和漏报一样有害**，都会让人不再信任这条用例）。
+    """
+    import re
+
+    return re.sub(r"\{[^}]*\}", "{}", path or "")
+
+
+def test_docstring_route_table_is_parseable():
+    """这条先保证下一条用例不是在"空集合上通过"。"""
+    declared = _declared_routes()
+    assert len(declared) >= 20, \
+        f"只从文档字符串里解析到 {len(declared)} 条路由，格式可能变了"
+
+
+def test_every_documented_route_really_exists():
+    """★ 文档里写了的接口，必须真的注册在应用上。
+
+    【为什么补这条】P4 清理 `main.py` 的 UI 代码时，我按"一整段连续区间"删除，
+    把 `GET /settings/api`、`POST /settings/token`、`POST /settings/ops`
+    **连路由一起删掉了**。后果是设置页的"保存令牌/保存数据源"两个按钮当场 404 ——
+    而**全部 1047 条用例照常全绿**：没有任何一条断言过这些路由存在。
+    文档里明明写着它们。
+
+    教训：**"代码里没有"和"不该有"是两件事，只有断言能区分。**
+    """
+    declared = {(m, _norm_path(p)) for m, p in _declared_routes()}
+    actual = {(m, _norm_path(p)) for m, p in _actual_routes()}
+    missing = sorted(f"{m} {p}" for m, p in declared if (m, p) not in actual)
+    assert not missing, (
+        "文档字符串里列了、但实际没有注册的路由：\n  - "
+        + "\n  - ".join(missing)
+        + "\n（要么把接口补回来，要么把文档改对 —— 别让文档说谎）"
+    )
+
+
+def test_settings_write_endpoints_are_not_public():
+    """三个 settings 写接口既不能在免鉴权清单里，也不能再次被误删。"""
+    actual = _actual_routes()
+    for method, path in (("GET", "/settings/api"), ("POST", "/settings/token"),
+                         ("POST", "/settings/ops")):
+        assert (method, path) in actual, f"{method} {path} 不见了（P4 曾误删过它们）"
+        assert path not in security.PUBLIC_EXACT, f"{path} 不该免鉴权"

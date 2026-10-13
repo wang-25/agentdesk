@@ -594,6 +594,175 @@ DEFAULT_PLAYBOOK = ["uptime", "df -h", "free -m", "du -sh /var/log"]
 
 
 # ============================================================
+# 设置页的读接口与两个写接口（令牌 / 数据源与 SSH 凭据）
+# ============================================================
+# ★ 这一段在 P4 清理 main.py 时被**越界删除**过（连路由一起删掉，
+#   设置页的"保存"按钮因此 404 而测试没拦住）。现在原样取回，
+#   并补了"文档里列出的路由必须在实际注册表里存在"的守门用例。
+def _mask_token(v: str) -> str:
+    if not v:
+        return "（未设置）"
+    if len(v) <= 10:
+        return v[0] + "…" + v[-1]
+    return v[:4] + "…" + v[-4:]
+
+
+def _persist_env(updates: dict) -> str:
+    """把键值对写回项目根 .env（存在才写；先备份上一份）。
+
+    返回说明字符串：写到了哪里 / 为什么没写。**只改认识的键**，
+    其它行原样保留 —— .env 里还有 DEEPSEEK_API_KEY 这些不能碰的东西。
+    """
+    env_path = PROJECT_ROOT / ".env"
+    if not env_path.exists():
+        return "项目根目录没有 .env，改动只在本次运行内生效（重启后还原）"
+    text = env_path.read_text(encoding="utf-8")
+    (env_path.parent / ".env.bak.settings").write_text(text, encoding="utf-8")
+    lines_out = text.splitlines()
+    for k, v in updates.items():
+        hit = False
+        for i, ln in enumerate(lines_out):
+            if ln.startswith(k + "="):
+                lines_out[i] = k + "=" + v
+                hit = True
+                break
+        if not hit:
+            lines_out.append(k + "=" + v)
+    env_path.write_text("\n".join(lines_out) + "\n", encoding="utf-8")
+    return ("已写回 .env（原文件备份为 .env.bak.settings）—— 重启后仍生效；"
+            "容器部署时 compose 的 env_file 读同一份")
+
+
+def _settings_snapshot() -> dict:
+    from app.tools import ops as _ops
+    env_path = PROJECT_ROOT / ".env"
+    return {
+        "auth": {
+            "auth_enabled": security.AUTH_ENABLED,
+            "token_masked": _mask_token(security.AGENT_TOKEN),
+            "token": security.AGENT_TOKEN,
+            "token_len": len(security.AGENT_TOKEN),
+        },
+        "ops": {
+            "backend": (_ops.BACKEND or "mock").lower(),
+            "targets": {k: v for k, v in _ops.SSH_TARGETS.items()},
+            # ★ 序列化成 _parse_ssh_targets 能吃回去的 `名=user@host[:port]`。
+            #   第一版直接 f"{k}={v}"，v 是解析后的 dict —— 回填到表单里
+            #   就是 `web-01={'user': 'root'...}`，用户一点「应用」就 400。
+            #   序列化和解析是同一份数据的两个方向，必须能对账往返。
+            "targets_raw": ",".join(
+                f"{k}={v['user']}@{v['host']}"
+                + (f":{v['port']}" if v.get("port") not in (None, 22) else "")
+                for k, v in _ops.SSH_TARGETS.items()),
+            "key": _ops.SSH_KEY,
+            "hosts_env": (os.getenv("OPS_HOSTS") or "").strip(),
+            "known_hosts": list(_ops.KNOWN_HOSTS),
+        },
+        "env_file": "项目根 .env（可持久化）" if env_path.exists()
+                    else "无 .env（改动仅本次运行生效）",
+    }
+
+
+@app.get("/settings", response_class=HTMLResponse, include_in_schema=False)
+def settings_page(response: Response):
+    """设置页壳：数据由 /settings/api 出（开了鉴权时同样要令牌）。"""
+    html = _SETTINGS_HTML
+    for k, v in (
+        ("__NEEDS_TOKEN__", "true" if security.AUTH_ENABLED else "false"),
+        ("__TOKEN_MASKED__", _mask_token(security.AGENT_TOKEN)),
+        ("__BASE_CSS__", _BASE_CSS),
+    ):
+        html = html.replace(k, v)
+    response.headers["Cache-Control"] = "no-store, must-revalidate"
+    return HTMLResponse(html)
+
+
+@app.get("/settings/api")
+def settings_api():
+    """当前令牌（含完整值，见上方安全模型说明）与数据源配置。"""
+    return _settings_snapshot()
+
+
+class SettingsTokenRequest(BaseModel):
+    token: str = Field(min_length=16, max_length=200,
+                       description="新令牌：>=16 字符、不含空白。建议 32+ 随机字符")
+
+
+@app.post("/settings/token")
+def settings_token(req: SettingsTokenRequest):
+    """修改访问令牌：运行时立即生效 + 写回 .env。旧令牌当场作废。"""
+    v = req.token.strip()
+    if len(v) < 16:
+        raise HTTPException(400, detail="令牌太短：至少 16 个字符")
+    if any(ch.isspace() for ch in v):
+        raise HTTPException(400, detail="令牌不能含空白字符")
+    old_masked = _mask_token(security.AGENT_TOKEN)
+    security.AGENT_TOKEN = v
+    os.environ["AGENT_TOKEN"] = v
+    persisted = _persist_env({"AGENT_TOKEN": v})
+    return {"ok": True, "old": old_masked, "new_masked": _mask_token(v),
+            "persist": persisted}
+
+
+class SettingsOpsRequest(BaseModel):
+    backend: str = Field(description="mock | local | ssh")
+    targets: str = Field(default="", description="web-01=root@1.2.3.4:22,db-01=ops@10.0.0.9")
+    key: str = Field(default="", description="SSH 私钥路径（ssh 后端用）")
+    hosts: str = Field(default="", description="可选：显式主机清单，逗号分隔；留空=自动推导")
+
+
+@app.post("/settings/ops")
+def settings_ops(req: SettingsOpsRequest):
+    """切换工具层数据源。ssh 后端要求至少配一个目标，否则 400（fail-closed）。"""
+    from app.tools import ops as _ops
+    backend = (req.backend or "").strip().lower()
+    if backend not in ("mock", "local", "ssh"):
+        raise HTTPException(400, detail="backend 只能是 mock / local / ssh")
+    targets_raw = (req.targets or "").strip()
+    if backend == "ssh" and not targets_raw:
+        raise HTTPException(400, detail="ssh 后端至少要配一个目标，"
+                            "例如 web-01=root@1.2.3.4 —— 没有目标的 ssh 只会"
+                            "在每次查询时报错，不如显式拒绝")
+    try:
+        targets = _ops._parse_ssh_targets(targets_raw) if targets_raw else {}
+    except ValueError as e:
+        raise HTTPException(400, detail=f"目标格式不对：{e}")
+
+    _ops.BACKEND = backend
+    _ops.SSH_TARGETS = targets
+    _ops.SSH_KEY = (req.key or "").strip()
+    hosts_env = (req.hosts or "").strip()
+    if hosts_env:
+        os.environ["OPS_HOSTS"] = hosts_env
+    else:
+        os.environ.pop("OPS_HOSTS", None)
+    # KNOWN_HOSTS 是导入时算好的，换后端必须重推 ——
+    # 漏了这步就会出现「配置已是 ssh、提示词还列着旧的机器清单」的矛盾
+    _ops.KNOWN_HOSTS = _ops._resolve_hosts()
+
+    os.environ["OPS_BACKEND"] = backend
+    os.environ["OPS_SSH_TARGETS"] = targets_raw
+    os.environ["OPS_SSH_KEY"] = _ops.SSH_KEY
+    persisted = _persist_env({
+        "OPS_BACKEND": backend,
+        "OPS_SSH_TARGETS": targets_raw,
+        "OPS_SSH_KEY": _ops.SSH_KEY,
+        **({"OPS_HOSTS": hosts_env} if hosts_env else {"OPS_HOSTS": ""}),
+    })
+    resp = {"ok": True, "backend": backend,
+            "known_hosts": list(_ops.KNOWN_HOSTS), "persist": persisted}
+    # ★ 实测踩过的坑（2026-09-30）：key 留空保存后，ssh 每次查询都
+    #   Permission denied，而 responses 里只有 ok=true —— 用户要到
+    #   前端查不出数据才回头找原因。不阻止（有人的 ssh 靠默认路径/
+    #   agent 转发就能通），但必须把后果说明白。
+    if backend == "ssh" and not _ops.SSH_KEY:
+        resp["warning"] = ("未配置私钥：ssh 将退回 ssh 客户端的默认密钥搜索路径，"
+                           "大概率每次查询都 Permission denied。"
+                           "如果连不上，回到本页把私钥路径填上。")
+    return resp
+
+
+# ============================================================
 # 接口 1·A：处置剧本（M5 · I-9）
 # ============================================================
 @app.get("/plays")
